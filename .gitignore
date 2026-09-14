@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+*.egg-info/
+.venv/
+build/
+dist/
+
+# run outputs
+experiments/
+task_runs/
+*.log
+env

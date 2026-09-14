@@ -1,0 +1,31 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "sandboxes"
+version = "0.1.0"
+description = "Unified sandbox API over docker and Daytona: put_file, get_file, run_command, add_dependency, build_sandbox_image, push_sandbox_image, get_total_runtime_cost, open, close."
+requires-python = ">=3.10"
+dependencies = [
+    "pydantic>=2.7",
+    "pyyaml>=6",
+]
+
+[project.optional-dependencies]
+# only needed when a config actually selects `name: daytona`. Pinned to the
+# same harbor version euphoria/petunia already use in the shared venv —
+# `daytona-sdk` was tried here first and pulled in a NEWER `daytona` client
+# (0.203.0 -> 0.210.0) that hung euphoria's own test suite; harbor[daytona]
+# alone already brings the correct, already-proven `daytona` client version
+# as a transitive dependency, so there's no reason to depend on it directly.
+daytona = [
+    "harbor[daytona]==0.22.0",
+]
+test = ["pytest"]
+
+[tool.hatch.build.targets.wheel]
+packages = ["sandboxes"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
