@@ -40,6 +40,30 @@ def test_open_close_roundtrip(provider):
     provider.close()  # idempotent, must not raise
 
 
+def test_open_defaults_to_sbx_name_prefix(provider):
+    provider.open(BASE_IMAGE)
+    assert provider._container_name.startswith("sbx-")
+
+
+def test_open_with_name_prefix_names_the_container_after_it(provider):
+    """A caller-supplied name_prefix (e.g. a run id) becomes the actual
+    docker container name's prefix — findable later via
+    `docker ps --filter name=<prefix>` with no separate label mechanism."""
+    provider.open(BASE_IMAGE, name_prefix="r-20260914-231318-t-0004")
+    assert provider._container_name.startswith("r-20260914-231318-t-0004-")
+    r = subprocess.run(["docker", "inspect", "--format", "{{.Name}}",
+                        provider._container_name], capture_output=True, text=True)
+    assert r.returncode == 0
+    assert provider._container_name in r.stdout
+
+
+def test_open_sanitizes_an_unsafe_name_prefix(provider):
+    """A prefix with characters docker container names disallow (spaces,
+    slashes, ...) is sanitized rather than making `docker run` itself fail."""
+    provider.open(BASE_IMAGE, name_prefix="weird prefix/with:bad*chars")
+    assert provider._container_name.startswith("weird-prefix-with-bad-chars-")
+
+
 def test_run_command_before_open_raises(provider):
     with pytest.raises(SandboxNotOpenError):
         provider.run_command("echo hi")

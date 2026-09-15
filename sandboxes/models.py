@@ -73,6 +73,7 @@ class SandboxProviderConfig(BaseModel):
     spend_cap_usd: Optional[float] = None
     auto_stop_minutes: int = 0
     auto_delete_minutes: int = 0
-    usd_per_hour: float = 0.0                      # metered rate; 0 for docker
+    usd_per_hour: float = 0.0                      # daytona: fallback estimate when the
+                                                   # Analytics API is unreachable; 0 for docker
     registry: Optional[str] = None                 # default push target
     extra: dict = Field(default_factory=dict)

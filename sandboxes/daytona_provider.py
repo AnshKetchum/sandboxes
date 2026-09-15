@@ -135,6 +135,48 @@ async def _start_env(env, attempts: int = _SANDBOX_START_ATTEMPTS) -> None:
             await asyncio.sleep(min(60, 15 * attempt))
 
 
+async def _fetch_analytics_cost(sandbox, organization_id: str, sandbox_id: str,
+                                 start: datetime, end: datetime) -> Optional[float]:
+    """Sum the provider-computed `price` field of every usage period the
+    Analytics API reports for `sandbox` over [start, end] — the real,
+    metered cost, not an estimate. `sandbox` is the raw `daytona.AsyncSandbox`
+    (harbor's `DaytonaEnvironment._sandbox`); this mirrors its own private
+    `_get_analytics_api_url`/`_build_analytics_telemetry_api` pattern
+    (see `AsyncSandbox.get_metrics`) but hits `UsageApi`'s
+    per-sandbox-usage endpoint instead of `TelemetryApi`'s metrics one.
+    Returns None (never raises) if the deployment has no separate Analytics
+    API, or on any request failure — callers fall back to the usd_per_hour
+    estimate in that case."""
+    analytics_api_url = await sandbox._get_analytics_api_url()
+    if not analytics_api_url:
+        return None
+
+    from daytona_analytics_api_client_async import ApiClient as AnalyticsApiClient
+    from daytona_analytics_api_client_async import Configuration as AnalyticsConfiguration
+    from daytona_analytics_api_client_async import UsageApi
+
+    client = AnalyticsApiClient(AnalyticsConfiguration(host=analytics_api_url))
+    client.default_headers["Authorization"] = sandbox._sandbox_api.api_client.default_headers["Authorization"]
+    usage_api = UsageApi(client)
+    try:
+        periods = await usage_api.organization_organization_id_sandbox_sandbox_id_usage_get(
+            organization_id, sandbox_id,
+            var_from=start.isoformat(), to=end.isoformat(),
+        )
+    finally:
+        await client.close()
+    return round(sum(p.price for p in periods if p.price is not None), 6)
+
+
+def _session_id(name_prefix: Optional[str], short_name: str) -> str:
+    """DaytonaEnvironment's session_id, optionally prefixed with a caller
+    id (e.g. a run id) — same intent as DockerProvider's container-name
+    prefix. Extracted as its own function so the prefixing logic is
+    testable without going through a real (or heavily mocked) open()."""
+    prefix = f"{name_prefix}__" if name_prefix else ""
+    return f"{prefix}{short_name}__{uuid.uuid4().hex[:10]}"
+
+
 def kill_sandboxes() -> int:
     """Fleet cleanup: delete every sandbox this package's providers tagged
     with SANDBOX_LABELS. Explicitly NOT a SandboxProvider method — this acts
@@ -164,6 +206,11 @@ class DaytonaProvider(SandboxProvider):
         super().__init__(config)
         self._env = None
         self._workdir: str = "/"
+        # Wall-clock bookends alongside base.py's time.monotonic() ones —
+        # the Analytics API's usage endpoint takes real RFC3339 timestamps,
+        # not monotonic offsets.
+        self._opened_at_wall: Optional[datetime] = None
+        self._closed_at_wall: Optional[datetime] = None
 
     # -- lifecycle ------------------------------------------------------
 
@@ -174,13 +221,17 @@ class DaytonaProvider(SandboxProvider):
         workdir: str = "/",
         network: str = "bridge",
         volumes: Optional[dict[str, str]] = None,
+        name_prefix: Optional[str] = None,
     ) -> None:
         """`image` is a harbor-style task directory (task.toml +
         environment/Dockerfile) — see the module docstring for why this
         differs from DockerProvider's already-built-tag contract.
         `volumes` is accepted for signature parity only — a remote Daytona
         sandbox has no local host filesystem to bind-mount; a non-empty
-        value raises rather than silently doing nothing."""
+        value raises rather than silently doing nothing. `name_prefix`
+        (e.g. a run id) is prepended to the Daytona session id, same intent
+        as DockerProvider's container-name prefix — findable later via
+        whatever the sandbox listing surfaces the session id through."""
         if self._is_open:
             raise SandboxOpenError("already open — call close() first")
         if volumes:
@@ -224,7 +275,7 @@ class DaytonaProvider(SandboxProvider):
         kw = dict(
             environment_dir=task.paths.environment_dir,
             environment_name=task.short_name,
-            session_id=f"{task.short_name}__{uuid.uuid4().hex[:10]}",
+            session_id=_session_id(name_prefix, task.short_name),
             trial_paths=paths,
             task_env_config=task.config.environment,
             override_storage_mb=int((cfg.disk_gb or 8) * 1024),
@@ -253,6 +304,8 @@ class DaytonaProvider(SandboxProvider):
         self._is_open = True
         self._opened_at = time.monotonic()
         self._closed_at = None
+        self._opened_at_wall = datetime.now(timezone.utc)
+        self._closed_at_wall = None
 
     def close(self) -> None:
         if not self._is_open:
@@ -263,6 +316,7 @@ class DaytonaProvider(SandboxProvider):
             pass  # best-effort — a sandbox that fails to stop still hits its
                    # own auto_stop/auto_delete TTL as a backstop
         self._closed_at = time.monotonic()
+        self._closed_at_wall = datetime.now(timezone.utc)
         self._is_open = False
 
     def _require_open(self):
@@ -428,7 +482,37 @@ class DaytonaProvider(SandboxProvider):
 
     # -- cost -------------------------------------------------------------
 
+    def _real_cost(self) -> Optional[float]:
+        """Query Daytona's Analytics API for this sandbox's actual metered
+        cost so far. Returns None (never raises) whenever that isn't
+        possible — no sandbox opened yet, the SDK's internal shape changed,
+        the deployment has no separate Analytics API, or the request
+        failed — so `get_total_runtime_cost` can fall back to the
+        usd_per_hour estimate."""
+        env = self._env
+        if env is None or self._opened_at_wall is None:
+            return None
+        sandbox = getattr(env, "_sandbox", None)
+        if sandbox is None:
+            return None
+        organization_id = getattr(sandbox, "organization_id", None)
+        sandbox_id = getattr(sandbox, "id", None)
+        if not organization_id or not sandbox_id:
+            return None
+        end_wall = self._closed_at_wall or datetime.now(timezone.utc)
+        try:
+            return _run_sync(
+                _fetch_analytics_cost(sandbox, organization_id, sandbox_id,
+                                       self._opened_at_wall, end_wall),
+                timeout=20,
+            )
+        except Exception:
+            return None
+
     def get_total_runtime_cost(self) -> float:
+        real = self._real_cost()
+        if real is not None:
+            return real
         rate = self.config.usd_per_hour or 0.0
         if rate <= 0 or self._opened_at is None:
             return 0.0

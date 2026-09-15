@@ -48,6 +48,14 @@ def _docker(*args: str, timeout: float) -> subprocess.CompletedProcess:
     return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
 
 
+def _sanitize_name_prefix(prefix: str, max_len: int = 100) -> str:
+    """A docker container name must match [a-zA-Z0-9][a-zA-Z0-9_.-]* — collapse
+    everything else to '-' and trim, so a caller can pass e.g. a run id
+    (already safe) or something messier without open() ever rejecting it."""
+    s = re.sub(r"[^A-Za-z0-9_.-]", "-", prefix).strip("-")[:max_len]
+    return s or "sbx"
+
+
 class DockerProvider(SandboxProvider):
     name: ClassVar[str] = "docker"
 
@@ -65,6 +73,7 @@ class DockerProvider(SandboxProvider):
         workdir: str = "/",
         network: str = "bridge",
         volumes: Optional[dict[str, str]] = None,
+        name_prefix: Optional[str] = None,
     ) -> None:
         """`image` is an already-built (or pre-pulled) image tag. Starts a
         long-lived `sleep infinity` container from it, retrying up to 3x on
@@ -72,10 +81,15 @@ class DockerProvider(SandboxProvider):
         between caller-side checks and this call). `volumes` are bind
         mounts: {host_path: "container_path[:mode]"}, mode "rw" if omitted —
         for a workspace an agent writes to directly through the host
-        filesystem, without a put_file/get_file round trip per write."""
+        filesystem, without a put_file/get_file round trip per write.
+        `name_prefix` (e.g. a run id) becomes the container's own name
+        prefix instead of the default "sbx" — so a caller can later find/
+        kill everything from one job via `docker ps --filter name=<prefix>`
+        without a separate label mechanism."""
         if self._is_open:
             raise SandboxOpenError("already open — call close() first")
-        name = "sbx-" + re.sub(r"[^A-Za-z0-9_.-]", "-", uuid.uuid4().hex[:12])
+        prefix = _sanitize_name_prefix(name_prefix) if name_prefix else "sbx"
+        name = f"{prefix}-" + re.sub(r"[^A-Za-z0-9_.-]", "-", uuid.uuid4().hex[:12])
         cfg = self.config
         args = ["run", "-d", "--name", name, "--network", network]
         if cfg.cpu:

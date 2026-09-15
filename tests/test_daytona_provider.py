@@ -8,6 +8,8 @@ step — not part of this automated suite.
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
+
 import pytest
 
 pytest.importorskip("harbor", reason="daytona extras not installed")
@@ -15,6 +17,25 @@ pytest.importorskip("harbor", reason="daytona extras not installed")
 from sandboxes import SandboxProviderConfig
 from sandboxes.daytona_provider import DaytonaProvider
 from sandboxes.errors import SandboxNotOpenError, SandboxOpenError
+
+
+class _FakeSandbox:
+    """Stands in for `daytona.AsyncSandbox` — only the fields/method
+    `_real_cost` actually reads: `organization_id`, `id`, and the private
+    `_get_analytics_api_url` coroutine method it calls before ever touching
+    the real Analytics API client."""
+
+    def __init__(self, organization_id="org-1", sandbox_id="sbx-1"):
+        self.organization_id = organization_id
+        self.id = sandbox_id
+
+    async def _get_analytics_api_url(self):
+        return "https://analytics.example.test"
+
+
+class _FakeEnv:
+    def __init__(self, sandbox):
+        self._sandbox = sandbox
 
 
 def test_get_total_runtime_cost_is_zero_with_no_rate_configured():
@@ -65,6 +86,87 @@ def test_stats_composes_elapsed_seconds_and_cost_from_the_base_class():
     p._opened_at = 0.0
     p._closed_at = 3600.0
     assert p.stats() == {"seconds": 3600.0, "cost_usd": pytest.approx(2.0)}
+
+
+def test_real_cost_is_none_without_an_open_sandbox():
+    p = DaytonaProvider(SandboxProviderConfig(name="daytona"))
+    assert p._real_cost() is None
+
+
+def test_get_total_runtime_cost_prefers_the_analytics_api_over_the_estimate(monkeypatch):
+    """When the Analytics API answers, its `price` sum wins even though it
+    disagrees with what the usd_per_hour estimate would have computed —
+    proving the real figure isn't just a tie-breaker."""
+    p = DaytonaProvider(SandboxProviderConfig(name="daytona", usd_per_hour=2.0))
+    p._env = _FakeEnv(_FakeSandbox())
+    p._opened_at = 1000.0
+    p._closed_at = 4600.0  # 1 hour -> estimate would be $2.00
+    p._opened_at_wall = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    p._closed_at_wall = datetime(2026, 1, 1, 1, tzinfo=timezone.utc)
+
+    async def fake_fetch(sandbox, organization_id, sandbox_id, start, end):
+        assert organization_id == "org-1"
+        assert sandbox_id == "sbx-1"
+        return 0.37  # the "real" metered figure, deliberately != the estimate
+
+    monkeypatch.setattr("sandboxes.daytona_provider._fetch_analytics_cost", fake_fetch)
+    assert p.get_total_runtime_cost() == pytest.approx(0.37)
+
+
+def test_get_total_runtime_cost_falls_back_when_analytics_api_has_no_answer(monkeypatch):
+    p = DaytonaProvider(SandboxProviderConfig(name="daytona", usd_per_hour=2.0))
+    p._env = _FakeEnv(_FakeSandbox())
+    p._opened_at = 0.0
+    p._closed_at = 3600.0
+    p._opened_at_wall = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    p._closed_at_wall = datetime(2026, 1, 1, 1, tzinfo=timezone.utc)
+
+    async def fake_fetch(*a, **kw):
+        return None  # e.g. deployment has no separate Analytics API
+
+    monkeypatch.setattr("sandboxes.daytona_provider._fetch_analytics_cost", fake_fetch)
+    assert p.get_total_runtime_cost() == pytest.approx(2.0)  # 1h * $2/h estimate
+
+
+def test_get_total_runtime_cost_falls_back_when_analytics_api_raises(monkeypatch):
+    """A network/permissions failure querying the real cost must never
+    surface to the caller — it silently falls back to the estimate."""
+    p = DaytonaProvider(SandboxProviderConfig(name="daytona", usd_per_hour=2.0))
+    p._env = _FakeEnv(_FakeSandbox())
+    p._opened_at = 0.0
+    p._closed_at = 3600.0
+    p._opened_at_wall = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    p._closed_at_wall = datetime(2026, 1, 1, 1, tzinfo=timezone.utc)
+
+    async def fake_fetch(*a, **kw):
+        raise RuntimeError("analytics API unreachable")
+
+    monkeypatch.setattr("sandboxes.daytona_provider._fetch_analytics_cost", fake_fetch)
+    assert p.get_total_runtime_cost() == pytest.approx(2.0)
+
+
+def test_real_cost_is_none_when_sandbox_lacks_identity_fields():
+    """A sandbox object missing organization_id/id (e.g. a stub, or an SDK
+    shape change) is treated as unusable rather than crashing."""
+    p = DaytonaProvider(SandboxProviderConfig(name="daytona"))
+    p._env = _FakeEnv(_FakeSandbox(organization_id=None, sandbox_id="sbx-1"))
+    p._opened_at_wall = datetime(2026, 1, 1, tzinfo=timezone.utc)
+    assert p._real_cost() is None
+
+
+def test_session_id_without_name_prefix_is_unchanged():
+    from sandboxes.daytona_provider import _session_id
+    sid = _session_id(None, "my-task")
+    assert sid.startswith("my-task__")
+    assert sid.count("__") == 1
+
+
+def test_session_id_with_name_prefix_is_prepended():
+    """A caller-supplied name_prefix (e.g. a run id) shows up in the
+    Daytona session id, mirroring DockerProvider's container-name prefix."""
+    from sandboxes.daytona_provider import _session_id
+    sid = _session_id("r-20260914-231318-t-0004", "my-task")
+    assert sid.startswith("r-20260914-231318-t-0004__my-task__")
 
 
 def test_run_command_before_open_raises():

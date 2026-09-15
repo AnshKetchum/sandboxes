@@ -89,6 +89,7 @@ class SandboxProvider(ABC):
         workdir: str = "/",
         network: str = "bridge",
         volumes: Optional[dict[str, str]] = None,
+        name_prefix: Optional[str] = None,
     ) -> None:
         """Start the sandbox. `image` is an already-built image tag for
         DockerProvider; an environment directory (containing a Dockerfile)
@@ -106,7 +107,15 @@ class SandboxProvider(ABC):
         long-lived rw workspace (e.g. an agent writing many files over a
         session) wants direct host I/O, not a put_file/get_file round trip
         per write — the same reason greenhouse's own gen-stage sandbox
-        bind-mounts its workspace instead of copying into it."""
+        bind-mounts its workspace instead of copying into it.
+
+        `name_prefix`: an optional caller-supplied identifier (e.g. a run
+        id) folded into the sandbox's own name — `<name_prefix>-<random>`
+        for DockerProvider's container name, `<name_prefix>__<random>`
+        prepended to DaytonaProvider's session id — so a caller can later
+        find/kill everything belonging to one job via `docker ps`/`daytona
+        list` without needing a separate label mechanism. None (the
+        default) keeps each provider's original unprefixed naming."""
 
     @abstractmethod
     def close(self) -> None:
