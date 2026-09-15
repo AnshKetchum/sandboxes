@@ -43,6 +43,7 @@ Design notes (from the standardization discussion this package came out of):
 from __future__ import annotations
 
 import contextlib
+import time
 from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import ClassVar, Iterator, Optional, Union
@@ -81,13 +82,31 @@ class SandboxProvider(ABC):
     # -- lifecycle ------------------------------------------------------
 
     @abstractmethod
-    def open(self, image: str, *, workdir: str = "/", network: str = "bridge") -> None:
+    def open(
+        self,
+        image: str,
+        *,
+        workdir: str = "/",
+        network: str = "bridge",
+        volumes: Optional[dict[str, str]] = None,
+    ) -> None:
         """Start the sandbox. `image` is an already-built image tag for
         DockerProvider; an environment directory (containing a Dockerfile)
         for DaytonaProvider — see the module docstring for why these differ.
         Must be safe to retry on a known-transient provider error (an
         implementation's job, not the caller's — see open_task_sandbox_retrying
-        precedent this class's docstring cites)."""
+        precedent this class's docstring cites).
+
+        `volumes`: {host_path: "container_path[:mode]"} bind mounts (mode
+        "rw" if omitted) — a DOCKER-ONLY capability, present in every
+        provider's signature for parity but meaningful only for
+        DockerProvider (a remote Daytona sandbox has no local host
+        filesystem to mount); DaytonaProvider raises SandboxOpenError if
+        given a non-empty `volumes`. Exists because a caller with a
+        long-lived rw workspace (e.g. an agent writing many files over a
+        session) wants direct host I/O, not a put_file/get_file round trip
+        per write — the same reason greenhouse's own gen-stage sandbox
+        bind-mounts its workspace instead of copying into it."""
 
     @abstractmethod
     def close(self) -> None:
@@ -197,3 +216,26 @@ class SandboxProvider(ABC):
         """USD cost of this sandbox's runtime so far (0.0 for a backend with
         no metering, e.g. docker). Well-defined between `open()` and
         `close()`; keeps returning the final total after `close()`."""
+
+    def get_elapsed_seconds(self) -> float:
+        """Wall-clock time since `open()`, common to every backend (docker
+        and daytona both set `_opened_at`/`_closed_at` identically, via
+        `time.monotonic()`) — 0.0 before `open()` is ever called, frozen at
+        its final value after `close()`, still counting up while open."""
+        if self._opened_at is None:
+            return 0.0
+        end = self._closed_at if self._closed_at is not None else time.monotonic()
+        return end - self._opened_at
+
+    def stats(self) -> dict:
+        """{"seconds": <elapsed wall time>, "cost_usd": <get_total_runtime_cost()>}
+        — the one place this dict is assembled, so every provider reports it
+        identically. A subclass never needs to build this itself: it only
+        has to keep `_opened_at`/`_closed_at` current (already required for
+        `get_total_runtime_cost`) and implement `get_total_runtime_cost` —
+        `stats()` just proxies both onto whichever concrete provider it's
+        called on."""
+        return {
+            "seconds": self.get_elapsed_seconds(),
+            "cost_usd": self.get_total_runtime_cost(),
+        }

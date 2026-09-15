@@ -68,6 +68,7 @@ class SandboxProviderConfig(BaseModel):
     disk_gb: Optional[float] = None
     cpu: Optional[float] = None
     memory_mb: Optional[int] = None
+    pids_limit: Optional[int] = None
     peak_concurrent_sandboxes: Optional[int] = None
     spend_cap_usd: Optional[float] = None
     auto_stop_minutes: int = 0

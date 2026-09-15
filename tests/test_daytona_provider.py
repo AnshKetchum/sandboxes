@@ -45,10 +45,39 @@ def test_get_total_runtime_cost_freezes_after_close():
     assert p.get_total_runtime_cost() == pytest.approx(2.0)
 
 
+def test_get_elapsed_seconds_before_open_is_zero():
+    p = DaytonaProvider(SandboxProviderConfig(name="daytona"))
+    assert p.get_elapsed_seconds() == 0.0
+
+
+def test_get_elapsed_seconds_freezes_after_close():
+    p = DaytonaProvider(SandboxProviderConfig(name="daytona"))
+    p._opened_at = 0.0
+    p._closed_at = 42.0
+    assert p.get_elapsed_seconds() == 42.0
+
+
+def test_stats_composes_elapsed_seconds_and_cost_from_the_base_class():
+    """stats() lives on SandboxProvider, not reimplemented per-provider —
+    proven by getting the right numbers out of DaytonaProvider without this
+    module ever defining stats() itself."""
+    p = DaytonaProvider(SandboxProviderConfig(name="daytona", usd_per_hour=2.0))
+    p._opened_at = 0.0
+    p._closed_at = 3600.0
+    assert p.stats() == {"seconds": 3600.0, "cost_usd": pytest.approx(2.0)}
+
+
 def test_run_command_before_open_raises():
     p = DaytonaProvider(SandboxProviderConfig(name="daytona"))
     with pytest.raises(SandboxNotOpenError):
         p.run_command("echo hi")
+
+
+def test_open_rejects_volumes(tmp_path, monkeypatch):
+    monkeypatch.setenv("DAYTONA_API_KEY", "test-key-not-real")
+    p = DaytonaProvider(SandboxProviderConfig(name="daytona"))
+    with pytest.raises(SandboxOpenError, match="does not support host bind mounts"):
+        p.open(str(tmp_path), volumes={"/host/dir": "/container/dir"})
 
 
 def test_close_before_open_is_a_noop():

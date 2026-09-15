@@ -1,0 +1,8 @@
+# Shared base config for the local docker sandbox provider. Docker has no
+# metering/quota knobs (cost is always $0, no auto-stop/spend-cap concept) —
+# this is deliberately minimal. `image` is the one field worth overriding
+# per consumer (each stage/experiment picks its own base image); everything
+# else (cpu/memory_mb/pids_limit) is optional and only applied if a
+# consumer's own override sets it.
+sandbox_providers:
+  - name: docker

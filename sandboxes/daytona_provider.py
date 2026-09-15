@@ -167,12 +167,28 @@ class DaytonaProvider(SandboxProvider):
 
     # -- lifecycle ------------------------------------------------------
 
-    def open(self, image: str, *, workdir: str = "/", network: str = "bridge") -> None:
+    def open(
+        self,
+        image: str,
+        *,
+        workdir: str = "/",
+        network: str = "bridge",
+        volumes: Optional[dict[str, str]] = None,
+    ) -> None:
         """`image` is a harbor-style task directory (task.toml +
         environment/Dockerfile) — see the module docstring for why this
-        differs from DockerProvider's already-built-tag contract."""
+        differs from DockerProvider's already-built-tag contract.
+        `volumes` is accepted for signature parity only — a remote Daytona
+        sandbox has no local host filesystem to bind-mount; a non-empty
+        value raises rather than silently doing nothing."""
         if self._is_open:
             raise SandboxOpenError("already open — call close() first")
+        if volumes:
+            raise SandboxOpenError(
+                "DaytonaProvider does not support host bind mounts (volumes=) "
+                "— a remote sandbox has no local host filesystem to mount; "
+                "use put_file/get_file instead"
+            )
         if not os.environ.get("DAYTONA_API_KEY"):
             raise SandboxOpenError(
                 "DAYTONA_API_KEY is not set — the daytona SDK needs it in the "
@@ -416,6 +432,5 @@ class DaytonaProvider(SandboxProvider):
         rate = self.config.usd_per_hour or 0.0
         if rate <= 0 or self._opened_at is None:
             return 0.0
-        end = self._closed_at if self._closed_at is not None else time.monotonic()
-        hours = (end - self._opened_at) / 3600.0
+        hours = self.get_elapsed_seconds() / 3600.0
         return round(hours * rate, 6)

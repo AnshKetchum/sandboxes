@@ -6,7 +6,7 @@ from __future__ import annotations
 import pytest
 import yaml
 
-from sandboxes import DockerProvider, get_sandbox_provider
+from sandboxes import DockerProvider, get_sandbox_provider, load_sandbox_providers
 from sandboxes.errors import ConfigError
 
 
@@ -104,3 +104,70 @@ def test_only_the_first_provider_entry_is_used(tmp_path):
     provider = get_sandbox_provider(cfg)
     assert isinstance(provider, DockerProvider)
     assert provider.config.image == "first"
+
+
+# --- shared base config indirection (sandboxes/configs/*.yaml) ------------
+
+def test_load_sandbox_providers_from_a_base_file_with_no_overrides(tmp_path):
+    base = tmp_path / "daytona.yaml"
+    base.write_text(yaml.safe_dump({"sandbox_providers": [
+        {"name": "daytona", "disk_gb": 8, "peak_concurrent_sandboxes": 230},
+    ]}))
+    result = load_sandbox_providers(base)
+    assert result == [{"name": "daytona", "disk_gb": 8, "peak_concurrent_sandboxes": 230}]
+
+
+def test_load_sandbox_providers_applies_overrides_onto_the_base_entry(tmp_path):
+    base = tmp_path / "daytona.yaml"
+    base.write_text(yaml.safe_dump({"sandbox_providers": [
+        {"name": "daytona", "disk_gb": 8, "peak_concurrent_sandboxes": 230},
+    ]}))
+    result = load_sandbox_providers(base, {"peak_concurrent_sandboxes": 48})
+    assert result == [{"name": "daytona", "disk_gb": 8, "peak_concurrent_sandboxes": 48}]
+
+
+def test_load_sandbox_providers_missing_base_file_raises_clearly(tmp_path):
+    with pytest.raises(ConfigError, match="not found"):
+        load_sandbox_providers(tmp_path / "nope.yaml")
+
+
+def test_get_sandbox_provider_accepts_a_bare_path_string_for_sandbox_providers(tmp_path):
+    base = tmp_path / "daytona_base.yaml"
+    base.write_text(yaml.safe_dump({"sandbox_providers": [
+        {"name": "daytona", "peak_concurrent_sandboxes": 230},
+    ]}))
+    cfg = tmp_path / "run.yaml"
+    cfg.write_text(yaml.safe_dump({"sandbox_providers": str(base)}))
+    provider = get_sandbox_provider(cfg)
+    assert provider.name == "daytona"
+    assert provider.config.peak_concurrent_sandboxes == 230
+
+
+def test_get_sandbox_provider_accepts_base_plus_overrides_shape(tmp_path):
+    base = tmp_path / "daytona_base.yaml"
+    base.write_text(yaml.safe_dump({"sandbox_providers": [
+        {"name": "daytona", "peak_concurrent_sandboxes": 230, "disk_gb": 8},
+    ]}))
+    cfg = tmp_path / "run.yaml"
+    cfg.write_text(yaml.safe_dump({
+        "sandbox_providers": {"base": str(base), "overrides": {"peak_concurrent_sandboxes": 48}},
+    }))
+    provider = get_sandbox_provider(cfg)
+    assert provider.config.peak_concurrent_sandboxes == 48
+    assert provider.config.disk_gb == 8   # untouched fields survive the override merge
+
+
+def test_the_actual_shared_configs_load_correctly():
+    """sandboxes/configs/{docker,daytona}.yaml are the real files every
+    consuming codebase (euphoria, petunia, greenhouse) points at — a genuine
+    regression here would break sandbox setup everywhere at once."""
+    from pathlib import Path
+
+    pkg_root = Path(__file__).resolve().parent.parent
+    daytona = load_sandbox_providers(pkg_root / "configs" / "daytona.yaml")
+    assert daytona[0]["name"] == "daytona"
+    assert daytona[0]["peak_concurrent_sandboxes"] == 230
+    assert daytona[0]["auto_stop_minutes"] == 120
+
+    docker = load_sandbox_providers(pkg_root / "configs" / "docker.yaml")
+    assert docker[0]["name"] == "docker"

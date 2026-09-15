@@ -58,18 +58,41 @@ class DockerProvider(SandboxProvider):
 
     # -- lifecycle ------------------------------------------------------
 
-    def open(self, image: str, *, workdir: str = "/", network: str = "bridge") -> None:
+    def open(
+        self,
+        image: str,
+        *,
+        workdir: str = "/",
+        network: str = "bridge",
+        volumes: Optional[dict[str, str]] = None,
+    ) -> None:
         """`image` is an already-built (or pre-pulled) image tag. Starts a
         long-lived `sleep infinity` container from it, retrying up to 3x on
         a known image-cache-race error (a concurrent prune evicted the tag
-        between caller-side checks and this call)."""
+        between caller-side checks and this call). `volumes` are bind
+        mounts: {host_path: "container_path[:mode]"}, mode "rw" if omitted —
+        for a workspace an agent writes to directly through the host
+        filesystem, without a put_file/get_file round trip per write."""
         if self._is_open:
             raise SandboxOpenError("already open — call close() first")
         name = "sbx-" + re.sub(r"[^A-Za-z0-9_.-]", "-", uuid.uuid4().hex[:12])
+        cfg = self.config
+        args = ["run", "-d", "--name", name, "--network", network]
+        if cfg.cpu:
+            args += ["--cpus", str(cfg.cpu)]
+        if cfg.memory_mb:
+            args += ["--memory", f"{cfg.memory_mb}m"]
+        if cfg.pids_limit:
+            args += ["--pids-limit", str(cfg.pids_limit)]
+        for host_path, spec in (volumes or {}).items():
+            container_path, _, mode = spec.partition(":")
+            mode = mode or "rw"
+            args += ["-v", f"{host_path}:{container_path}:{mode}"]
+        args += [image, "sleep", "infinity"]
+
         last_stderr = ""
         for attempt in range(3):
-            r = _docker("run", "-d", "--name", name, "--network", network, image,
-                       "sleep", "infinity", timeout=90)
+            r = _docker(*args, timeout=90)
             if r.returncode == 0:
                 break
             last_stderr = _tail(r.stderr, 4000)

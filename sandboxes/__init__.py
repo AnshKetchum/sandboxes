@@ -8,7 +8,7 @@
 """
 
 from .base import SandboxProvider
-from .config import SANDBOX_CONFIG_PATH_ENV, get_sandbox_provider
+from .config import SANDBOX_CONFIG_PATH_ENV, get_sandbox_provider, load_sandbox_providers
 from .docker_provider import DockerProvider
 from .errors import (
     BuildError,
@@ -28,6 +28,7 @@ from .models import (
 
 __all__ = [
     "get_sandbox_provider",
+    "load_sandbox_providers",
     "SANDBOX_CONFIG_PATH_ENV",
     "SandboxProvider",
     "SandboxProviderConfig",

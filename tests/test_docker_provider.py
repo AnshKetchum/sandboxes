@@ -106,6 +106,39 @@ def test_put_file_directory_mode(provider, tmp_path):
     assert r.output == "a\nb\n"
 
 
+def test_open_with_volumes_bind_mounts_the_host_directory(provider, tmp_path):
+    host_dir = tmp_path / "workspace"
+    host_dir.mkdir()
+    (host_dir / "seed.txt").write_text("from the host\n")
+
+    provider.open(BASE_IMAGE, workdir="/mnt/ws",
+                 volumes={str(host_dir): "/mnt/ws:rw"})
+    # visible inside the container immediately, no put_file needed
+    r = provider.run_command("cat seed.txt")
+    assert r.output == "from the host\n"
+    # and a write INSIDE the container is visible on the host directly —
+    # the whole point of a bind mount vs. a put_file/get_file round trip
+    provider.run_command("echo 'from the container' > written.txt")
+    assert (host_dir / "written.txt").read_text() == "from the container\n"
+
+
+def test_open_with_volumes_defaults_to_rw_when_mode_omitted(provider, tmp_path):
+    host_dir = tmp_path / "workspace"
+    host_dir.mkdir()
+    provider.open(BASE_IMAGE, volumes={str(host_dir): "/mnt/ws"})  # no :mode suffix
+    r = provider.run_command("touch /mnt/ws/ok && echo done")
+    assert r.output.strip() == "done"
+
+
+def test_open_with_readonly_volume_rejects_writes(provider, tmp_path):
+    host_dir = tmp_path / "ro"
+    host_dir.mkdir()
+    provider.open(BASE_IMAGE, volumes={str(host_dir): "/mnt/ro:ro"})
+    r = provider.run_command("touch /mnt/ro/nope")
+    assert r.exit_code != 0
+    assert "Read-only file system" in r.output
+
+
 def test_get_file_roundtrip(provider, tmp_path):
     provider.open(BASE_IMAGE, workdir="/tmp")
     provider.run_command("echo 'from the sandbox' > /tmp/out.txt")
@@ -141,6 +174,29 @@ def test_get_total_runtime_cost_is_always_zero_for_docker(provider):
     assert provider.get_total_runtime_cost() == 0.0
     provider.close()
     assert provider.get_total_runtime_cost() == 0.0
+
+
+def test_stats_before_open_is_all_zero(provider):
+    assert provider.stats() == {"seconds": 0.0, "cost_usd": 0.0}
+
+
+def test_stats_while_open_reports_nonzero_elapsed_time(provider):
+    provider.open(BASE_IMAGE)
+    import time
+    time.sleep(0.05)
+    stats = provider.stats()
+    assert stats["seconds"] > 0.0
+    assert stats["cost_usd"] == 0.0  # docker is never metered
+
+
+def test_stats_after_close_freezes_elapsed_time(provider):
+    provider.open(BASE_IMAGE)
+    provider.close()
+    first = provider.stats()
+    import time
+    time.sleep(0.05)
+    second = provider.stats()
+    assert first == second  # must not keep advancing after close()
 
 
 def test_session_context_manager_closes_on_exception(tmp_path):
