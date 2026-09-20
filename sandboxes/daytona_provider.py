@@ -177,18 +177,48 @@ def _session_id(name_prefix: Optional[str], short_name: str) -> str:
     return f"{prefix}{short_name}__{uuid.uuid4().hex[:10]}"
 
 
-def kill_sandboxes() -> int:
-    """Fleet cleanup: delete every sandbox this package's providers tagged
-    with SANDBOX_LABELS. Explicitly NOT a SandboxProvider method — this acts
-    across every sandbox, not the one instance a provider owns (see base.py's
-    module docstring on why fleet ops live outside this class)."""
+async def _list_sandboxes_async(name_contains: Optional[str] = None) -> list:
     from daytona import ListSandboxesQuery
     from harbor.environments.daytona.environment import DaytonaClientManager
 
-    async def _delete_all() -> int:
+    client = await (await DaytonaClientManager.get_instance()).get_client()
+    out = []
+    async for sb in client.list(ListSandboxesQuery(labels=dict(SANDBOX_LABELS))):
+        # harbor sets this label itself (DaytonaEnvironment._sandbox_labels)
+        # from the session_id we build in _session_id() — the same
+        # `name_prefix` (e.g. a run id) DockerProvider folds into its
+        # container name, so callers can find/kill one job's sandboxes the
+        # same way on either backend, no separate label scheme needed.
+        session_id = (sb.labels or {}).get("harbor.session_id", "")
+        if name_contains is None or name_contains in session_id:
+            out.append(sb)
+    return out
+
+
+def find_sandboxes(name_contains: Optional[str] = None) -> list:
+    """Every currently-visible sandbox this package's providers tagged with
+    SANDBOX_LABELS, optionally filtered to those whose session id (the
+    harbor.session_id label) contains `name_contains` — e.g. a specific run
+    id. Returns raw SDK sandbox objects (id/labels/state available). Explicitly
+    NOT a SandboxProvider method — this acts across every sandbox, not the
+    one instance a provider owns (see base.py's module docstring)."""
+    return _run_sync(_list_sandboxes_async(name_contains), timeout=60)
+
+
+def kill_sandboxes(*, name_contains: Optional[str] = None) -> int:
+    """Fleet cleanup: delete every sandbox this package's providers tagged
+    with SANDBOX_LABELS — optionally scoped to those whose session id
+    contains `name_contains` (e.g. one run's id), rather than every sandbox
+    ANY consumer of this package has ever opened (euphoria/petunia/
+    greenhouse all share the same SANDBOX_LABELS). Explicitly NOT a
+    SandboxProvider method — see base.py's module docstring on why fleet
+    ops live outside this class."""
+    from harbor.environments.daytona.environment import DaytonaClientManager
+
+    async def _delete_matching() -> int:
         client = await (await DaytonaClientManager.get_instance()).get_client()
         n = 0
-        async for sb in client.list(ListSandboxesQuery(labels=dict(SANDBOX_LABELS))):
+        for sb in await _list_sandboxes_async(name_contains):
             try:
                 await client.delete(sb)
                 n += 1
@@ -196,7 +226,7 @@ def kill_sandboxes() -> int:
                 pass
         return n
 
-    return _run_sync(_delete_all(), timeout=120)
+    return _run_sync(_delete_matching(), timeout=180)
 
 
 class DaytonaProvider(SandboxProvider):

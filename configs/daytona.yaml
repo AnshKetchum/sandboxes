@@ -16,4 +16,4 @@ sandbox_providers:
     peak_concurrent_sandboxes: 230      # caps run.concurrency — override per run
     spend_cap_usd: 2500                 # cumulative soft cap; stop when reached
     auto_stop_minutes: 120              # auto_stop_interval_mins
-    auto_delete_minutes: 0              # auto_delete_interval_mins
+    auto_delete_minutes: 180            # auto_delete_interval_mins
