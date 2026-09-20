@@ -133,6 +133,15 @@ class DockerProvider(SandboxProvider):
             raise SandboxNotOpenError("sandbox is not open — call open() first")
         return self._container_name
 
+    @property
+    def raw_env(self) -> str:
+        """The real container name this provider opened — the docker-side
+        equivalent of DaytonaProvider.raw_env's escape hatch, for a caller
+        that wants to run its own `docker exec`/`docker cp` directly rather
+        than through run_command/put_file/get_file (e.g. a library needing
+        a feature this provider doesn't wrap)."""
+        return self._require_open()
+
     # -- files ------------------------------------------------------------
 
     def put_file(

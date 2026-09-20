@@ -354,6 +354,25 @@ class DaytonaProvider(SandboxProvider):
             raise SandboxNotOpenError("sandbox is not open — call open() first")
         return self._env
 
+    @property
+    def raw_env(self):
+        """The wrapped `harbor.environments.daytona.environment.
+        DaytonaEnvironment` this provider opened — an escape hatch for a
+        caller that needs harbor's own richer, async, environment-native
+        surface (`ensure_dirs`, `scoped_exec_env`, `download_dir`, the
+        `agent.run(env, ...)` contract harbor's own agent framework expects)
+        that `run_command`/`put_file`/`get_file` deliberately don't cover.
+
+        Exists specifically so a caller like euphoria — whose job body is
+        fundamentally async and built on harbor's agent framework, not this
+        package's own sync primitives — can still get its sandbox OPENED
+        (with this package's own retry/backoff) and admitted/scheduled
+        through `sandboxes.parallel`'s shared pool, without rewriting a
+        single line of its actual agent-running code. Raises the same
+        SandboxNotOpenError as every other accessor if called before open()
+        or after close()."""
+        return self._require_open()
+
     # -- files ------------------------------------------------------------
 
     def put_file(

@@ -25,6 +25,7 @@ from .models import (
     PushResult,
     SandboxProviderConfig,
 )
+from .parallel import AsyncSandboxPool, Job, JobOutcome, ResourceLimits, RetryPolicy, SandboxPool, Stage
 
 __all__ = [
     "get_sandbox_provider",
@@ -43,6 +44,13 @@ __all__ = [
     "SandboxNotOpenError",
     "BuildError",
     "PushError",
+    "SandboxPool",
+    "AsyncSandboxPool",
+    "Job",
+    "JobOutcome",
+    "Stage",
+    "RetryPolicy",
+    "ResourceLimits",
 ]
 
 try:
