@@ -71,6 +71,20 @@ class SandboxProviderConfig(BaseModel):
     pids_limit: Optional[int] = None
     peak_concurrent_sandboxes: Optional[int] = None
     spend_cap_usd: Optional[float] = None
+    auto_snapshot: Optional[bool] = None           # daytona only: whether `open()` snapshots
+                                                   # the built image as a NEW persistent
+                                                   # Daytona snapshot every call. None (default)
+                                                   # preserves the provider's own historical
+                                                   # default (snapshot unless the task ships a
+                                                   # prebuilt image). A caller that opens many
+                                                   # short-lived sandboxes from DIFFERENT/edited
+                                                   # Dockerfiles (e.g. a repair loop rebuilding
+                                                   # every iteration) should set this False —
+                                                   # Daytona's snapshot quota is a small, shared,
+                                                   # hard-capped org-wide resource (confirmed
+                                                   # live: 30 max), and one snapshot per sandbox
+                                                   # open burns through it fast with nothing ever
+                                                   # reusing the snapshot anyway.
     auto_stop_minutes: int = 0
     auto_delete_minutes: int = 0
     usd_per_hour: float = 0.0                      # daytona: fallback estimate when the

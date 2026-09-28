@@ -302,6 +302,7 @@ class DaytonaProvider(SandboxProvider):
 
         prebuilt = bool(task.config.environment.docker_image)
         cfg = self.config
+        auto_snapshot = (not prebuilt) if cfg.auto_snapshot is None else cfg.auto_snapshot
         kw = dict(
             environment_dir=task.paths.environment_dir,
             environment_name=task.short_name,
@@ -309,7 +310,7 @@ class DaytonaProvider(SandboxProvider):
             trial_paths=paths,
             task_env_config=task.config.environment,
             override_storage_mb=int((cfg.disk_gb or 8) * 1024),
-            auto_snapshot=not prebuilt,
+            auto_snapshot=auto_snapshot,
             labels=dict(SANDBOX_LABELS),
             auto_stop_interval_mins=cfg.auto_stop_minutes,
             auto_delete_interval_mins=cfg.auto_delete_minutes,
