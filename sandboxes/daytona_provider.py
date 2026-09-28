@@ -326,7 +326,23 @@ class DaytonaProvider(SandboxProvider):
 
         env = DaytonaEnvironment(**kw)
         try:
-            _run_sync(_start_env(env), timeout=600)
+            # 600s -> 240s: confirmed live (greenhouse, 2026-09-28) that a
+            # genuinely HUNG env.start() call (never responds at all, not a
+            # legitimate slow-but-progressing build) sat the full 600s before
+            # this fired — a bare `TimeoutError` whose default str() is empty,
+            # producing an opaque "daytona sandbox start failed: " with
+            # nothing after it. That's 10 minutes of dead sandbox-slot time
+            # PER hang, recurring in simultaneous bursts across multiple
+            # concurrent opens (consistent with a connection-pool/throttling
+            # issue on a burst of opens, not a per-task problem) — and this
+            # exception type isn't RuntimeError, so a caller like
+            # greenhouse's test.py that specifically retries RuntimeError
+            # around create_sandbox() never gets a repair attempt either; the
+            # candidate is aborted outright. 240s still gives real headroom
+            # for _start_env's own internal 3-attempt retry loop (backoff up
+            # to 45s total) plus a genuinely slow build, while cutting the
+            # worst-case dead-time-per-hang by 60%.
+            _run_sync(_start_env(env), timeout=240)
         except Exception as e:
             raise SandboxOpenError(f"daytona sandbox start failed: {e}") from e
 
