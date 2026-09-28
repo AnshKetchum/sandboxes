@@ -103,9 +103,22 @@ def _run_sync(coro, timeout: Optional[float] = None):
     fut = asyncio.run_coroutine_threadsafe(coro, loop)
     try:
         return fut.result(timeout=timeout)
-    except TimeoutError:
+    except TimeoutError as e:
         fut.cancel()  # best-effort; the coroutine may be past its last cancellation point
-        raise
+        # Bare TimeoutError's str() is empty — confirmed live to cause real
+        # harm downstream: a repair agent seeing only "daytona sandbox start
+        # failed: " with nothing after it has no way to distinguish "this
+        # timed out" from any other failure, and was repeatedly misdiagnosing
+        # it as "no network available" (a plausible-sounding but wrong guess)
+        # instead of "this needed more time," stripping real dependencies
+        # from Dockerfiles that would have built fine given longer. Give it
+        # an unambiguous message instead.
+        raise TimeoutError(
+            f"operation exceeded its {timeout}s timeout without completing "
+            "(this is a timeout, not a network/connectivity error — if this "
+            "recurs for the same task, the build/operation likely just needs "
+            "more time, not different dependencies)"
+        ) from e
 
 
 def _is_retryable_start_error(e: Exception) -> bool:
@@ -326,23 +339,22 @@ class DaytonaProvider(SandboxProvider):
 
         env = DaytonaEnvironment(**kw)
         try:
-            # 600s -> 240s: confirmed live (greenhouse, 2026-09-28) that a
-            # genuinely HUNG env.start() call (never responds at all, not a
-            # legitimate slow-but-progressing build) sat the full 600s before
-            # this fired — a bare `TimeoutError` whose default str() is empty,
-            # producing an opaque "daytona sandbox start failed: " with
-            # nothing after it. That's 10 minutes of dead sandbox-slot time
-            # PER hang, recurring in simultaneous bursts across multiple
-            # concurrent opens (consistent with a connection-pool/throttling
-            # issue on a burst of opens, not a per-task problem) — and this
-            # exception type isn't RuntimeError, so a caller like
-            # greenhouse's test.py that specifically retries RuntimeError
-            # around create_sandbox() never gets a repair attempt either; the
-            # candidate is aborted outright. 240s still gives real headroom
-            # for _start_env's own internal 3-attempt retry loop (backoff up
-            # to 45s total) plus a genuinely slow build, while cutting the
-            # worst-case dead-time-per-hang by 60%.
-            _run_sync(_start_env(env), timeout=240)
+            # 600s -> 240s -> 400s. 600s let genuinely HUNG env.start() calls
+            # (never responds at all) sit dead for a full 10 minutes before a
+            # bare, empty-str() TimeoutError fired — cut to 240s to bound
+            # that. But 240s then turned out too tight the OTHER direction:
+            # confirmed live (greenhouse, 2026-09-28), MULTIPLE distinct
+            # candidates with genuinely heavy dependency stacks (pandas,
+            # scipy, sklearn, opencv, pydicom, pyarrow...) started timing out
+            # mid-build — same empty-str() TimeoutError, indistinguishable
+            # from a real hang, so the repair agent (seeing nothing but an
+            # empty error) kept guessing "no network" and stripping real
+            # dependencies instead of the true fix (more time). A real build
+            # taking 3-4 minutes for a heavy scientific-Python stack is
+            # normal, not a hang. 400s splits the difference: still a real
+            # bound on truly-hung opens (33% cut from 600s), while giving
+            # legitimate heavy builds enough room to actually finish.
+            _run_sync(_start_env(env), timeout=400)
         except Exception as e:
             raise SandboxOpenError(f"daytona sandbox start failed: {e}") from e
 
