@@ -57,6 +57,9 @@ from .models import BuildResult, CommandResult, DependencyEntry, PushResult, San
 _OPEN_GATE = threading.BoundedSemaphore(
     max(1, int(os.environ.get("DAYTONA_MAX_CONCURRENT_OPENS", "24"))))
 _START_TIMEOUT_S = int(os.environ.get("DAYTONA_START_TIMEOUT_S", "600"))
+# Uploads of a prepared package/source tree into a fresh sandbox exceeded the
+# old fixed 120s under org-wide load (several gen sessions lost per wave).
+_UPLOAD_TIMEOUT_S = int(os.environ.get("DAYTONA_UPLOAD_TIMEOUT_S", "360"))
 
 SANDBOX_LABELS = {"sandboxes.managed": "true"}
 _SANDBOX_START_ATTEMPTS = 3
@@ -436,9 +439,9 @@ class DaytonaProvider(SandboxProvider):
             # itself just succeeded.
             self.run_command(f"mkdir -p {shlex.quote(parent)} && chmod {perm} {shlex.quote(parent)}")
         if mode == "dir":
-            _run_sync(env.upload_dir(str(local_path), remote_path), timeout=120)
+            _run_sync(env.upload_dir(str(local_path), remote_path), timeout=_UPLOAD_TIMEOUT_S)
         else:
-            _run_sync(env.upload_file(str(local_path), remote_path), timeout=90)
+            _run_sync(env.upload_file(str(local_path), remote_path), timeout=_UPLOAD_TIMEOUT_S)
         self.run_command(f"chmod -R {perm} {shlex.quote(remote_path)}")
 
     def get_file(self, remote_path: str, local_path: Union[str, Path]) -> None:
