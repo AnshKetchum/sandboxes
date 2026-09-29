@@ -50,6 +50,14 @@ from .base import SandboxProvider
 from .errors import BuildError, PushError, SandboxNotOpenError, SandboxOpenError
 from .models import BuildResult, CommandResult, DependencyEntry, PushResult, SandboxProviderConfig
 
+# Bound how many sandbox builds+starts are in flight at once, process-wide.
+# A pipeline wave launching dozens at the same instant made Daytona queue the
+# builds behind each other until the slowest ones hit the start timeout
+# (6 simultaneous timeouts at one wave start, all "just needed more time").
+_OPEN_GATE = threading.BoundedSemaphore(
+    max(1, int(os.environ.get("DAYTONA_MAX_CONCURRENT_OPENS", "24"))))
+_START_TIMEOUT_S = int(os.environ.get("DAYTONA_START_TIMEOUT_S", "600"))
+
 SANDBOX_LABELS = {"sandboxes.managed": "true"}
 _SANDBOX_START_ATTEMPTS = 3
 _OUTPUT_TAIL = 12000
@@ -354,7 +362,11 @@ class DaytonaProvider(SandboxProvider):
             # normal, not a hang. 400s splits the difference: still a real
             # bound on truly-hung opens (33% cut from 600s), while giving
             # legitimate heavy builds enough room to actually finish.
-            _run_sync(_start_env(env), timeout=400)
+            # 2026-09-29: back to 600s (env-overridable) now that starts are
+            # gated by _OPEN_GATE — at 400s, 199/318 test iterations in one
+            # run died as build timeouts, largely queueing behind each other.
+            with _OPEN_GATE:
+                _run_sync(_start_env(env), timeout=_START_TIMEOUT_S)
         except Exception as e:
             raise SandboxOpenError(f"daytona sandbox start failed: {e}") from e
 
