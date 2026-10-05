@@ -74,6 +74,7 @@ class DockerProvider(SandboxProvider):
         network: str = "bridge",
         volumes: Optional[dict[str, str]] = None,
         name_prefix: Optional[str] = None,
+        labels: Optional[dict[str, str]] = None,
     ) -> None:
         """`image` is an already-built (or pre-pulled) image tag. Starts a
         long-lived `sleep infinity` container from it, retrying up to 3x on
@@ -92,6 +93,11 @@ class DockerProvider(SandboxProvider):
         name = f"{prefix}-" + re.sub(r"[^A-Za-z0-9_.-]", "-", uuid.uuid4().hex[:12])
         cfg = self.config
         args = ["run", "-d", "--name", name, "--network", network]
+        # `labels` (e.g. {"greenhouse": "1", "greenhouse.run": "<run id>"}) let a
+        # caller find exactly its own containers on a host shared with other
+        # agents: `docker ps --filter label=greenhouse.run=<run id>`.
+        for k, v in (labels or {}).items():
+            args += ["--label", f"{k}={v}"]
         if cfg.cpu:
             args += ["--cpus", str(cfg.cpu)]
         if cfg.memory_mb:
@@ -210,10 +216,15 @@ class DockerProvider(SandboxProvider):
         *,
         tag: str,
         timeout: float = 1800.0,
+        network: Optional[str] = None,
         dockerfile: Optional[str] = None,
     ) -> BuildResult:
         t0 = time.monotonic()
         args = ["build", "-t", tag]
+        if network:
+            # RUN steps of a build use the DEFAULT bridge; on a shared host with a /28
+            # bridge that fails apt/pip with no route — `host` sidesteps it.
+            args += ["--network", network]
         if dockerfile:
             args += ["-f", dockerfile]
         args.append(str(context_dir))
