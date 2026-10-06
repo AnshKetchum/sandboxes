@@ -24,6 +24,8 @@ daytona = [
 ]
 e2b = ["e2b>=2.0"]
 blaxel = ["blaxel>=0.4"]
+modal = ["modal>=1.0"]
+fly = ["httpx"]
 test = ["pytest"]
 
 [tool.hatch.build.targets.wheel]

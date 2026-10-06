@@ -142,3 +142,11 @@ class E2BProvider(RawBackedProvider):
 
 class BlaxelProvider(RawBackedProvider):
     name: ClassVar[str] = "blaxel"
+
+
+class ModalProvider(RawBackedProvider):
+    name: ClassVar[str] = "modal"
+
+
+class FlyProvider(RawBackedProvider):
+    name: ClassVar[str] = "fly"

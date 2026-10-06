@@ -19,7 +19,6 @@ import io
 import os
 import shlex
 import tarfile
-import tempfile
 import time
 import uuid
 from abc import ABC, abstractmethod
@@ -95,6 +94,7 @@ class RawSandbox(ABC):
     """
     provider: ClassVar[str] = "base"
     hard_lifetime: ClassVar[bool] = False
+    max_call_s: ClassVar[Optional[int]] = None      # per-call time cap of the provider's exec API; longer commands run detached and are polled
 
     def __init_subclass__(cls, **kw):
         super().__init_subclass__(**kw)
@@ -170,6 +170,12 @@ class RawSandbox(ABC):
         self._ledger_handle = get_ledger().open(self.provider, cpu=s.cpu, ram_gib=s.mem_gb, disk_gib=s.disk_gb,
                                                 labels=s.labels, sandbox_id=self.sandbox_id)
         try:
+            loop_gb = int(s.extra.get("docker_loop_gb") or 0)
+            if loop_gb:      # docker's overlay2 cannot sit on an overlay root (blaxel, fly): give it an ext4 loop file instead
+                r = await self.exec(f"truncate -s {loop_gb}G /mnt/docker.img && mkfs.ext4 -q -F /mnt/docker.img && mkdir -p /var/lib/docker && "
+                                    f"mount -o loop /mnt/docker.img /var/lib/docker", timeout=120)
+                if r.rc != 0:
+                    raise SandboxCreateError(f"{self.provider}: docker loop setup failed (rc={r.rc}): {r.stdout[-300:]}")
             if s.boot_cmd:
                 r = await self.exec(s.boot_cmd, timeout=s.boot_timeout)
                 if r.rc != 0:
@@ -205,7 +211,10 @@ class RawSandbox(ABC):
     async def exec(self, command: str, *, cwd: Optional[str] = None, env: Optional[dict] = None,
                    timeout: Optional[int] = None) -> ExecResult:
         try:
-            return await self._exec(command, cwd, env, int(timeout or 7200))
+            t = int(timeout or 7200)
+            if self.max_call_s and t > self.max_call_s:
+                return await self._exec_detached(command, cwd, env, t)
+            return await self._exec(command, cwd, env, t)
         except CapacityError:
             raise
         except Exception as e:  # noqa: BLE001
@@ -213,6 +222,26 @@ class RawSandbox(ABC):
             if "timeout" in msg.lower() or "timed out" in msg.lower():
                 msg = f"Execution timed out after {timeout} seconds."
             return ExecResult(-1, msg)
+
+    async def _exec_detached(self, command: str, cwd: Optional[str], env: Optional[dict], timeout: int) -> ExecResult:
+        """For providers whose exec API caps one call (Fly ~60 s): upload the command as a script, run it in the background,
+        poll for its exit code, return its output."""
+        tag = uuid.uuid4().hex[:10]; script, out, rcf = f"/tmp/.x-{tag}.sh", f"/tmp/.x-{tag}.out", f"/tmp/.x-{tag}.rc"
+        body = "".join(f"export {k}={shlex.quote(str(v))}\n" for k, v in (env or {}).items()) + (f"cd {shlex.quote(cwd)} || exit 1\n" if cwd else "") + command + "\n"
+        await self._upload(body.encode(), script)
+        r = await self._exec(f"nohup sh -c 'bash -l {script} > {out} 2>&1; echo $? > {rcf}' >/dev/null 2>&1 &", None, None, 20)
+        if r.rc != 0:
+            return ExecResult(r.rc, "could not start the detached command: " + r.stdout[-300:])
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            await asyncio.sleep(3)
+            r = await self._exec(f"cat {rcf} 2>/dev/null", None, None, 20)
+            if r.stdout.strip().lstrip("-").isdigit():
+                rc = int(r.stdout.strip())
+                o = await self._exec(f"tail -c 200000 {out}; rm -f {out} {rcf} {script}", None, None, 30)
+                return ExecResult(rc, o.stdout)
+        await self._exec(f"pkill -f {script}; true", None, None, 20)
+        return ExecResult(-1, f"Execution timed out after {timeout} seconds.")
 
     # -- files (file or directory) ----------------------------------------------------------------------
     async def put_file(self, local: "str | Path", remote: str) -> None:

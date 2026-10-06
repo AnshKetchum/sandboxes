@@ -3,6 +3,8 @@
 Every provider charges differently, and not only for running time:
 
     daytona   vCPU-hour + GiB-RAM-hour + GiB-disk-hour (first 5 GiB of disk free), per second
+    fly       vCPU-second (performance or shared presets) + GB-second above the RAM included with the preset
+    modal     core-second + GiB-second ($0.00003942 / $0.00000667); VM runtime has a large root disk
     e2b       vCPU-second + GiB-RAM-second; storage, templates, pause are free; the plan fee
               ($150/mo Pro) and concurrency add-ons (600 -> $650/mo, 1100 -> $1150/mo) are fixed
     blaxel    GB-RAM-second only (CPU scales with RAM and is not billed separately), plus storage:
@@ -28,6 +30,7 @@ class CostModel:
     vcpu_hour: float = 0.0               # USD per vCPU-hour of a running sandbox
     ram_gib_hour: float = 0.0            # USD per GiB-RAM-hour of a running sandbox
     cpu_included_in_ram: bool = False    # True: vcpu_hour is ignored (CPU rides on the RAM price)
+    included_ram_gib_per_vcpu: float = 0.0   # RAM that comes with each vCPU and is not billed separately (Fly performance: 2)
     disk_gib_hour: float = 0.0           # USD per GiB-disk-hour of a running sandbox
     free_disk_gib: float = 0.0           # disk allowance that is not billed
     snapshot_gib_month: float = 0.0      # persistent snapshot storage
@@ -44,7 +47,8 @@ class CostModel:
         hours = max(0.0, seconds) / 3600.0
         cpu_part = 0.0 if self.cpu_included_in_ram else self.vcpu_hour * cpu
         disk_part = self.disk_gib_hour * max(0.0, disk_gib - self.free_disk_gib)
-        return (cpu_part + self.ram_gib_hour * ram_gib + disk_part) * hours
+        billable_ram = max(0.0, ram_gib - self.included_ram_gib_per_vcpu * cpu)
+        return (cpu_part + self.ram_gib_hour * billable_ram + disk_part) * hours
 
     def hourly_usd(self, cpu: float, ram_gib: float, disk_gib: float) -> float:
         return self.sandbox_usd(cpu, ram_gib, disk_gib, 3600.0)
@@ -73,6 +77,14 @@ DEFAULT_MODELS: dict[str, CostModel] = {
         "blaxel", ram_gib_hour=0.0000115 * 3600, cpu_included_in_ram=True,
         snapshot_gib_month=0.20, image_gib_month=0.045, volume_gib_month=0.12,
         notes="CPU scales with RAM and is free; snapshots $0.20, images $0.045, volumes $0.12 per GB-month"),
+    "modal": CostModel(
+        "modal", vcpu_hour=0.00003942 * 3600, ram_gib_hour=0.00000667 * 3600, plan_monthly_usd=0.0, max_concurrent=100,
+        notes="$0.00003942 per core-second (priced per `cpu` requested; Modal calls a core 2 vCPU) + $0.00000667 per GiB-second; "
+              "Starter $0 with 100 containers and $30 credits, Team $250/mo with 5,000"),
+    "fly": CostModel(
+        "fly", vcpu_hour=0.000012732 * 3600, ram_gib_hour=0.000002316 * 3600, included_ram_gib_per_vcpu=2.0,
+        notes="performance CPU, Ashburn list price: $0.000012732 per vCPU-second, 2 GB RAM per vCPU included, extra RAM $0.000002316 per GB-second; "
+              "shared CPU is ~15x cheaper per vCPU (override: vcpu_hour 0.003047, included_ram_gib_per_vcpu 0.25); volumes $0.15/GB-month"),
     "docker": CostModel("docker", notes="local daemon, free"),
 }
 

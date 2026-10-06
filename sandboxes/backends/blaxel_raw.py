@@ -150,12 +150,6 @@ class BlaxelRaw(RawSandbox):
             await self._cleanup_name()
             raise TimeoutError(f"blaxel sandbox {self._name} not DEPLOYED in {s.create_timeout}s")
         self.sandbox_id = self._name
-        loop_gb = int(s.extra.get("docker_loop_gb", 0) or 0)
-        if loop_gb:
-            r = await self._exec(f"truncate -s {loop_gb}G /mnt/docker.img && mkfs.ext4 -q -F /mnt/docker.img && "
-                                 f"mkdir -p /var/lib/docker && mount -o loop /mnt/docker.img /var/lib/docker", None, None, 120)
-            if r.rc != 0:
-                raise RuntimeError(f"blaxel docker loop setup failed: {r.stdout[-300:]}")
 
     async def _cleanup_name(self) -> None:
         from blaxel.core import SandboxInstance

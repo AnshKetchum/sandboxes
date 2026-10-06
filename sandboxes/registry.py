@@ -24,6 +24,7 @@ class ProviderInfo:
     raw: Optional[str] = None            # "module:Class" of the async RawSandbox (None: local only)
     sync: Optional[str] = None           # "module:Class" of the sync SandboxProvider
     capabilities: dict = field(default_factory=dict)
+    available: Optional[object] = None   # optional callable() -> bool: credentials that are not plain env vars (e.g. a profile file)
 
 
 # `dind`: can run a docker daemon with real storage inside the sandbox (what pr_task_synthesis needs).
@@ -34,7 +35,13 @@ DEFAULT_CAPABILITIES = {
     "blaxel": {"dind": False, "image_ref": True, "persistent_disk_gb": 0,
                "note": "root fs is RAM-backed (50% of memory); docker only fits in a small loop file"},
     "docker": {"dind": False, "image_ref": True, "persistent_disk_gb": 0, "local": True},
+    "fly": {"dind": True, "image_ref": True, "persistent_disk_gb": 8, "note": "Firecracker microVM, real disk (8 GB rootfs by default)"},
+    "modal": {"dind": True, "image_ref": True, "persistent_disk_gb": 500, "note": "runtime=vm (real VM, large root disk); gvisor cannot run a daemon"},
 }
+
+
+def _modal_credentials() -> bool:
+    return bool(os.environ.get("MODAL_TOKEN_ID") and os.environ.get("MODAL_TOKEN_SECRET")) or os.path.exists(os.path.expanduser("~/.modal.toml"))
 
 PROVIDERS: dict[str, ProviderInfo] = {
     "docker": ProviderInfo("docker", (), None, "sandboxes.docker_provider:DockerProvider", DEFAULT_CAPABILITIES["docker"]),
@@ -44,6 +51,9 @@ PROVIDERS: dict[str, ProviderInfo] = {
                         "sandboxes.generic_provider:E2BProvider", DEFAULT_CAPABILITIES["e2b"]),
     "blaxel": ProviderInfo("blaxel", ("BL_API_KEY", "BL_WORKSPACE"), "sandboxes.backends.blaxel_raw:BlaxelRaw",
                            "sandboxes.generic_provider:BlaxelProvider", DEFAULT_CAPABILITIES["blaxel"]),
+    "fly": ProviderInfo("fly", ("FLY_API_KEY",), "sandboxes.backends.fly_raw:FlyRaw", "sandboxes.generic_provider:FlyProvider", DEFAULT_CAPABILITIES["fly"]),
+    "modal": ProviderInfo("modal", (), "sandboxes.backends.modal_raw:ModalRaw", "sandboxes.generic_provider:ModalProvider",
+                          DEFAULT_CAPABILITIES["modal"], _modal_credentials),
 }
 
 
@@ -75,6 +85,9 @@ def usable(cfg: SandboxProviderConfig, env=None) -> tuple[bool, str]:
     missing = [k for k in required_env(cfg) if not env.get(k)]
     if missing:
         return False, f"{', '.join(missing)} not set"
+    check = PROVIDERS[name].available
+    if check is not None and cfg.api_key_env is None and not check():
+        return False, "no credentials (set the provider's token env vars or log in with its CLI)"
     return True, ""
 
 
