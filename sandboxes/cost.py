@@ -36,7 +36,9 @@ LEDGER_ENV = "SANDBOX_COST_LEDGER"
 RUN_ENV = "SANDBOX_RUN_ID"
 DEFAULT_LEDGER = Path.home() / ".cache" / "sandboxes" / "costs.jsonl"
 # an `open` with no `close` older than this is treated as dead (killed process), billed up to here
-STALE_AFTER_S = float(os.environ.get("SANDBOX_STALE_AFTER_S", 4 * 3600))
+from .lifetime import MAX_LIFETIME_MIN
+
+STALE_AFTER_S = float(os.environ.get("SANDBOX_STALE_AFTER_S", MAX_LIFETIME_MIN * 60))      # past the lifetime ceiling a sandbox is dead
 
 
 class SpendCapExceeded(SandboxError):

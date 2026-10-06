@@ -66,7 +66,7 @@ usd = await router.close(sbx)
 
 Every sandbox any provider opens writes `open`/`close` events (with its dollar cost from `pricing.py`) to one
 JSONL ledger; storage (snapshots, images, volumes) and one-off charges are `storage` events. A sandbox whose
-process was killed still counts as running until `SANDBOX_STALE_AFTER_S` (4 h).
+process was killed still counts as running until `SANDBOX_STALE_AFTER_S` (default: the 8 h lifetime ceiling).
 
 ```
 SANDBOX_COST_LEDGER=/path/costs.jsonl   SANDBOX_RUN_ID=scale-200    # where / which run
@@ -74,6 +74,24 @@ python -m sandboxes.cost --run scale-200 --watch 30 --cap 120       # live table
 ```
 
 `SANDBOX_CAP_DIVISOR=N` makes each of N data-parallel processes use 1/N of every provider's peak.
+
+## spend caps (env cost, enforced here, not in euphoria)
+
+Spend is read from the cost ledger in the sandboxes cache dir (`~/.cache/sandboxes/costs.jsonl`: one `open`/`close` record
+per sandbox with provider, size, run id and USD; running ones count at their cost so far). Every open path checks the caps
+first (`RawSandbox.start`, `SandboxRouter.open`, the harbor Daytona provider, euphoria's `make_env`) and raises
+`SpendCapExceeded` before anything is created. Defaults: $500 total. Change them without touching any project:
+
+```
+echo '{"total_usd": 800, "runs": {"final-e2b": 40}, "providers": {"daytona": 300}}' > ~/.cache/sandboxes/caps.json
+SANDBOX_CAP_USD=300  SANDBOX_RUN_ID=my-run  SANDBOX_RUN_CAP_USD=50     # per process
+python -m sandboxes.guard                      # caps, spend by run, burn rate, hours to the cap
+python -m sandboxes.guard --watch 60 --kill    # also delete running sandboxes once a cap trips
+```
+
+A cap stops NEW sandboxes; `--kill` (or the janitor) ends running ones. `guard` and the janitor also reconcile the ledger:
+an entry whose sandbox no longer exists on its provider is closed, so killed runs stop accruing phantom cost. Only
+sandboxes opened through this library are in the ledger (the legacy agentdist Daytona backend is not).
 
 ## lifetime policy (no sandbox bills for ever)
 

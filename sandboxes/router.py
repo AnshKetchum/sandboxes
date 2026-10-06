@@ -156,7 +156,9 @@ class SandboxRouter:
 
     async def open(self, image: str, *, require: Sequence[str] = (), wait_s: float = 600.0, **spec_kw) -> RawSandbox:
         """Start a sandbox on the best provider. Waits up to `wait_s` for capacity before failing."""
-        if self.total_spend_cap_usd:
+        from .guard import check_admission
+        check_admission()                       # total and per-run caps (caps.json / env / default); raises SpendCapExceeded
+        if self.total_spend_cap_usd:            # a cap carried by this router's own config file
             tot = self._ledger_summary()["total_usd"]
             if tot >= self.total_spend_cap_usd:
                 from .cost import SpendCapExceeded

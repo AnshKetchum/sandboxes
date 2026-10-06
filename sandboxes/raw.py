@@ -89,6 +89,8 @@ class RawSandbox(ABC):
 
     # -- lifecycle ----------------------------------------------------------------------------------
     async def start(self) -> "RawSandbox":
+        from .guard import check_admission
+        check_admission(self.provider, provider_cap_usd=self.spec.extra.get("spend_cap_usd"))      # SpendCapExceeded before anything is created
         last: Optional[Exception] = None
         for attempt in range(self.spec.create_tries):
             try:

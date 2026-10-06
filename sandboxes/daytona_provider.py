@@ -288,6 +288,8 @@ class DaytonaProvider(SandboxProvider):
         whatever the sandbox listing surfaces the session id through."""
         if self._is_open:
             raise SandboxOpenError("already open — call close() first")
+        from .guard import check_admission
+        check_admission("daytona", provider_cap_usd=self.config.spend_cap_usd)      # SpendCapExceeded before anything is created
         if volumes:
             raise SandboxOpenError(
                 "DaytonaProvider does not support host bind mounts (volumes=) "
@@ -375,6 +377,9 @@ class DaytonaProvider(SandboxProvider):
 
         self._env = env
         self._workdir = workdir or "/"
+        from .cost import get_ledger
+        self._ledger_handle = get_ledger().open("daytona", cpu=float(cfg.cpu or 1), ram_gib=(cfg.memory_mb or 2048) / 1024.0,
+                                                disk_gib=float(cfg.disk_gb or 8), labels={"prefix": name_prefix or ""})
         self._is_open = True
         self._opened_at = time.monotonic()
         self._closed_at = None
@@ -391,6 +396,11 @@ class DaytonaProvider(SandboxProvider):
                    # own auto_stop/auto_delete TTL as a backstop
         self._closed_at = time.monotonic()
         self._closed_at_wall = datetime.now(timezone.utc)
+        handle, self._ledger_handle = getattr(self, "_ledger_handle", None), None
+        if handle:
+            from .cost import get_ledger
+            from .pricing import cost_model_for
+            get_ledger().close(handle, cost_model_for("daytona", self.config.pricing))
         self._is_open = False
 
     def _require_open(self):

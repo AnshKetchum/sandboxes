@@ -148,6 +148,9 @@ def main(argv=None) -> int:
     _load_keys()
     while True:
         found = asyncio.run(sweep(a.max_age_hours, [p for p in a.providers.split(",") if p], a.dry_run))
+        if not a.dry_run:
+            from .guard import reconcile
+            reconcile()                                  # the sandboxes just deleted stop accruing in the cost ledger
         verb = "would delete" if a.dry_run else "deleted"
         print(f"{time.strftime('%FT%TZ', time.gmtime())} janitor: {verb} {len(found)} sandbox(es) older than {a.max_age_hours:g} h"
               + ("".join(f"\n  {n} ({age:.1f} h)" for n, age in found[:20])), flush=True)
