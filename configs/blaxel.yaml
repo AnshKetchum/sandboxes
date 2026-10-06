@@ -1,0 +1,14 @@
+# Blaxel: billed per GB-RAM-second (CPU scales with RAM and is free); snapshots/images/volumes are billed
+# storage, so snapshots are off. Needs BL_API_KEY and BL_WORKSPACE. The sandbox root filesystem is RAM
+# backed (50% of memory): docker-in-docker only fits in a small loop file, hence dind: false.
+sandbox_providers:
+  - name: blaxel
+    cpu: 1                              # informational: Blaxel derives CPU from memory
+    memory_mb: 2048
+    disk_gb: 8
+    peak_concurrent_sandboxes: 200      # QUOTA_EXCEEDED "N/200 sandboxes" (tier 2); a higher tier lifts it
+    spend_cap_usd: 2500
+    auto_stop_minutes: 120
+    auto_delete_minutes: 180
+    capabilities: {dind: false}
+    extra: {docker_loop_gb: 1, region: us-pdx-1}

@@ -1,4 +1,4 @@
-"""sandboxes — one API over docker and Daytona.
+"""sandboxes — one API over docker, Daytona, E2B and Blaxel (any provider whose key is in the environment).
 
     from sandboxes import get_sandbox_provider
 
@@ -12,6 +12,8 @@ from .config import SANDBOX_CONFIG_PATH_ENV, get_sandbox_provider, load_sandbox_
 from .docker_provider import DockerProvider
 from .errors import (
     BuildError,
+    CapacityError,
+    SandboxCreateError,
     ConfigError,
     PushError,
     SandboxError,
@@ -25,9 +27,17 @@ from .models import (
     PushResult,
     SandboxProviderConfig,
 )
+from .cost import CostLedger, SpendCapExceeded, get_ledger, summary as cost_summary
+from .pricing import DEFAULT_MODELS, CostModel, cost_model_for
+from .raw import ExecResult, RawSandbox, SandboxSpec
+from .registry import PROVIDERS, ProviderInfo, register_provider, usable
+from .router import NoProviderAvailable, SandboxRouter
 from .parallel import AsyncSandboxPool, Job, JobOutcome, ResourceLimits, RetryPolicy, SandboxPool, Stage
 
 __all__ = [
+    "CapacityError", "SandboxCreateError", "CostLedger", "SpendCapExceeded", "get_ledger", "cost_summary",
+    "DEFAULT_MODELS", "CostModel", "cost_model_for", "ExecResult", "RawSandbox", "SandboxSpec",
+    "PROVIDERS", "ProviderInfo", "register_provider", "usable", "NoProviderAvailable", "SandboxRouter",
     "get_sandbox_provider",
     "load_sandbox_providers",
     "SANDBOX_CONFIG_PATH_ENV",

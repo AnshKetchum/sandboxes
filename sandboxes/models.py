@@ -62,7 +62,16 @@ class SandboxProviderConfig(BaseModel):
     for docker, which is always free and always explicitly torn down).
     """
 
-    name: str = "docker"                          # "docker" | "daytona"
+    name: str = "docker"                          # "docker" | "daytona" | "e2b" | "blaxel" (registry.PROVIDERS)
+    enabled: bool = True                          # false: listed but never used
+    api_key_env: Optional[list[str]] = None       # env vars that must be set for this provider to be
+                                                   # usable; default: the provider's own (registry.py).
+                                                   # A listed provider whose keys are absent is skipped.
+    priority: int = 0                             # lower is tried first when capacity is equal
+    weight: float = 1.0                           # share of new sandboxes when several have room
+    pricing: dict = Field(default_factory=dict)   # overrides for pricing.CostModel fields
+    capabilities: dict = Field(default_factory=dict)  # e.g. {dind: false} to keep docker-in-docker
+                                                   # work off a provider; see registry.DEFAULT_CAPABILITIES
     image: Optional[str] = None                   # default base image to `open()` when
                                                    # none is given explicitly
     disk_gb: Optional[float] = None
