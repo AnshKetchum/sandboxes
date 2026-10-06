@@ -23,15 +23,42 @@ from .lifetime import DEFAULT_IDLE_STOP_MIN, clamp_lifetime_min
 
 HARBOR_ENVS = {
     "daytona": ("harbor.environments.daytona.environment", "DaytonaEnvironment"),
-    "e2b": ("harbor.environments.e2b", "E2BEnvironment"),
+    "e2b": ("sandboxes.harbor_e2b", "LifetimeE2BEnvironment"),   # harbor's E2BEnvironment with a real lifetime + our labels
     "blaxel": ("harbor.environments.blaxel", "BlaxelEnvironment"),
 }
 _live: dict = {}
 
 
 def harbor_providers() -> tuple:
-    """Providers a harbor environment exists for."""
-    return tuple(HARBOR_ENVS)
+    """Providers a harbor environment exists for: harbor's native ones, plus every provider with a RawSandbox backend (those get
+    the generic prebuilt-image environment in harbor_raw), so adding a provider to the registry adds its harbor path too."""
+    from .registry import PROVIDERS
+    return tuple(dict.fromkeys([*HARBOR_ENVS, *(n for n, i in PROVIDERS.items() if i.raw)]))
+
+
+def harbor_env_class(provider: str):
+    """The harbor environment class to construct for `provider`."""
+    native = HARBOR_ENVS.get(provider)
+    if native:
+        return getattr(importlib.import_module(native[0]), native[1])
+    from .harbor_raw import environment_class
+    return environment_class(provider)
+
+
+def lifetime_kwargs(provider: str, size: dict, *, labels: dict, auto_snapshot: bool = False, prebuilt: bool = False) -> dict:
+    """The constructor arguments that give `provider`'s harbor environment a FINITE lifetime and the labels cleanup tooling looks for.
+    The one place that knows what each provider's environment takes, so a caller (here, euphoria) cannot forget one.
+    `size`: {auto_stop_minutes, auto_delete_minutes, extra}."""
+    life = clamp_lifetime_min(size.get("auto_delete_minutes"))
+    if provider == "daytona":        # idle stop, then delete: not a hard cap (see lifetime.py; the janitor backstops it)
+        return dict(auto_snapshot=auto_snapshot and not prebuilt, labels=labels,
+                    auto_stop_interval_mins=int(size.get("auto_stop_minutes") or DEFAULT_IDLE_STOP_MIN), auto_delete_interval_mins=life)
+    if provider == "blaxel":         # ttl ends it at that age (harbor's own default is 24 h)
+        return {"ttl": f"{life}m"}
+    kw = dict(lifetime_s=life * 60, labels=labels)       # e2b (timeout, hard) and every raw-backed provider (hard cap in the provider)
+    if provider not in HARBOR_ENVS:
+        kw["sandbox_extra"] = dict(size.get("extra") or {})
+    return kw
 
 
 def _sandbox_id(env, provider: str) -> str:
@@ -48,23 +75,18 @@ def make_env(provider: str, *, task, trial_paths, session_id: str, size: dict, n
     `size`: {cpu, memory_mb, disk_gb, auto_stop_minutes, auto_delete_minutes, pricing}."""
     from .guard import check_admission
     check_admission(provider)
-    mod, cls = HARBOR_ENVS[provider]
     kw = dict(environment_dir=task.paths.environment_dir, environment_name=task.short_name, session_id=session_id, trial_paths=trial_paths,
               task_env_config=task.config.environment, override_storage_mb=int((size.get("disk_gb") or 8) * 1024))
     if network_mode is not None:
         from harbor.models.task.config import NetworkMode, NetworkPolicy
         kw["network_policy"] = NetworkPolicy(network_mode=NetworkMode(network_mode))
-    life = clamp_lifetime_min(size.get("auto_delete_minutes"))
-    if provider == "daytona":
-        kw.update(auto_snapshot=auto_snapshot and not bool(task.config.environment.docker_image), labels=standard_labels(owner, run),
-                  auto_stop_interval_mins=int(size.get("auto_stop_minutes") or DEFAULT_IDLE_STOP_MIN), auto_delete_interval_mins=life)
-    elif provider == "blaxel":
-        kw["ttl"] = f"{life}m"                                   # harbor's default is 24 h
+    kw.update(lifetime_kwargs(provider, size, labels=standard_labels(owner, run), auto_snapshot=auto_snapshot,
+                              prebuilt=bool(task.config.environment.docker_image)))
     if size.get("cpu"):
         kw["override_cpus"] = int(size["cpu"])
     if size.get("memory_mb"):
         kw["override_memory_mb"] = int(size["memory_mb"])
-    env = getattr(importlib.import_module(mod), cls)(**kw)
+    env = harbor_env_class(provider)(**kw)
     _track(env, provider, size, standard_labels(owner, run), on_release)
     return env
 
@@ -82,12 +104,20 @@ def _track(env, provider: str, size: dict, labels: dict, on_release) -> None:
             if on_release:
                 on_release()
 
+    own_ledger = not getattr(env, "LEDGER_NATIVE", False)       # a raw-backed environment's RawSandbox records its own entry
+
     async def start(*a, **k):
         try:
             r = await orig_start(*a, **k)
         except BaseException:
+            try:
+                await orig_stop(True)          # a start that failed part-way may have left a sandbox behind: delete it
+            except BaseException:  # noqa: BLE001
+                pass
             release()
             raise
+        if not own_ledger:
+            return r
         state["handle"] = get_ledger().open(provider, cpu=float(size.get("cpu") or 1), ram_gib=(size.get("memory_mb") or 2048) / 1024.0,
                                             disk_gib=float(size.get("disk_gb") or 8), labels=labels, sandbox_id=_sandbox_id(env, provider))
         return r
