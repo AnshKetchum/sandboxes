@@ -75,6 +75,21 @@ python -m sandboxes.cost --run scale-200 --watch 30 --cap 120       # live table
 
 `SANDBOX_CAP_DIVISOR=N` makes each of N data-parallel processes use 1/N of every provider's peak.
 
+## lifetime policy (no sandbox bills for ever)
+
+Every sandbox gets a finite lifetime whatever the config says: `auto_delete_minutes` unset, 0 or negative becomes 240
+(`SANDBOX_DEFAULT_LIFETIME_MIN`), and nothing may exceed 480 (`SANDBOX_MAX_LIFETIME_MIN`). E2B (`timeout`) and Blaxel
+(`ttl`) end the sandbox at that age, hard; checked live with 3-minute sandboxes. Daytona only auto-stops after that many
+minutes of inactivity, and harbor's own E2B environment lives 24 h, so `sandboxes.janitor` backs both up:
+
+```
+python -m sandboxes.janitor --dry-run                       # what is past 6 h
+python -m sandboxes.janitor --max-age-hours 6 --watch 300   # keep deleting
+```
+
+It deletes only what this stack creates (daytona labels agentdist / sandboxes.managed / euphoria.managed, never other
+projects' harbor.* ones; the E2B and Blaxel accounts). The pr_task_synthesis spend watchdog runs it every 10 minutes.
+
 ## checks
 
 `pytest tests` runs offline; `pytest tests/test_providers_live.py -s` opens one real sandbox per provider

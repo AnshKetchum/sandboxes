@@ -47,6 +47,10 @@ class SandboxSpec:
     create_tries: int = 4
     extra: dict = field(default_factory=dict)   # provider-specific knobs (region, template, ...)
 
+    def __post_init__(self):
+        from .lifetime import clamp_lifetime_min
+        self.lifetime_s = clamp_lifetime_min(self.lifetime_s // 60) * 60      # always finite, never above the ceiling
+
 
 @dataclass
 class ExecResult:
