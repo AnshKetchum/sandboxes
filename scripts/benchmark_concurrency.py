@@ -146,6 +146,8 @@ def table(rows):
 
 
 async def main_async(args):
+    from sandboxes.janitor import load_provider_keys
+    load_provider_keys()                      # provider keys from the shared env file when the shell did not export them
     extra = dict(kv.split("=", 1) for kv in args.extra)
     os.environ.setdefault("SANDBOX_RUN_ID", "bench-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S"))
     run_id = os.environ["SANDBOX_RUN_ID"]
