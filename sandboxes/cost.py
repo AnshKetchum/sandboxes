@@ -12,6 +12,12 @@ hide spend. Storage (snapshots, images, volumes) goes in as `storage` events.
     python -m sandboxes.cost --run v0-scale-200 --watch 30
     python -m sandboxes.cost --cap 120        # exit status 2 once the total passes $120
 
+Ledger format (JSON lines, the one uniform shape every provider is normalized into; times are epoch seconds):
+
+    {"ev":"open",    "t","id","provider","run","sid","cpu","ram_gib","disk_gib","labels"}   a sandbox started
+    {"ev":"close",   "t","id","provider","run","seconds","usd"[, "note"]}                    it ended; usd from the provider's CostModel
+    {"ev":"storage", "t","provider","run","kind","gib","seconds","usd","label"}              image / snapshot / volume storage, or a one-off charge
+
 The ledger is the single place to look at sandbox spend. It does not know about LLM spend; the
 caller adds that (`summary()["total_usd"]` is sandbox dollars only).
 """

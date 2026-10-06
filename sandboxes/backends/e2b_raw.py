@@ -9,7 +9,7 @@ import shlex
 import threading
 
 from ..errors import CapacityError
-from ..raw import ExecResult, RawSandbox
+from ..raw import ExecResult, LiveSandbox, RawSandbox
 
 _template_locks: dict[str, asyncio.Lock] = {}
 _guard = threading.Lock()
@@ -41,6 +41,23 @@ async def ensure_template(image: str, cpu: int, mem_gb: int, *, registry_auth: t
 
 class E2BRaw(RawSandbox):
     provider = "e2b"
+    hard_lifetime = True           # `timeout` at create ends the sandbox
+
+    @classmethod
+    async def list_live(cls):
+        from e2b import AsyncSandbox
+        pag, out = AsyncSandbox.list(), []
+        while True:
+            for x in await pag.next_items():
+                st = getattr(x, "started_at", None)
+                out.append(LiveSandbox("e2b", x.sandbox_id, st.timestamp() if st else None, str(getattr(x, "state", "")), dict(getattr(x, "metadata", None) or {})))
+            if not pag.has_next:
+                return out
+
+    @classmethod
+    async def kill(cls, sandbox_id):
+        from e2b import AsyncSandbox
+        await AsyncSandbox.kill(sandbox_id)
 
     def __init__(self, spec, model=None):
         super().__init__(spec, model)

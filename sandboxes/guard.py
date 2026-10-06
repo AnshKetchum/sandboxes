@@ -116,85 +116,10 @@ def _runs(path) -> list[str]:
     return seen
 
 
-async def _live_ids() -> dict[str, Optional[set]]:
-    """{provider: set of sandbox ids alive now}, None for a provider that could not be listed (its entries are left alone)."""
-    out: dict[str, Optional[set]] = {}
-    if os.environ.get("DAYTONA_API_KEY"):
-        try:
-            from daytona import AsyncDaytona
-            c = AsyncDaytona()
-            try:
-                res, ids = c.list(), set()
-                if hasattr(res, "__aiter__"):
-                    async for sb in res:
-                        ids.add(sb.id)
-                else:
-                    ids = {sb.id for sb in (await res).items}
-                out["daytona"] = ids
-            finally:
-                await c.close()
-        except Exception:  # noqa: BLE001
-            out["daytona"] = None
-    if os.environ.get("E2B_API_KEY"):
-        try:
-            from e2b import AsyncSandbox
-            pag, ids = AsyncSandbox.list(), set()
-            while True:
-                ids |= {x.sandbox_id for x in await pag.next_items()}
-                if not pag.has_next:
-                    break
-            out["e2b"] = ids
-        except Exception:  # noqa: BLE001
-            out["e2b"] = None
-    if os.environ.get("BL_API_KEY"):
-        try:
-            from .compat import ensure_blaxel_importable
-            ensure_blaxel_importable()
-            from blaxel.core import SandboxInstance
-            ids = set()
-            async for x in (await SandboxInstance.list(limit=100)).auto_paging_iter():
-                if str(x.status).split(".")[-1] not in ("TERMINATED", "DELETING"):
-                    ids.add(x.metadata.name)
-            out["blaxel"] = ids
-        except Exception:  # noqa: BLE001
-            out["blaxel"] = None
-    return out
-
-
-def reconcile(path=None, live: Optional[dict] = None, now: Optional[float] = None) -> int:
-    """Close ledger entries whose sandbox no longer exists on its provider (killed by a stop script, a janitor, the provider's
-    own lifetime, a crashed process) so they stop accruing phantom cost. Closed at `now`, so run it often (guard --watch does).
-    Entries without a sandbox id (euphoria's) are left to the stale cutoff. Returns the number closed."""
-    import asyncio
-    from .cost import get_ledger
-    from .pricing import cost_model_for
-    led = get_ledger(); path = path or led.path
-    live = live if live is not None else asyncio.run(_live_ids())
-    now = now or time.time()
-    opens, closed = {}, set()
-    try:
-        for line in open(path):
-            try:
-                r = json.loads(line)
-            except ValueError:
-                continue
-            if r.get("ev") == "open" and r.get("sid"):
-                opens[r["id"]] = r
-            elif r.get("ev") == "close":
-                closed.add(r["id"])
-    except OSError:
-        return 0
-    n = 0
-    for h, o in opens.items():
-        ids = live.get(o["provider"])
-        if h in closed or ids is None or o["sid"] in ids:
-            continue
-        sec = max(0.0, now - o["t"])
-        usd = cost_model_for(o["provider"]).sandbox_usd(o["cpu"], o["ram_gib"], o["disk_gib"], sec)
-        led._append({"t": now, "ev": "close", "id": h, "provider": o["provider"], "run": o.get("run", ""), "seconds": round(sec, 2),
-                     "usd": round(usd, 6), "note": "reconciled: sandbox no longer exists"})
-        n += 1
-    return n
+def reconcile(path=None, live=None, now=None) -> int:
+    """See fleet.reconcile: close ledger entries whose sandbox no longer exists on its provider."""
+    from .fleet import reconcile as _r
+    return _r(path, live, now)
 
 
 def main(argv=None) -> int:
@@ -202,8 +127,16 @@ def main(argv=None) -> int:
     ap.add_argument("--watch", type=float, default=0, help="check every N seconds")
     ap.add_argument("--kill", action="store_true", help="when a cap trips, delete this stack's running sandboxes (janitor, any age)")
     a = ap.parse_args(argv)
+    last = time.time()
     while True:
         n = reconcile()
+        import asyncio
+        from .fleet import accrue_storage
+        now_t = time.time()
+        added = asyncio.run(accrue_storage(now_t - last)) if a.watch else 0.0       # stored images/snapshots/volumes, per provider
+        last = now_t
+        if added:
+            print(f"  guard: stored artifacts accrued ${added:.4f}", flush=True)
         if n:
             print(f"  guard: closed {n} ledger entr{'y' if n == 1 else 'ies'} whose sandbox no longer exists", flush=True)
         st = status(); c = st["caps"]
@@ -213,9 +146,8 @@ def main(argv=None) -> int:
         for r, usd in st["by_run"].items():
             print(f"    run {r}: ${usd:.2f}" + (f" / ${c['runs'][r]:.0f}" if r in c["runs"] else ""), flush=True)
         if tripped and a.kill:
-            import asyncio
-            from .janitor import sweep
-            gone = asyncio.run(sweep(0.0, ("daytona", "e2b", "blaxel"), False))
+            from .fleet import sweep
+            gone = asyncio.run(sweep(0.0))
             print(f"  guard: cap tripped, deleted {len(gone)} running sandbox(es)", flush=True)
         if not a.watch:
             return 1 if tripped else 0

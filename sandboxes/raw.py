@@ -53,13 +53,75 @@ class SandboxSpec:
 
 
 @dataclass
+class LiveSandbox:
+    """One sandbox that exists on a provider right now (what `RawSandbox.list_live` returns)."""
+    provider: str
+    id: str
+    created_at: Optional[float] = None          # epoch seconds
+    state: str = ""
+    labels: dict = field(default_factory=dict)
+
+
+@dataclass
+class StoredArtifact:
+    """Billed storage a provider holds for us (what `RawSandbox.stored_artifacts` returns): an image, snapshot or volume."""
+    provider: str
+    kind: str                                    # "image" | "snapshot" | "volume": the keys of CostModel.storage_usd
+    id: str
+    gib: float
+    created_at: Optional[float] = None
+
+
+@dataclass
 class ExecResult:
     rc: int
     stdout: str = ""
 
 
 class RawSandbox(ABC):
+    """What a provider implements. Cost tracking and automatic cost cutting are first class here: a provider is not
+    complete until it can say what it bills for (`cost_model`), what exists right now (`list_live`), how to end one (`kill`),
+    and whether it ends sandboxes by itself at their lifetime (`hard_lifetime`). Everything generic in the library (the
+    uniform cost ledger, caps, the guard, the janitor, ledger reconciliation) is built only on these.
+
+    Subclass contract (checked when the class is defined):
+      provider        short name, the key in registry.PROVIDERS and in config `name:`
+      hard_lifetime   True if the provider itself ends a sandbox at its lifetime (E2B timeout, Blaxel ttl); False if it
+                      only stops idle ones (Daytona), in which case the janitor is the only hard cap
+      _create/_exec/_upload/_download/_delete   per-sandbox primitives
+      list_live/kill  fleet operations (classmethods, no instance needed)
+      stored_artifacts  optional: billed storage (images, snapshots, volumes) the provider holds for us
+      cost_model      optional override; the default comes from pricing.DEFAULT_MODELS[provider]
+    """
     provider: ClassVar[str] = "base"
+    hard_lifetime: ClassVar[bool] = False
+
+    def __init_subclass__(cls, **kw):
+        super().__init_subclass__(**kw)
+        if "provider" not in cls.__dict__ and not getattr(cls, "__abstractmethods__", None):
+            raise TypeError(f"{cls.__name__} must define `provider`")
+        if cls.__dict__.get("provider") and "hard_lifetime" not in cls.__dict__:
+            raise TypeError(f"{cls.__name__} must declare `hard_lifetime` (does the provider end sandboxes at their lifetime itself?)")
+
+    # -- fleet interface (class level) -----------------------------------------------------------------
+    @classmethod
+    @abstractmethod
+    async def list_live(cls) -> "list[LiveSandbox]":
+        """Every sandbox of OURS that exists now. On an account shared with other projects return only ours (by label)."""
+
+    @classmethod
+    @abstractmethod
+    async def kill(cls, sandbox_id: str) -> None:
+        """End one sandbox by id. Must not raise if it is already gone."""
+
+    @classmethod
+    async def stored_artifacts(cls) -> "list[StoredArtifact]":
+        """Billed storage held now. Default: none (E2B storage is free)."""
+        return []
+
+    @classmethod
+    def cost_model(cls, overrides: Optional[dict] = None) -> CostModel:
+        return cost_model_for(cls.provider, overrides)
 
     def __init__(self, spec: SandboxSpec, model: Optional[CostModel] = None):
         self.spec = spec

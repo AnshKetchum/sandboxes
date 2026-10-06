@@ -52,8 +52,22 @@ sandbox_providers:
 * `SandboxRouter.from_config(path)` (async) opens sandboxes on whichever usable provider has the most free
   capacity, fails over when one answers with a quota/429, and enforces `spend_cap_usd` per provider and
   `total_spend_cap_usd` overall. `require=("dind",)` keeps docker-in-docker work off providers that cannot host it.
-* A new provider is one `RawSandbox` subclass (five primitives: create, exec, upload, download, delete) plus
-  `register_provider(ProviderInfo(name, env_keys, raw="module:Class"))`.
+* A new provider is one `RawSandbox` subclass plus `register_provider(ProviderInfo(name, env_keys, raw="module:Class"))`.
+  The subclass is the whole contract; cost tracking and cost cutting are first class parts of it, not add-ons:
+
+  | member | purpose |
+  |---|---|
+  | `provider`, `hard_lifetime` | its name; whether the provider ends a sandbox at its lifetime by itself (a missing declaration fails when the class is defined) |
+  | `cost_model()` | what it bills for (default: `pricing.DEFAULT_MODELS[provider]`) |
+  | `list_live()` (classmethod) | every sandbox of ours that exists now (on a shared account only ours) |
+  | `kill(id)` (classmethod) | end one, quietly if already gone |
+  | `stored_artifacts()` (classmethod, optional) | billed images / snapshots / volumes held for us |
+  | `_create/_exec/_upload/_download/_delete` | the per-sandbox primitives |
+
+  `fleet.py` is the generic side and knows no provider names: the uniform ledger (open / close / storage, with USD from the
+  provider's cost model), spend caps (`guard.py`), the janitor, `reconcile()` (close entries whose sandbox is gone) and
+  `accrue_storage()` all run through those members. `tests/test_provider_interface.py` checks every real provider against
+  the contract and runs a fake provider through the generic flows, so a new provider is correct when those pass.
 
 ```python
 router = SandboxRouter.from_config("/ansh/sandboxes/configs/multi-dind.yaml")

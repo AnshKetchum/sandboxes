@@ -102,8 +102,15 @@ def test_shipped_configs_parse():
 # -- router ----------------------------------------------------------------------------------------
 class FakeRaw(RawSandbox):
     provider = "fake"
+    hard_lifetime = True
     full = False
     started = 0
+
+    @classmethod
+    async def list_live(cls): return []
+
+    @classmethod
+    async def kill(cls, sandbox_id): ...
 
     async def _create(self):
         if type(self).full:
@@ -120,11 +127,11 @@ class FakeRaw(RawSandbox):
 
 
 class FakeA(FakeRaw):
-    provider = "fa"; full = False; started = 0
+    provider = "fa"; hard_lifetime = True; full = False; started = 0
 
 
 class FakeB(FakeRaw):
-    provider = "fb"; full = False; started = 0
+    provider = "fb"; hard_lifetime = False; full = False; started = 0
 
 
 @pytest.fixture

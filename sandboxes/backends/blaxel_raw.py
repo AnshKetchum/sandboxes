@@ -17,7 +17,7 @@ from pathlib import Path
 
 from ..compat import ensure_blaxel_importable
 from ..errors import CapacityError
-from ..raw import ExecResult, RawSandbox
+from ..raw import ExecResult, LiveSandbox, RawSandbox, StoredArtifact
 
 ensure_blaxel_importable()
 
@@ -69,8 +69,50 @@ async def _build_locked(image: str, mem_gb: int, key: str) -> str:
     return ref
 
 
+def _epoch(ts):
+    import datetime as dt
+    try:
+        t = dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        return (t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
 class BlaxelRaw(RawSandbox):
     provider = "blaxel"
+    hard_lifetime = True           # `ttl` at create ends the sandbox
+
+    @classmethod
+    async def list_live(cls):
+        from blaxel.core import SandboxInstance
+        out = []
+        async for x in (await SandboxInstance.list(limit=100)).auto_paging_iter():      # one page is at most `limit`
+            if str(x.status).split(".")[-1] in ("TERMINATED", "DELETING"):
+                continue
+            labels = getattr(getattr(x.metadata, "labels", None), "additional_properties", None) or {}
+            out.append(LiveSandbox("blaxel", x.metadata.name, _epoch(getattr(x.metadata, "created_at", None)), str(x.status), dict(labels)))
+        return out
+
+    @classmethod
+    async def kill(cls, sandbox_id):
+        from blaxel.core import SandboxInstance
+        try:
+            await SandboxInstance.delete(sandbox_id)
+        except Exception as e:  # noqa: BLE001
+            if "not found" not in str(e).lower():
+                raise
+
+    @classmethod
+    async def stored_artifacts(cls):
+        """Images Blaxel keeps for us (billed per GB-month); every image build leaves one behind."""
+        from blaxel.core import ImageInstance
+        out = []
+        page = await ImageInstance.list_async(limit=100)
+        async for im in page.auto_paging_iter():
+            d = im.to_dict() if hasattr(im, "to_dict") else {}
+            out.append(StoredArtifact("blaxel", "image", str((d.get("metadata") or {}).get("name", "")),
+                                      float((d.get("spec") or {}).get("size", 0)) / 2 ** 30, _epoch((d.get("metadata") or {}).get("createdAt"))))
+        return out
 
     def __init__(self, spec, model=None):
         super().__init__(spec, model)

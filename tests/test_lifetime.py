@@ -26,14 +26,7 @@ def test_config_and_spec_defaults_are_finite():
     assert SandboxSpec(image="x", lifetime_s=10 ** 8).lifetime_s == MAX_LIFETIME_MIN * 60
 
 
-def test_janitor_age_and_scope(monkeypatch):
+def test_janitor_age_helper():
     now = dt.datetime.now(dt.timezone.utc)
     assert abs(janitor._age_h((now - dt.timedelta(hours=7)).isoformat()) - 7) < 0.01
     assert janitor._age_h("garbage") is None and janitor._age_h(None) is None
-    # other projects' harbor.* sandboxes are never ours
-    assert "harbor.session_id" not in janitor.DAYTONA_LABELS and "agentdist" in janitor.DAYTONA_LABELS
-
-    async def fake(max_h, dry):
-        return [("fake:1", 9.0)]
-    monkeypatch.setattr(janitor, "_e2b", fake); monkeypatch.setattr(janitor, "_daytona", fake); monkeypatch.setattr(janitor, "_blaxel", fake)
-    assert len(asyncio.run(janitor.sweep(6, ("e2b", "blaxel"), True))) == 2

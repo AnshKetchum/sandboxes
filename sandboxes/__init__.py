@@ -29,14 +29,15 @@ from .models import (
 )
 from .cost import CostLedger, SpendCapExceeded, get_ledger, summary as cost_summary
 from .pricing import DEFAULT_MODELS, CostModel, cost_model_for
-from .raw import ExecResult, RawSandbox, SandboxSpec
+from . import fleet
+from .raw import ExecResult, LiveSandbox, RawSandbox, SandboxSpec, StoredArtifact
 from .registry import PROVIDERS, ProviderInfo, register_provider, usable
 from .router import NoProviderAvailable, SandboxRouter
 from .parallel import AsyncSandboxPool, Job, JobOutcome, ResourceLimits, RetryPolicy, SandboxPool, Stage
 
 __all__ = [
     "CapacityError", "SandboxCreateError", "CostLedger", "SpendCapExceeded", "get_ledger", "cost_summary",
-    "DEFAULT_MODELS", "CostModel", "cost_model_for", "ExecResult", "RawSandbox", "SandboxSpec",
+    "DEFAULT_MODELS", "CostModel", "cost_model_for", "ExecResult", "RawSandbox", "SandboxSpec", "LiveSandbox", "StoredArtifact", "fleet",
     "PROVIDERS", "ProviderInfo", "register_provider", "usable", "NoProviderAvailable", "SandboxRouter",
     "get_sandbox_provider",
     "load_sandbox_providers",
