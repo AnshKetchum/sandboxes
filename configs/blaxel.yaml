@@ -6,7 +6,7 @@ sandbox_providers:
     cpu: 1                              # informational: Blaxel derives CPU from memory
     memory_mb: 2048
     disk_gb: 8
-    peak_concurrent_sandboxes: 200      # QUOTA_EXCEEDED "N/200 sandboxes" (tier 2); a higher tier lifts it
+    peak_concurrent_sandboxes: 250      # measured 2026-10-06: 252 start, then HTTP 429 (it was 200 earlier the same day: "N/200 sandboxes")
     spend_cap_usd: 2500
     auto_stop_minutes: 120
     auto_delete_minutes: 180

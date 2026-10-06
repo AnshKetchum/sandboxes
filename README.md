@@ -89,6 +89,20 @@ python -m sandboxes.cost --run scale-200 --watch 30 --cap 120       # live table
 
 `SANDBOX_CAP_DIVISOR=N` makes each of N data-parallel processes use 1/N of every provider's peak.
 
+## measured comparison (2026-10-06, `scripts/benchmark_concurrency.py`, 2 vCPU / 4 GiB / 10 GB node, python:3.12-slim)
+
+| provider | node $/h | concurrent ceiling seen | first command p50 (N=1 / 100 / max N) | CPU per sandbox as N grows | docker-in-docker |
+|---|---|---|---|---|---|
+| fly | 0.092 | ~190-260 ("organization machine limit", unpublished) | 7 s / 9 s / 11 s (200) | flat | yes: 5 GB loop file on the 8 GB disk |
+| e2b | 0.166 | 100 (plan; 429 beyond) | 0.7 s / 4.5 s | flat | yes, 20 GB disk |
+| blaxel | 0.166 | ~252 (HTTP 429 beyond; 200 earlier the same day) | 4 s / 7 s / 9 s (250) | falls 66% by N=250 | only with 16 GiB+ (RAM-backed disk) |
+| daytona | 0.166 | RAM quota ~120 at 4 GiB (tested to 5 here) | 1 s / - | flat | yes, 10 GB disk |
+| modal | 0.380 | 2000 of 2000 started (Team plan: 5,000) | 0.8 s / 1.1 s / 11 s (2000) | flat | yes with `runtime: vm` |
+
+`python scripts/benchmark_concurrency.py --provider X --concurrencies 1 10 100` reproduces a row;
+`python scripts/verify_costs.py` checks the cost model and the ledger against the published rates and, where the provider has an API,
+its own billing (see below).
+
 ## one command set for every project
 
 Projects that consume sandboxes (euphoria, petunia, greenhouse, pr_task_synthesis, anything new) hold NO provider logic: they

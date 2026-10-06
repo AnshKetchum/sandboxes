@@ -151,6 +151,8 @@ async def main_async(args):
     extra = dict(kv.split("=", 1) for kv in args.extra)
     os.environ.setdefault("SANDBOX_RUN_ID", "bench-" + dt.datetime.now(dt.timezone.utc).strftime("%Y%m%d-%H%M%S"))
     run_id = os.environ["SANDBOX_RUN_ID"]
+    from sandboxes import set_context
+    set_context(owner="benchmark", run=run_id)          # `sandboxes stop --owner benchmark` ends anything a crashed run left
     rows, summary, spent_est = [], {}, 0.0
     for prov in args.provider:
         ok, why = usable(SandboxProviderConfig(name=prov))

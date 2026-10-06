@@ -144,6 +144,7 @@ class BlaxelRaw(RawSandbox):
                 self._sb = g
                 break
             if str(g.status).split(".")[-1] in ("FAILED", "TERMINATED", "DELETING"):
+                await self._cleanup_name()               # a sandbox that failed to deploy still exists (and holds quota): delete it
                 raise RuntimeError(f"blaxel sandbox {self._name} entered {g.status}")
             await asyncio.sleep(1)
         else:

@@ -5,7 +5,7 @@ sandbox_providers:
   - name: fly
     cpu: 2
     memory_mb: 4096
-    peak_concurrent_sandboxes: 100      # unverified: raise once scripts/benchmark_concurrency.py shows the ceiling
+    peak_concurrent_sandboxes: 250      # measured: "organization has reached its machine limit" at ~190-260 (exact limit unpublished: contact billing)
     spend_cap_usd: 2500
     auto_delete_minutes: 240
     extra: {cpu_kind: performance, region: iad, docker_loop_gb: 5}   # overlay2 cannot sit on the overlay root: docker gets a 5 GB ext4 loop file on the machine's real 8 GB disk
