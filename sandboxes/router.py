@@ -32,6 +32,9 @@ from .raw import RawSandbox, SandboxSpec
 from .registry import PROVIDERS, capabilities, load_class, usable
 
 COOLDOWN_S = 20.0
+# Creations allowed in flight per provider. Daytona stalls (creation hangs, error-state sandboxes) when
+# dozens start at the same instant; E2B/Blaxel create in about a second and take far more.
+DEFAULT_START_GATE = {"daytona": 12, "e2b": 30, "blaxel": 30}
 SPEND_CACHE_S = 30.0
 
 
@@ -57,6 +60,7 @@ class _Slot:
     cool_until: float = 0.0
     observed_cap: Optional[int] = None
     capacity_errors: int = 0
+    gate: Optional[asyncio.Semaphore] = None      # bounds sandbox creations in flight on this provider
 
     @property
     def name(self) -> str:
@@ -79,7 +83,10 @@ class SandboxRouter:
         for cfg in configs:
             ok, why = usable(cfg, env)
             if ok:
-                self.slots.append(_Slot(cfg, capabilities(cfg)))
+                slot = _Slot(cfg, capabilities(cfg))
+                n = int((cfg.extra or {}).get("start_gate") or os.environ.get("SANDBOX_START_GATE") or DEFAULT_START_GATE.get(slot.name, 20))
+                slot.gate = asyncio.Semaphore(max(1, n))
+                self.slots.append(slot)
             else:
                 self.skipped[cfg.name] = why
         for n, why in self.skipped.items():
@@ -177,7 +184,8 @@ class SandboxRouter:
                 raise SandboxError(f"provider {slot.name} has no async backend")
             sbx = load_class(info.raw)(spec, cost_model_for(slot.name, slot.cfg.pricing))
             try:
-                await sbx.start()
+                async with slot.gate:
+                    await sbx.start()
             except CapacityError:
                 with self._lock:
                     slot.in_use -= 1
