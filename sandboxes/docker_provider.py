@@ -96,7 +96,9 @@ class DockerProvider(SandboxProvider):
         # `labels` (e.g. {"greenhouse": "1", "greenhouse.run": "<run id>"}) let a
         # caller find exactly its own containers on a host shared with other
         # agents: `docker ps --filter label=greenhouse.run=<run id>`.
-        for k, v in (labels or {}).items():
+        from .labels import standard_labels
+        std = standard_labels(run=name_prefix if name_prefix and not os.environ.get("SANDBOX_RUN_ID") else None, extra=labels)
+        for k, v in std.items():
             args += ["--label", f"{k}={v}"]
         if cfg.cpu:
             args += ["--cpus", str(cfg.cpu)]

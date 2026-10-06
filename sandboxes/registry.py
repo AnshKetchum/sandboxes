@@ -24,6 +24,7 @@ class ProviderInfo:
     raw: Optional[str] = None            # "module:Class" of the async RawSandbox (None: local only)
     sync: Optional[str] = None           # "module:Class" of the sync SandboxProvider
     capabilities: dict = field(default_factory=dict)
+    extra_env: tuple = ()                # optional env vars worth loading from the shared env file (e.g. a region)
     available: Optional[object] = None   # optional callable() -> bool: credentials that are not plain env vars (e.g. a profile file)
 
 
@@ -50,10 +51,10 @@ PROVIDERS: dict[str, ProviderInfo] = {
     "e2b": ProviderInfo("e2b", ("E2B_API_KEY",), "sandboxes.backends.e2b_raw:E2BRaw",
                         "sandboxes.generic_provider:E2BProvider", DEFAULT_CAPABILITIES["e2b"]),
     "blaxel": ProviderInfo("blaxel", ("BL_API_KEY", "BL_WORKSPACE"), "sandboxes.backends.blaxel_raw:BlaxelRaw",
-                           "sandboxes.generic_provider:BlaxelProvider", DEFAULT_CAPABILITIES["blaxel"]),
+                           "sandboxes.generic_provider:BlaxelProvider", DEFAULT_CAPABILITIES["blaxel"], extra_env=("BL_REGION",)),
     "fly": ProviderInfo("fly", ("FLY_API_KEY",), "sandboxes.backends.fly_raw:FlyRaw", "sandboxes.generic_provider:FlyProvider", DEFAULT_CAPABILITIES["fly"]),
     "modal": ProviderInfo("modal", (), "sandboxes.backends.modal_raw:ModalRaw", "sandboxes.generic_provider:ModalProvider",
-                          DEFAULT_CAPABILITIES["modal"], _modal_credentials),
+                          DEFAULT_CAPABILITIES["modal"], available=_modal_credentials),
 }
 
 

@@ -337,7 +337,8 @@ class DaytonaProvider(SandboxProvider):
             task_env_config=task.config.environment,
             override_storage_mb=int((cfg.disk_gb or 8) * 1024),
             auto_snapshot=auto_snapshot,
-            labels=dict(SANDBOX_LABELS),
+            labels=__import__("sandboxes.labels", fromlist=["standard_labels"]).standard_labels(
+                run=name_prefix if name_prefix and not os.environ.get("SANDBOX_RUN_ID") else None, extra=SANDBOX_LABELS),
             auto_stop_interval_mins=cfg.auto_stop_minutes,
             auto_delete_interval_mins=cfg.auto_delete_minutes,
         )

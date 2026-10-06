@@ -89,6 +89,30 @@ python -m sandboxes.cost --run scale-200 --watch 30 --cap 120       # live table
 
 `SANDBOX_CAP_DIVISOR=N` makes each of N data-parallel processes use 1/N of every provider's peak.
 
+## one command set for every project
+
+Projects that consume sandboxes (euphoria, petunia, greenhouse, pr_task_synthesis, anything new) hold NO provider logic: they
+set their identity once (`sandboxes.set_context(owner="euphoria")`, optionally `run=`), open sandboxes through the library
+(`SandboxRouter`, `harbor_adapter.make_env` for harbor tasks), and use the same commands as everyone else:
+
+```
+sandboxes ls    [--owner X] [--run R] [--older-than H]     what is alive, on every provider and local docker
+sandboxes stop  --owner X | --run R | --older-than H | --all [--dry-run] [--batch N --pause S]
+sandboxes reap  [--owner X]                                 delete broken sandboxes (error state, stuck creating)
+sandboxes cost | guard | janitor | providers | audit
+```
+
+A project's own stop/clean command is a one-line wrapper (`sandboxes.cli.stop_for("greenhouse", run=...)`): `euphoria stop`,
+`greenhouse clean`, `pr_task_synthesis/stop_lane.py` are all `sandboxes stop --owner <project>`. Every sandbox carries
+`sandboxes.managed / sandboxes.owner / sandboxes.run` as labels, tags or metadata (whatever the provider calls them), applied once in
+`RawSandbox.start`, the docker provider and the harbor adapter, so scoping needs no provider knowledge. Older markers
+(`agentdist`, `euphoria.managed`, greenhouse's container name prefixes) are mapped to owners in `labels.py`.
+
+**Enforcement:** `sandboxes audit PATH...` lists provider-specific code in a project (provider SDK imports, harbor provider
+classes, provider credentials, `== "daytona"` style branches). `tests/test_fleet_commands.py` runs it over the consuming projects and
+fails if any of them grows provider logic; a deliberate exception needs `# sandboxes-audit: ok (reason)` or a line in the
+project's `.sandboxes-audit-ignore`.
+
 ## spend caps (env cost, enforced here, not in euphoria)
 
 Spend is read from the cost ledger in the sandboxes cache dir (`~/.cache/sandboxes/costs.jsonl`: one `open`/`close` record

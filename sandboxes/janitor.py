@@ -43,7 +43,7 @@ async def sweep(max_age_hours: float = 6.0, providers=None, dry_run: bool = Fals
     return await fleet.sweep(max_age_hours, providers, dry_run)
 
 
-def _load_keys(env_file: str = "/ansh/euphoria/env/.env") -> None:
+def load_provider_keys(env_file: str = "/ansh/euphoria/env/.env") -> None:
     """Provider keys from the shared env file when the calling process (a watchdog, cron) did not export them."""
     from .registry import PROVIDERS
     wanted = {k for info in PROVIDERS.values() for k in info.env_keys}
@@ -57,13 +57,16 @@ def _load_keys(env_file: str = "/ansh/euphoria/env/.env") -> None:
         pass
 
 
+_load_keys = load_provider_keys      # old name
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--max-age-hours", type=float, default=float(os.environ.get("SANDBOX_JANITOR_MAX_AGE_H", 6)))
     ap.add_argument("--providers", default="", help="comma list; default: every provider whose key is set"); ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--watch", type=float, default=0, help="repeat every N seconds")
     a = ap.parse_args(argv)
-    _load_keys()
+    load_provider_keys()
     while True:
         found = asyncio.run(sweep(a.max_age_hours, [p for p in a.providers.split(",") if p] or None, a.dry_run))
         if not a.dry_run:

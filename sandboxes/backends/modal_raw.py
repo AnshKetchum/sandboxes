@@ -47,10 +47,19 @@ class ModalRaw(RawSandbox):
     @classmethod
     async def list_live(cls):
         import modal
-        out = []
+        boxes = []
         async for sb in modal.Sandbox.list.aio(app_id=(await _get_app()).app_id, tags={"sandboxes": "1"}):
-            out.append(LiveSandbox("modal", sb.object_id, None, "", {"sandboxes": "1"}))      # Modal does not report a creation time
-        return out
+            boxes.append(sb)
+        sem = asyncio.Semaphore(20)
+
+        async def tags_of(sb):
+            async with sem:
+                try:
+                    return dict(await sb.get_tags.aio())          # the standard owner/run labels travel as Modal tags
+                except Exception:  # noqa: BLE001
+                    return {"sandboxes": "1"}
+        tags = await asyncio.gather(*(tags_of(sb) for sb in boxes))
+        return [LiveSandbox("modal", sb.object_id, None, "", t) for sb, t in zip(boxes, tags)]      # Modal does not report a creation time
 
     @classmethod
     async def kill(cls, sandbox_id):

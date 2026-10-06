@@ -28,6 +28,9 @@ modal = ["modal>=1.0"]
 fly = ["httpx"]
 test = ["pytest"]
 
+[project.scripts]
+sandboxes = "sandboxes.cli:main"
+
 [tool.hatch.build.targets.wheel]
 packages = ["sandboxes"]
 

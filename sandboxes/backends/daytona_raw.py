@@ -17,7 +17,7 @@ def _is_capacity(msg: str) -> bool:
     return any(k in m for k in ("quota", "limit exceeded", "maximum", "too many", "429", "insufficient"))
 
 
-OUR_LABELS = ("agentdist", "sandboxes.managed", "euphoria.managed")      # not harbor.*: other projects in the org use those
+from ..labels import is_ours                    # standard or legacy markers; never harbor.* (other projects in the org use those)
 
 
 def _epoch(ts):
@@ -46,7 +46,7 @@ class DaytonaRaw(RawSandbox):
                 items = list((await res).items)
             for sb in items:
                 labels = dict(getattr(sb, "labels", None) or {})
-                if any(k in labels for k in OUR_LABELS):
+                if is_ours(labels):
                     out.append(LiveSandbox("daytona", sb.id, _epoch(getattr(sb, "created_at", None)), str(getattr(sb, "state", "")), labels))
         finally:
             await c.close()
@@ -78,7 +78,7 @@ class DaytonaRaw(RawSandbox):
             image=Image.base(s.image),
             resources=Resources(cpu=int(s.cpu), memory=int(s.mem_gb), disk=int(s.disk_gb)),
             env_vars={k: str(v) for k, v in (s.env or {}).items()},
-            labels={"agentdist": "1", "sandboxes.managed": "true", **{k: str(v) for k, v in (s.labels or {}).items()}},
+            labels={k: str(v) for k, v in (s.labels or {}).items()},          # standard labels from RawSandbox.start
             auto_stop_interval=int(s.lifetime_s // 60),
             auto_delete_interval=int(s.lifetime_s // 60) + 60,
             network_block_all=False,

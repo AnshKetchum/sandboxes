@@ -55,14 +55,10 @@ async def sweep(max_age_hours: float = 6.0, providers=None, dry_run: bool = Fals
     return found
 
 
-def reconcile(path=None, live_now: Optional[dict] = None, now: Optional[float] = None) -> int:
-    """Close ledger entries whose sandbox no longer exists on its provider (killed by a stop script, a janitor, the provider's own
-    lifetime, a crashed process). Closed at `now`, so run it often. Entries without a sandbox id are left to the stale cutoff."""
-    import asyncio
+def _reconcile_core(path, live_now: dict, now: Optional[float] = None) -> int:
+    """Close ledger entries whose sandbox is not in `live_now` ({provider: set of ids, or None if that provider could not be listed})."""
     from .cost import get_ledger
     led = get_ledger(); path = path or led.path
-    if live_now is None:
-        live_now = {n: ({x.id for x in v} if v is not None else None) for n, v in asyncio.run(live()).items()}
     now = now or time.time()
     opens, closed = {}, set()
     try:
@@ -90,6 +86,25 @@ def reconcile(path=None, live_now: Optional[dict] = None, now: Optional[float] =
     return n
 
 
+async def areconcile(path=None, live_now: Optional[dict] = None, now: Optional[float] = None, gone=()) -> int:
+    """Close ledger entries whose sandbox no longer exists on its provider (killed by a stop script, a janitor, the provider's own
+    lifetime, a crashed process). Closed at `now`, so run it often. Entries without a sandbox id are left to the stale cutoff.
+    Use this from async code; `reconcile()` is the same for plain scripts."""
+    if live_now is None:
+        live_now = {n: ({x.id for x in v} if v is not None else None) for n, v in (await live()).items()}
+    if gone:                                   # ids just killed: providers take a few seconds to stop listing them
+        live_now = {n: (ids - set(gone) if ids is not None else None) for n, ids in live_now.items()}
+    return _reconcile_core(path, live_now, now)
+
+
+def reconcile(path=None, live_now: Optional[dict] = None, now: Optional[float] = None) -> int:
+    """Synchronous `areconcile` (it starts its own event loop: do not call it from async code)."""
+    import asyncio
+    if live_now is not None:
+        return _reconcile_core(path, live_now, now)
+    return asyncio.run(areconcile(path, None, now))
+
+
 async def accrue_storage(seconds: float, providers=None) -> float:
     """Record `seconds` of storage cost for whatever each provider holds now (images, snapshots, volumes). Returns USD added.
     Call it on a fixed cadence (the guard does, every cycle) with the time since the previous call."""
@@ -104,3 +119,131 @@ async def accrue_storage(seconds: float, providers=None) -> float:
         for a in items:
             total += led.storage(n, a.kind, a.gib, seconds, label=a.id, model=model)
     return total
+
+
+# ---------------------------------------------------------------------------------------------------------------------
+# One command set for every project: ls / stop by owner, run and age. Nothing here names a provider, except the local docker
+# daemon, which is not a RawSandbox and is listed through its own small adapter below.
+# ---------------------------------------------------------------------------------------------------------------------
+import asyncio as _asyncio
+import json as _json
+import shutil as _shutil
+import subprocess as _subprocess
+
+from .labels import LEGACY_DOCKER_PREFIXES, is_ours, owner_of, run_of
+from .raw import LiveSandbox
+
+
+def _docker_ok() -> bool:
+    if not _shutil.which("docker"):
+        return False
+    try:
+        return _subprocess.run(["docker", "version", "--format", "{{.Server.Version}}"], capture_output=True, timeout=8).returncode == 0
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def _docker_live_sync() -> list:
+    r = _subprocess.run(["docker", "ps", "-a", "--no-trunc", "--format", "{{json .}}"], capture_output=True, text=True, timeout=60)
+    out = []
+    for line in r.stdout.splitlines():
+        try:
+            c = _json.loads(line)
+        except ValueError:
+            continue
+        labels = dict(kv.split("=", 1) for kv in (c.get("Labels") or "").split(",") if "=" in kv)
+        name, image = c.get("Names", ""), c.get("Image", "")
+        if not is_ours(labels):                                   # containers older than the standard labels: known name/image conventions
+            owner = next((o for pre, o in LEGACY_DOCKER_PREFIXES.items() if name.startswith(pre)), None) or ("greenhouse" if image.startswith("greenhouse-precheck:") else None)
+            if not owner:
+                continue
+            labels = {**labels, "sandboxes.owner": owner}
+        labels["name"] = name
+        try:
+            created = _dt_epoch(c.get("CreatedAt", ""))
+        except ValueError:
+            created = None
+        out.append(LiveSandbox("docker", c["ID"], created, c.get("State", ""), labels))
+    return out
+
+
+def _dt_epoch(s: str):
+    import datetime as dt
+    return dt.datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc).timestamp() if s else None
+
+
+async def ls(owner=None, run=None, older_than_hours=None, providers=None) -> list:
+    """Sandboxes of ours alive now, optionally narrowed by owner, run and age. Includes local docker containers."""
+    now, out = time.time(), []
+    live_by = await live([p for p in (providers or providers_available()) if p != "docker"])
+    if (providers is None or "docker" in providers) and _docker_ok():
+        live_by["docker"] = await _asyncio.get_running_loop().run_in_executor(None, _docker_live_sync)
+    for items in live_by.values():
+        for sb in items or []:
+            if owner and owner_of(sb.labels) != owner:
+                continue
+            if run and not (run_of(sb.labels) == run or run in sb.labels.get("name", "")):
+                continue
+            if older_than_hours is not None and not (sb.created_at and (now - sb.created_at) / 3600.0 > older_than_hours):
+                continue
+            out.append(sb)
+    return out
+
+
+async def stop(owner=None, run=None, older_than_hours=None, providers=None, all_ours: bool = False, dry_run: bool = False,
+               batch: int = 0, pause_s: float = 0.0) -> list:
+    """End sandboxes of ours: by owner (a project), by run, by age, or `all_ours`. A scope is required so nothing is stopped by
+    accident. Kills through each provider's own `kill`, then closes the cost-ledger entries. Returns what was (or would be) stopped."""
+    if not (owner or run or older_than_hours is not None or all_ours):
+        raise ValueError("stop needs a scope: owner=, run=, older_than_hours= or all_ours=True")
+    found = await ls(owner, run, older_than_hours, providers)
+    if dry_run:
+        return found
+    for i, sb in enumerate(found):
+        if batch and i and i % batch == 0 and pause_s:
+            await _asyncio.sleep(pause_s)                  # staggered deletes: a provider with a deep destroy backlog stays healthy
+        try:
+            if sb.provider == "docker":
+                _subprocess.run(["docker", "rm", "-f", sb.id], capture_output=True, timeout=60)
+            else:
+                await raw_class(sb.provider).kill(sb.id)
+        except Exception:  # noqa: BLE001 — "state change in progress": the next stop gets it
+            pass
+    await areconcile(gone={sb.id for sb in found})
+    return found
+
+
+def classify_state(state: str) -> str:
+    """Normalize a provider's sandbox state string to error | creating | stopped | running (unknown states are running)."""
+    t = (state or "").lower()
+    if "error" in t or "failed" in t:
+        return "error"
+    if any(k in t for k in ("creat", "build", "pending", "deploy", "schedul", "pull")):
+        return "creating"
+    if any(k in t for k in ("stop", "archiv", "destroy", "terminat", "exit")):
+        return "stopped"
+    return "running"
+
+
+async def reap(owner=None, run=None, creating_older_than_min: float = 8.0, providers=None, dry_run: bool = False) -> list:
+    """Delete our sandboxes that are broken: in an error state, or still `creating` after `creating_older_than_min` (the ghosts of
+    timed-out create calls hold quota). Returns [(LiveSandbox, why)]."""
+    now, out = time.time(), []
+    for sb in await ls(owner, run, None, providers):
+        st = classify_state(sb.state)
+        age_min = (now - sb.created_at) / 60.0 if sb.created_at else 0.0
+        why = "error state" if st == "error" else (f"creating for {age_min:.0f} min" if st == "creating" and age_min > creating_older_than_min else None)
+        if why:
+            out.append((sb, why))
+    if not dry_run:
+        for sb, _ in out:
+            try:
+                if sb.provider == "docker":
+                    _subprocess.run(["docker", "rm", "-f", sb.id], capture_output=True, timeout=60)
+                else:
+                    await raw_class(sb.provider).kill(sb.id)
+            except Exception:  # noqa: BLE001
+                pass
+        if out:
+            await areconcile(gone={sb.id for sb, _ in out})
+    return out
