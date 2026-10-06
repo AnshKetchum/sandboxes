@@ -27,3 +27,16 @@ class BuildError(SandboxError):
 
 class PushError(SandboxError):
     """`.push_sandbox_image()` failed."""
+
+
+class CapacityError(SandboxError):
+    """A provider refused to start another sandbox (concurrency/quota/rate limit). The router treats
+    this as "this provider is full right now" and sends the sandbox to another provider."""
+
+    def __init__(self, provider: str, message: str = ""):
+        super().__init__(f"{provider}: {message}")
+        self.provider = provider
+
+
+class SandboxCreateError(SandboxOpenError):
+    """Every attempt to create a sandbox on a provider failed for a non-capacity reason."""

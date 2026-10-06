@@ -50,6 +50,17 @@ from .base import SandboxProvider
 from .errors import BuildError, PushError, SandboxNotOpenError, SandboxOpenError
 from .models import BuildResult, CommandResult, DependencyEntry, PushResult, SandboxProviderConfig
 
+# Bound how many sandbox builds+starts are in flight at once, process-wide.
+# A pipeline wave launching dozens at the same instant made Daytona queue the
+# builds behind each other until the slowest ones hit the start timeout
+# (6 simultaneous timeouts at one wave start, all "just needed more time").
+_OPEN_GATE = threading.BoundedSemaphore(
+    max(1, int(os.environ.get("DAYTONA_MAX_CONCURRENT_OPENS", "24"))))
+_START_TIMEOUT_S = int(os.environ.get("DAYTONA_START_TIMEOUT_S", "600"))
+# Uploads of a prepared package/source tree into a fresh sandbox exceeded the
+# old fixed 120s under org-wide load (several gen sessions lost per wave).
+_UPLOAD_TIMEOUT_S = int(os.environ.get("DAYTONA_UPLOAD_TIMEOUT_S", "360"))
+
 SANDBOX_LABELS = {"sandboxes.managed": "true"}
 _SANDBOX_START_ATTEMPTS = 3
 _OUTPUT_TAIL = 12000
@@ -103,9 +114,22 @@ def _run_sync(coro, timeout: Optional[float] = None):
     fut = asyncio.run_coroutine_threadsafe(coro, loop)
     try:
         return fut.result(timeout=timeout)
-    except TimeoutError:
+    except TimeoutError as e:
         fut.cancel()  # best-effort; the coroutine may be past its last cancellation point
-        raise
+        # Bare TimeoutError's str() is empty — confirmed live to cause real
+        # harm downstream: a repair agent seeing only "daytona sandbox start
+        # failed: " with nothing after it has no way to distinguish "this
+        # timed out" from any other failure, and was repeatedly misdiagnosing
+        # it as "no network available" (a plausible-sounding but wrong guess)
+        # instead of "this needed more time," stripping real dependencies
+        # from Dockerfiles that would have built fine given longer. Give it
+        # an unambiguous message instead.
+        raise TimeoutError(
+            f"operation exceeded its {timeout}s timeout without completing "
+            "(this is a timeout, not a network/connectivity error — if this "
+            "recurs for the same task, the build/operation likely just needs "
+            "more time, not different dependencies)"
+        ) from e
 
 
 def _is_retryable_start_error(e: Exception) -> bool:
@@ -302,6 +326,7 @@ class DaytonaProvider(SandboxProvider):
 
         prebuilt = bool(task.config.environment.docker_image)
         cfg = self.config
+        auto_snapshot = (not prebuilt) if cfg.auto_snapshot is None else cfg.auto_snapshot
         kw = dict(
             environment_dir=task.paths.environment_dir,
             environment_name=task.short_name,
@@ -309,7 +334,7 @@ class DaytonaProvider(SandboxProvider):
             trial_paths=paths,
             task_env_config=task.config.environment,
             override_storage_mb=int((cfg.disk_gb or 8) * 1024),
-            auto_snapshot=not prebuilt,
+            auto_snapshot=auto_snapshot,
             labels=dict(SANDBOX_LABELS),
             auto_stop_interval_mins=cfg.auto_stop_minutes,
             auto_delete_interval_mins=cfg.auto_delete_minutes,
@@ -325,7 +350,26 @@ class DaytonaProvider(SandboxProvider):
 
         env = DaytonaEnvironment(**kw)
         try:
-            _run_sync(_start_env(env), timeout=600)
+            # 600s -> 240s -> 400s. 600s let genuinely HUNG env.start() calls
+            # (never responds at all) sit dead for a full 10 minutes before a
+            # bare, empty-str() TimeoutError fired — cut to 240s to bound
+            # that. But 240s then turned out too tight the OTHER direction:
+            # confirmed live (greenhouse, 2026-09-28), MULTIPLE distinct
+            # candidates with genuinely heavy dependency stacks (pandas,
+            # scipy, sklearn, opencv, pydicom, pyarrow...) started timing out
+            # mid-build — same empty-str() TimeoutError, indistinguishable
+            # from a real hang, so the repair agent (seeing nothing but an
+            # empty error) kept guessing "no network" and stripping real
+            # dependencies instead of the true fix (more time). A real build
+            # taking 3-4 minutes for a heavy scientific-Python stack is
+            # normal, not a hang. 400s splits the difference: still a real
+            # bound on truly-hung opens (33% cut from 600s), while giving
+            # legitimate heavy builds enough room to actually finish.
+            # 2026-09-29: back to 600s (env-overridable) now that starts are
+            # gated by _OPEN_GATE — at 400s, 199/318 test iterations in one
+            # run died as build timeouts, largely queueing behind each other.
+            with _OPEN_GATE:
+                _run_sync(_start_env(env), timeout=_START_TIMEOUT_S)
         except Exception as e:
             raise SandboxOpenError(f"daytona sandbox start failed: {e}") from e
 
@@ -395,9 +439,9 @@ class DaytonaProvider(SandboxProvider):
             # itself just succeeded.
             self.run_command(f"mkdir -p {shlex.quote(parent)} && chmod {perm} {shlex.quote(parent)}")
         if mode == "dir":
-            _run_sync(env.upload_dir(str(local_path), remote_path), timeout=120)
+            _run_sync(env.upload_dir(str(local_path), remote_path), timeout=_UPLOAD_TIMEOUT_S)
         else:
-            _run_sync(env.upload_file(str(local_path), remote_path), timeout=90)
+            _run_sync(env.upload_file(str(local_path), remote_path), timeout=_UPLOAD_TIMEOUT_S)
         self.run_command(f"chmod -R {perm} {shlex.quote(remote_path)}")
 
     def get_file(self, remote_path: str, local_path: Union[str, Path]) -> None:

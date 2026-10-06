@@ -1,0 +1,8 @@
+# Docker-in-docker sandboxes (pr_task_synthesis): 2 vCPU / 4 GiB, own docker daemon per sandbox. Only
+# providers with real disk can host this: daytona (RAM quota limits it to ~120 at 4 GiB) and e2b (100,
+# plan cap). Blaxel's root filesystem is RAM-backed, so it stays out (capabilities.dind: false).
+total_spend_cap_usd: 500
+sandbox_providers:
+  - {base: /ansh/sandboxes/configs/daytona.yaml, overrides: {peak_concurrent_sandboxes: 120, cpu: 2, memory_mb: 4096, disk_gb: 10, auto_snapshot: false}}
+  - {base: /ansh/sandboxes/configs/e2b.yaml, overrides: {cpu: 2, memory_mb: 4096, disk_gb: 20}}
+  - {base: /ansh/sandboxes/configs/blaxel.yaml, overrides: {cpu: 2, memory_mb: 4096, enabled: false}}

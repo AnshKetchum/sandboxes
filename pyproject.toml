@@ -5,7 +5,7 @@ build-backend = "hatchling.build"
 [project]
 name = "sandboxes"
 version = "0.1.0"
-description = "Unified sandbox API over docker and Daytona: put_file, get_file, run_command, add_dependency, build_sandbox_image, push_sandbox_image, get_total_runtime_cost, open, close."
+description = "Unified sandbox API over docker, Daytona, E2B and Blaxel with a capacity router and cost ledger: put_file, get_file, run_command, add_dependency, build_sandbox_image, push_sandbox_image, get_total_runtime_cost, open, close."
 requires-python = ">=3.10"
 dependencies = [
     "pydantic>=2.7",
@@ -22,6 +22,8 @@ dependencies = [
 daytona = [
     "harbor[daytona]==0.22.0",
 ]
+e2b = ["e2b>=2.0"]
+blaxel = ["blaxel>=0.4"]
 test = ["pytest"]
 
 [tool.hatch.build.targets.wheel]

@@ -1,0 +1,9 @@
+# Every provider at once, one size (1 vCPU / 2 GiB / 8 GB) — the euphoria/petunia default. Each provider
+# is used only if its API key is in the environment and `enabled` is not false, so one file works on a
+# laptop (docker only) and on the cluster. Sandboxes go to whichever provider has the most free capacity.
+# Per-provider overrides: {base: .../multi.yaml, overrides: {daytona: {peak_concurrent_sandboxes: 48}}}
+total_spend_cap_usd: 500                # sandbox spend across all providers (cost ledger)
+sandbox_providers:
+  - {base: /ansh/sandboxes/configs/daytona.yaml}
+  - {base: /ansh/sandboxes/configs/e2b.yaml}
+  - {base: /ansh/sandboxes/configs/blaxel.yaml}

@@ -1,0 +1,12 @@
+# E2B: 100 concurrent on the Pro plan (add-ons: 600 / 1100). Storage is free; time is
+# $0.000014/vCPU-s + $0.0000045/GiB-s. Needs E2B_API_KEY in the environment. Sized like daytona.yaml
+# so one config can list both; override cpu/memory_mb/disk_gb per run (disk is fixed at ~20 GB by E2B).
+sandbox_providers:
+  - name: e2b
+    cpu: 1
+    memory_mb: 2048
+    disk_gb: 8
+    peak_concurrent_sandboxes: 100
+    spend_cap_usd: 2500
+    auto_stop_minutes: 120
+    auto_delete_minutes: 180            # sandbox lifetime if never closed

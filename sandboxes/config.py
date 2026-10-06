@@ -19,9 +19,13 @@ and petunia configs, so an existing config file needs no translation:
 
 A bare `sandbox_providers: [{name: docker}]`, an empty/missing
 `sandbox_providers:` key, or no config at all — all resolve to a
-DockerProvider with default settings. The list's FIRST entry is the one
-used; supporting more than one active provider at a time is explicitly out
-of scope (see the package README).
+DockerProvider with default settings.
+
+SEVERAL providers can be listed at once (daytona + e2b + blaxel ...). A listed provider is used only
+when its API key(s) are in the environment (registry.py names them; `api_key_env:` overrides) and
+`enabled` is not false. `get_sandbox_provider()` returns the first usable one (lowest `priority`,
+then list order); `SandboxRouter.from_config()` (router.py) spreads sandboxes over all usable ones by
+free capacity. Entries may be inline dicts, a path string, or `{base: path, overrides: {...}}`.
 
 `sandbox_providers` can ALSO be a reference to the shared base configs in
 `sandboxes/configs/*.yaml` instead of an inline list — the point of those
@@ -52,6 +56,7 @@ import yaml
 from .base import SandboxProvider
 from .errors import ConfigError
 from .models import SandboxProviderConfig
+from .registry import PROVIDERS
 
 SANDBOX_CONFIG_PATH_ENV = "SANDBOX_CONFIG_PATH"
 
@@ -59,74 +64,114 @@ _PROVIDERS: dict[str, type[SandboxProvider]] = {}
 
 
 def _register_builtin_providers() -> None:
+    """Fill _PROVIDERS from registry.PROVIDERS; a provider whose SDK extra is not installed is left out."""
     if _PROVIDERS:
         return
-    from .docker_provider import DockerProvider
+    from .registry import load_class
 
-    _PROVIDERS["docker"] = DockerProvider
+    for name, info in PROVIDERS.items():
+        if not info.sync:
+            continue
+        try:
+            _PROVIDERS[name] = load_class(info.sync)
+        except ImportError:
+            pass  # that provider's extra (daytona/e2b/blaxel SDK) is not installed
+
+
+_KNOWN_KEYS = ("docker", "daytona", "e2b", "blaxel")
+
+
+def _read_yaml(path: Path) -> dict:
+    if not path.is_file():
+        raise ConfigError(f"sandbox base config not found: {path}")
     try:
-        from .daytona_provider import DaytonaProvider
-    except ImportError:
-        pass  # `daytona`/`harbor` extras not installed — docker-only install
-    else:
-        _PROVIDERS["daytona"] = DaytonaProvider
-
-
-def load_sandbox_providers(base_path: Union[str, Path],
-                          overrides: Optional[dict] = None) -> list[dict]:
-    """Load `base_path`'s own `sandbox_providers` list (a shared config file,
-    e.g. one of `sandboxes/configs/*.yaml`) and merge `overrides` onto its
-    first entry. Returns a plain list-of-dicts — the raw YAML shape, not a
-    `SandboxProviderConfig` — for a host codebase with its own config system
-    to splice directly into its own config dict."""
-    base_path = Path(base_path)
-    if not base_path.is_file():
-        raise ConfigError(f"sandbox base config not found: {base_path}")
-    try:
-        raw = yaml.safe_load(base_path.read_text(encoding="utf-8")) or {}
+        return yaml.safe_load(path.read_text(encoding="utf-8")) or {}
     except yaml.YAMLError as e:
-        raise ConfigError(f"failed to parse YAML config {base_path}: {e}") from e
-    providers = (raw or {}).get("sandbox_providers") or []
-    if not isinstance(providers, list) or not providers or not isinstance(providers[0], dict):
-        return []
-    merged = dict(providers[0])
-    if overrides:
-        merged.update(overrides)
-    return [merged]
+        raise ConfigError(f"failed to parse YAML config {path}: {e}") from e
 
 
-def _resolve_sandbox_providers(value) -> list[dict]:
-    """Normalize a `sandbox_providers` YAML value into a plain list-of-dicts:
-    an inline list (today's shape, unchanged), a bare path string (load that
-    file's own list, no overrides), or `{base, overrides}` (load + merge)."""
-    if isinstance(value, list):
-        return value
+def _apply_overrides(entries: list[dict], overrides: Optional[dict]) -> list[dict]:
+    """`overrides` is either flat ({peak_concurrent_sandboxes: 48}, applied to the FIRST entry, the old
+    single-provider behaviour) or keyed by provider name ({e2b: {...}, daytona: {...}})."""
+    if not overrides:
+        return [dict(e) for e in entries]
+    per_provider = isinstance(overrides, dict) and all(k in _KNOWN_KEYS or k in PROVIDERS for k in overrides) \
+        and all(isinstance(v, dict) for v in overrides.values())
+    out = []
+    for i, e in enumerate(entries):
+        e = dict(e)
+        if per_provider:
+            e.update(overrides.get(str(e.get("name", "")).lower(), {}))
+        elif i == 0:
+            e.update(overrides)
+        out.append(e)
+    return out
+
+
+def load_sandbox_providers(base_path: Union[str, Path], overrides: Optional[dict] = None) -> list[dict]:
+    """Load `base_path`'s `sandbox_providers` list (a shared config file such as `configs/multi.yaml`)
+    and apply `overrides` (flat: first entry; or keyed by provider name). Returns ALL entries as plain
+    dicts, the raw YAML shape, for a host codebase with its own config system to splice in."""
+    raw = _read_yaml(Path(base_path))
+    providers = _resolve_sandbox_providers((raw or {}).get("sandbox_providers"), _depth=1)
+    return _apply_overrides(providers, overrides)
+
+
+def _resolve_sandbox_providers(value, _depth: int = 0) -> list[dict]:
+    """Normalize a `sandbox_providers` YAML value into a plain list-of-dicts: an inline list whose items
+    are dicts, path strings or `{base, overrides}`; a bare path string; or `{base, overrides}`."""
+    if _depth > 4:
+        raise ConfigError("sandbox_providers references nest too deeply")
     if isinstance(value, str) and value.strip():
         return load_sandbox_providers(value)
     if isinstance(value, dict) and "base" in value:
         return load_sandbox_providers(value["base"], value.get("overrides"))
+    if isinstance(value, list):
+        out: list[dict] = []
+        for item in value:
+            if isinstance(item, (str, dict)) and (isinstance(item, str) or "base" in item):
+                out.extend(_resolve_sandbox_providers(item, _depth + 1))
+            elif isinstance(item, dict):
+                out.append(item)
+        return out
     return []
 
 
-def _load_provider_config(config_path: Path) -> SandboxProviderConfig:
-    if not config_path.is_file():
-        raise ConfigError(f"sandbox config not found: {config_path}")
-    try:
-        raw = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
-    except yaml.YAMLError as e:
-        raise ConfigError(f"failed to parse YAML config {config_path}: {e}") from e
+def load_provider_entries(config_path: Optional[Union[str, Path]] = None) -> dict:
+    """{"providers": [entry dicts...], "total_spend_cap_usd": float|None} for a config file (explicit path,
+    else SANDBOX_CONFIG_PATH, else a single local docker entry)."""
+    resolved = config_path or os.environ.get(SANDBOX_CONFIG_PATH_ENV)
+    if resolved is None:
+        return {"providers": [{"name": "docker"}], "total_spend_cap_usd": None}
+    raw = _read_yaml(Path(resolved))
     if not isinstance(raw, dict):
-        raise ConfigError(f"sandbox config root must be a mapping: {config_path}")
-    providers = _resolve_sandbox_providers(raw.get("sandbox_providers"))
-    if not providers:
-        return SandboxProviderConfig(name="docker")
-    entry = providers[0]
-    if not isinstance(entry, dict):
-        raise ConfigError(f"sandbox_providers[0] must be a mapping: {config_path}")
-    try:
-        return SandboxProviderConfig.model_validate(entry)
-    except Exception as e:  # pydantic ValidationError
-        raise ConfigError(f"invalid sandbox_providers[0] in {config_path}: {e}") from e
+        raise ConfigError(f"sandbox config root must be a mapping: {resolved}")
+    providers = _resolve_sandbox_providers(raw.get("sandbox_providers")) or [{"name": "docker"}]
+    return {"providers": providers, "total_spend_cap_usd": raw.get("total_spend_cap_usd")}
+
+
+def _load_provider_config(config_path: Path) -> SandboxProviderConfig:
+    """The first USABLE entry (enabled, its API keys present), ordered by `priority` then list order."""
+    from .registry import usable
+
+    entries = load_provider_entries(config_path)["providers"]
+    cfgs = []
+    for i, e in enumerate(entries):
+        if not isinstance(e, dict):
+            raise ConfigError(f"sandbox_providers[{i}] must be a mapping: {config_path}")
+        try:
+            cfgs.append(SandboxProviderConfig.model_validate(e))
+        except Exception as ex:  # pydantic ValidationError
+            raise ConfigError(f"invalid sandbox_providers[{i}] in {config_path}: {ex}") from ex
+    for cfg in sorted(cfgs, key=lambda c: c.priority):       # sorted() is stable: list order breaks ties
+        if usable(cfg)[0]:
+            return cfg
+    # None is usable. A single-provider config keeps its historical behaviour: return the first entry that
+    # is not explicitly disabled, so the provider itself reports the missing key at open() time.
+    for cfg in sorted(cfgs, key=lambda c: c.priority):
+        if cfg.enabled:
+            return cfg
+    raise ConfigError(f"every sandbox provider in {config_path} is disabled")
 
 
 def get_sandbox_provider(config_path: Optional[Union[str, Path]] = None) -> SandboxProvider:
@@ -146,6 +191,6 @@ def get_sandbox_provider(config_path: Optional[Union[str, Path]] = None) -> Sand
         supported = ", ".join(sorted(_PROVIDERS)) or "docker"
         raise ConfigError(
             f"unsupported sandbox provider {name!r} (supported: {supported}); "
-            f"install the `sandboxes[daytona]` extra if you meant daytona"
+            f"install the matching extra (`sandboxes[daytona|e2b|blaxel]`) if you meant one of those"
         )
     return provider_cls(cfg)
