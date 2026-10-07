@@ -4,7 +4,8 @@ harbor ships native environments for only some providers (daytona, e2b, blaxel).
 added next) run harbor tasks without hand-writing a harbor environment per provider: it opens the task's PREBUILT image
 (`task_env_config.docker_image`) as a raw sandbox and maps harbor's exec / upload / download onto the raw backend.
 
-Limit: no Dockerfile builds. A task without a `docker_image` is rejected at construction, so the caller can pick another provider.
+A task without a `docker_image` is built from its Dockerfile on providers marked `builds_dockerfile` (modal); on the others it is rejected at
+construction, so the caller can pick another provider.
 Cost accounting is the RawSandbox's own (it opens/closes the ledger entry in start()/stop()), so `LEDGER_NATIVE` tells
 harbor_adapter / euphoria not to count the sandbox a second time.
 
@@ -15,6 +16,7 @@ harbor_adapter / euphoria not to count the sandbox a second time.
 from __future__ import annotations
 
 import math
+import re
 import shlex
 from pathlib import Path
 from typing import Optional
@@ -25,6 +27,17 @@ from harbor.environments.definition import effective_exec_cwd
 
 from .raw import SandboxSpec
 from .registry import PROVIDERS, load_class
+
+
+def dockerfile_workdir(environment_dir) -> str | None:
+    """The Dockerfile's last absolute WORKDIR: providers that replace the image's entrypoint (fly) start commands in `/`, not where the
+    image says, so a harbor exec with no cwd needs it passed explicitly (modal and daytona honour the image's WORKDIR themselves)."""
+    try:
+        text = (Path(environment_dir) / "Dockerfile").read_text()
+    except OSError:
+        return None
+    found = re.findall(r"^\s*WORKDIR\s+(/\S+)\s*$", text, flags=re.MULTILINE | re.IGNORECASE)
+    return found[-1] if found else None
 
 
 class RawSandboxEnvironment(BaseEnvironment):
@@ -52,7 +65,10 @@ class RawSandboxEnvironment(BaseEnvironment):
         return EnvironmentCapabilities()
 
     def _validate_definition(self):
-        if not self.task_env_config.docker_image:
+        if not self.task_env_config.docker_image and (PROVIDERS[self.PROVIDER].capabilities or {}).get("builds_dockerfile"):
+            if not (self.environment_dir / "Dockerfile").exists():
+                raise RuntimeError(f"{self.PROVIDER}: task has neither a docker_image nor an environment/Dockerfile")
+        elif not self.task_env_config.docker_image:
             raise RuntimeError(f"{self.PROVIDER}: a raw sandbox runs a prebuilt image, and this task has no docker_image "
                                f"(Dockerfile builds are not supported on this provider)")
 
@@ -60,13 +76,14 @@ class RawSandboxEnvironment(BaseEnvironment):
     async def start(self, force_build: bool):
         cfg = self.task_env_config
         spec = SandboxSpec(
-            image=cfg.docker_image,
+            image=cfg.docker_image or "",
             cpu=int(self._effective_cpus or 1),
             mem_gb=max(1, math.ceil((self._effective_memory_mb or 2048) / 1024)),
             disk_gb=max(1, math.ceil((self._effective_storage_mb or 8192) / 1024)),
             env=dict(self._startup_env()),
             labels=dict(self._labels),
-            extra={k: v for k, v in self._sandbox_extra.items() if k != "docker_loop_gb"},   # no docker daemon in a harbor task's sandbox
+            extra={**{k: v for k, v in self._sandbox_extra.items() if k != "docker_loop_gb"},   # no docker daemon in a harbor task's sandbox
+                   **({} if cfg.docker_image else {"dockerfile": str(self.environment_dir / "Dockerfile"), "context_dir": str(self.environment_dir)})},
             **({"lifetime_s": int(self._lifetime_s)} if self._lifetime_s else {}),
         )
         self._raw = load_class(PROVIDERS[self.PROVIDER].raw)(spec)
@@ -114,7 +131,7 @@ class RawSandboxEnvironment(BaseEnvironment):
                    timeout_sec: int | None = None, user: str | int | None = None) -> ExecResult:
         raw = self._require()
         user = self._resolve_user(user)
-        r = await raw.exec(self._as_user(command, user), cwd=effective_exec_cwd(cwd, self.task_env_config.workdir, None),
+        r = await raw.exec(self._as_user(command, user), cwd=effective_exec_cwd(cwd, self.task_env_config.workdir, dockerfile_workdir(self.environment_dir)),
                            env=self._merge_env(env), timeout=timeout_sec)
         return ExecResult(stdout=r.stdout, stderr="", return_code=r.rc)
 

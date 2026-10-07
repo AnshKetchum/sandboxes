@@ -1,13 +1,3 @@
-# Shared base config for the daytona sandbox provider — the values every
-# codebase (euphoria, petunia, greenhouse) using daytona had been
-# independently copy-pasting into their own configs before this file
-# existed (confirmed: identical across 7 of euphoria's 9 config files and
-# petunia's own default.yaml). A consuming config loads this file as its
-# BASE and layers its own per-run overrides on top — see
-# sandboxes.config.load_sandbox_providers() — rather than repeating every
-# field itself; `peak_concurrent_sandboxes` in particular genuinely varies
-# per experiment/run (48-230 observed) and is the field most worth
-# overriding, not copying wholesale.
 sandbox_providers:
   - name: daytona
     disk_gb: 8                          # override_storage_mb

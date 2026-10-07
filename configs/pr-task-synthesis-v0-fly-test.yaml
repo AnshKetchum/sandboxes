@@ -1,0 +1,10 @@
+# Fly-only pool for a small euphoria check of fly_raw (Dockerfile builds in Fly VMs, pushed to registry.fly.io).
+total_spend_cap_usd: 700
+sandbox_providers:
+  - name: fly
+    cpu: 1
+    memory_mb: 2048
+    peak_concurrent_sandboxes: 20
+    spend_cap_usd: 100
+    auto_delete_minutes: 120
+    extra: {cpu_kind: performance, region: iad}

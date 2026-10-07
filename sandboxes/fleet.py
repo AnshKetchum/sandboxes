@@ -86,6 +86,38 @@ def _reconcile_core(path, live_now: dict, now: Optional[float] = None) -> int:
     return n
 
 
+def close_dead_entries(max_age_s: float = 3 * 3600.0, path=None, now: Optional[float] = None) -> int:
+    """Close ledger entries still open after `max_age_s`. reconcile() only closes entries that carry a sandbox id, so a killed process's
+    entries (no id yet, or an old record) would bill up to the stale ceiling and count against the spend cap for hours. A sandbox never
+    outlives its own lifetime (<= 3 h in every config here), so one open longer than that is dead; it is billed at `max_age_s`."""
+    from .cost import CostLedger, get_ledger
+    led = CostLedger(path) if path else get_ledger()
+    path = path or led.path
+    cut = (now or time.time()) - max_age_s
+    opens, closed = {}, set()
+    try:
+        for line in open(path):
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("ev") == "open":
+                opens[r["id"]] = r
+            elif r.get("ev") == "close":
+                closed.add(r["id"])
+    except OSError:
+        return 0
+    n = 0
+    for h, o in opens.items():
+        if h in closed or o["t"] > cut:
+            continue
+        usd = raw_class(o["provider"]).cost_model().sandbox_usd(o["cpu"], o["ram_gib"], o["disk_gib"], max_age_s) if o["provider"] in PROVIDERS else 0.0
+        led._append({"t": o["t"] + max_age_s, "ev": "close", "id": h, "provider": o["provider"], "run": o.get("run", ""), "seconds": max_age_s,
+                     "usd": round(usd, 6), "note": "closed: open past the lifetime ceiling (dead process)"})
+        n += 1
+    return n
+
+
 async def areconcile(path=None, live_now: Optional[dict] = None, now: Optional[float] = None, gone=()) -> int:
     """Close ledger entries whose sandbox no longer exists on its provider (killed by a stop script, a janitor, the provider's own
     lifetime, a crashed process). Closed at `now`, so run it often. Entries without a sandbox id are left to the stale cutoff.
@@ -191,26 +223,37 @@ async def ls(owner=None, run=None, older_than_hours=None, providers=None) -> lis
 
 
 async def stop(owner=None, run=None, older_than_hours=None, providers=None, all_ours: bool = False, dry_run: bool = False,
-               batch: int = 0, pause_s: float = 0.0) -> list:
+               batch: int = 0, pause_s: float = 0.0, on_result=None) -> list:
     """End sandboxes of ours: by owner (a project), by run, by age, or `all_ours`. A scope is required so nothing is stopped by
-    accident. Kills through each provider's own `kill`, then closes the cost-ledger entries. Returns what was (or would be) stopped."""
+    accident. Kills through each provider's own `kill`, then closes the cost-ledger entries of the ones that were deleted.
+    Returns the sandboxes that were deleted (with `dry_run`: the ones that would be). A kill that fails is left alone (the next stop
+    gets it), is not returned and is not closed in the ledger. `on_result(sandbox, error_or_None)` is called as each is handled."""
     if not (owner or run or older_than_hours is not None or all_ours):
         raise ValueError("stop needs a scope: owner=, run=, older_than_hours= or all_ours=True")
     found = await ls(owner, run, older_than_hours, providers)
     if dry_run:
+        for sb in found:
+            if on_result:
+                on_result(sb, None)
         return found
+    deleted = []
     for i, sb in enumerate(found):
         if batch and i and i % batch == 0 and pause_s:
             await _asyncio.sleep(pause_s)                  # staggered deletes: a provider with a deep destroy backlog stays healthy
+        err = None
         try:
             if sb.provider == "docker":
                 _subprocess.run(["docker", "rm", "-f", sb.id], capture_output=True, timeout=60)
             else:
                 await raw_class(sb.provider).kill(sb.id)
-        except Exception:  # noqa: BLE001 — "state change in progress": the next stop gets it
-            pass
-    await areconcile(gone={sb.id for sb in found})
-    return found
+        except Exception as e:  # noqa: BLE001 — "state change in progress": the next stop gets it
+            err = e
+        if err is None:
+            deleted.append(sb)
+        if on_result:
+            on_result(sb, err)
+    await areconcile(gone={sb.id for sb in deleted})
+    return deleted
 
 
 def classify_state(state: str) -> str:

@@ -70,8 +70,16 @@ def main(argv=None) -> int:
     while True:
         found = asyncio.run(sweep(a.max_age_hours, [p for p in a.providers.split(",") if p] or None, a.dry_run))
         if not a.dry_run:
-            from .fleet import reconcile
+            from .fleet import close_dead_entries, reconcile
             reconcile()                                  # the sandboxes just deleted stop accruing in the cost ledger
+            close_dead_entries()                         # and so do entries a dead process left open past any sandbox's lifetime
+        if os.environ.get("BL_API_KEY") and (not a.providers or "blaxel" in a.providers):
+            from .blaxel_images import purge_images
+            try:
+                r = asyncio.run(purge_images(30.0, a.dry_run))
+                print(f"{time.strftime('%FT%TZ', time.gmtime())} janitor: blaxel images {r}", flush=True)
+            except Exception as e:  # noqa: BLE001 — the sweep must never stop the janitor
+                print(f"janitor: blaxel image sweep failed: {e!r}", flush=True)
         verb = "would delete" if a.dry_run else "deleted"
         print(f"{time.strftime('%FT%TZ', time.gmtime())} janitor: {verb} {len(found)} sandbox(es) older than {a.max_age_hours:g} h"
               + ("".join(f"\n  {n} ({age:.1f} h)" for n, age in found[:20])), flush=True)

@@ -24,3 +24,21 @@ def test_raw_backed_providers_build_a_harbor_class():
         if name not in HARBOR_ENVS:
             cls = harbor_env_class(name)
             assert issubclass(cls, BaseEnvironment) and cls.PROVIDER == name and cls.LEDGER_NATIVE
+
+
+def test_every_provider_declares_whether_it_needs_a_prebuilt_image():
+    undeclared = [n for n, i in PROVIDERS.items() if "requires_prebuilt_image" not in i.capabilities]
+    assert not undeclared, f"declare requires_prebuilt_image in registry.DEFAULT_CAPABILITIES for {undeclared}"
+
+
+def test_the_declaration_matches_what_the_provider_harbor_path_can_do():
+    # harbor's native environments (HARBOR_ENVS) build a task's Dockerfile; the generic raw-backed one (harbor_raw) only boots an image
+    for name in harbor_providers():
+        assert PROVIDERS[name].capabilities["requires_prebuilt_image"] == (name not in HARBOR_ENVS and not PROVIDERS[name].capabilities.get("builds_dockerfile")), name
+
+
+def test_dockerfile_workdir_is_the_last_absolute_one(tmp_path):
+    from sandboxes.harbor_raw import dockerfile_workdir
+    (tmp_path / "Dockerfile").write_text("FROM x\nWORKDIR /a\nRUN true\nworkdir /workspace\nWORKDIR rel\n")
+    assert dockerfile_workdir(tmp_path) == "/workspace"
+    assert dockerfile_workdir(tmp_path / "nope") is None

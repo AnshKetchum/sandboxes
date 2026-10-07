@@ -5,7 +5,7 @@ sandbox_providers:
   - name: modal
     cpu: 2
     memory_mb: 4096
-    peak_concurrent_sandboxes: 2000     # measured: 2000 of 2000 started and ran (docs: Team plan allows 5,000)
+    peak_concurrent_sandboxes: 100      # the Modal workspace limit (dashboard, 2026-10-07): sandboxes beyond it sit in scheduling. An earlier benchmark started 2000, so the limit has changed
     spend_cap_usd: 2500
     auto_delete_minutes: 240
     extra: {runtime: vm}

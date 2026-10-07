@@ -1,0 +1,11 @@
+# One-hour Modal test for pr-task-synthesis-v0: Daytona-sized sandboxes (1 vCPU / 2 GiB, as daytona.yaml) on Modal VMs.
+# Modal boots prebuilt registry images only, so this only runs the tasks listed in image_map.jsonl.
+total_spend_cap_usd: 250
+sandbox_providers:
+  - name: modal
+    cpu: 1
+    memory_mb: 2048
+    peak_concurrent_sandboxes: 500
+    spend_cap_usd: 250
+    auto_delete_minutes: 120
+    extra: {runtime: vm}

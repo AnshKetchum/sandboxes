@@ -30,14 +30,25 @@ class ProviderInfo:
 
 # `dind`: can run a docker daemon with real storage inside the sandbox (what pr_task_synthesis needs).
 # `image_ref`: opens a sandbox directly from a registry image reference.
+# `builds_dockerfile`: RawSandbox builds a task's Dockerfile itself when the spec carries extra["dockerfile"] (+ ["context_dir"]).
+# `requires_prebuilt_image`: the provider can only boot an image that is ALREADY in a registry; it cannot build a task's Dockerfile.
+#   A consumer must not send it a task without a built image. Every provider declares this explicitly (tests enforce it).
+# `build_timeout_s`: a build running longer than this is cancelled and fails (one E2B build hung for 35+ minutes holding a build slot).
+# `max_concurrent_builds`: the provider limits how many image/template builds run at once (e2b: 20); the harbor environment gates its builds to this many, host-wide.
+# `create_rate_per_s` / `create_burst`: the provider's published limit on creating sandboxes (see ratelimit.py), shared by all processes on a host:
+#   modal  5/s       the API's own error ("Sandbox creation rate limit (5/s) exceeded"); its docs give no figure
+#   e2b    5/s       Pro plan (Hobby 1/s)                         docs.e2b.dev/sandbox/rate-limits
+#   fly    1/s, 3    create-machine: 1 req/s per action, short bursts to 3     fly.io/docs/machines/api/working-with-machines-api
+#   daytona 5/s      tier 1: 300 sandbox creations/min (tiers 2-4: 400/500/600) www.daytona.io/docs/en/limits
+#   blaxel -         no per-second creation limit published (concurrency tiers only)
 DEFAULT_CAPABILITIES = {
-    "daytona": {"dind": True, "image_ref": True, "persistent_disk_gb": 10},
-    "e2b": {"dind": True, "image_ref": True, "persistent_disk_gb": 20},
-    "blaxel": {"dind": False, "image_ref": True, "persistent_disk_gb": 0,
+    "daytona": {"create_rate_per_s": 5, "create_burst": 5, "dind": True, "image_ref": True, "requires_prebuilt_image": False, "persistent_disk_gb": 10},
+    "e2b": {"create_rate_per_s": 5, "create_burst": 5, "max_concurrent_builds": 15, "build_timeout_s": 900, "dind": True, "image_ref": True, "requires_prebuilt_image": False, "persistent_disk_gb": 20},
+    "blaxel": {"dind": False, "image_ref": True, "requires_prebuilt_image": False, "persistent_disk_gb": 0,
                "note": "root fs is RAM-backed (50% of memory); docker only fits in a small loop file"},
-    "docker": {"dind": False, "image_ref": True, "persistent_disk_gb": 0, "local": True},
-    "fly": {"dind": True, "image_ref": True, "persistent_disk_gb": 8, "note": "Firecracker microVM, real disk (8 GB rootfs by default)"},
-    "modal": {"dind": True, "image_ref": True, "persistent_disk_gb": 500, "note": "runtime=vm (real VM, large root disk); gvisor cannot run a daemon"},
+    "docker": {"dind": False, "image_ref": True, "requires_prebuilt_image": False, "persistent_disk_gb": 0, "local": True},
+    "fly": {"create_rate_per_s": 1, "create_burst": 3, "dind": True, "image_ref": True, "requires_prebuilt_image": False, "builds_dockerfile": True, "persistent_disk_gb": 8, "note": "Firecracker microVM, real disk (8 GB rootfs by default)"},
+    "modal": {"create_rate_per_s": 5, "create_burst": 5, "dind": True, "image_ref": True, "requires_prebuilt_image": False, "builds_dockerfile": True, "persistent_disk_gb": 500, "note": "runtime=vm (real VM, large root disk); gvisor cannot run a daemon"},
 }
 
 
@@ -96,3 +107,9 @@ def capabilities(cfg: SandboxProviderConfig) -> dict:
     base = dict(PROVIDERS[cfg.name.lower()].capabilities) if cfg.name.lower() in PROVIDERS else {}
     base.update(cfg.capabilities or {})
     return base
+
+
+def requires_prebuilt_image(cfg: SandboxProviderConfig) -> bool:
+    """True when `cfg`'s provider cannot build a task's Dockerfile and so needs a built image (a config's `capabilities:` may override).
+    Undeclared counts as True: the failure mode is skipping a provider, not failing every task it is sent."""
+    return bool(capabilities(cfg).get("requires_prebuilt_image", True))

@@ -27,7 +27,7 @@ from pathlib import Path
 from typing import ClassVar, Optional
 
 from .cost import get_ledger
-from .errors import CapacityError, SandboxCreateError, SandboxError
+from .errors import CapacityError, ImageBuildError, SandboxCreateError, SandboxError
 from .pricing import CostModel, cost_model_for
 
 
@@ -158,16 +158,29 @@ class RawSandbox(ABC):
         last: Optional[Exception] = None
         for attempt in range(self.spec.create_tries):
             try:
+                from .ratelimit import acquire_create
+                await acquire_create(self.provider)             # the provider's creation rate limit, shared by every process on this host
                 await self._create()
                 break
-            except CapacityError:
-                raise                       # the router decides what to do about a full provider
+            except (CapacityError, ImageBuildError) as e:
+                if isinstance(e, CapacityError) and "rate limit" in str(e).lower():     # throttled, not full: back off and try again
+                    last = e
+                    await asyncio.sleep(2 + 3 * attempt)
+                    continue
+                if isinstance(e, ImageBuildError):
+                    from .health import record
+                    record(self.provider, False)
+                raise                       # the router decides what to do about a full provider; a failed image build fails again
             except Exception as e:  # noqa: BLE001 — provider flakes are retried
                 last = e
                 await asyncio.sleep(10 * (attempt + 1))
         else:
+            from .health import record
+            record(self.provider, False)
             raise SandboxCreateError(f"{self.provider}: sandbox creation failed after "
                                      f"{self.spec.create_tries} tries: {last}")
+        from .health import record
+        record(self.provider, True)             # the circuit breaker (health.py) watches how starts go on each provider
         s = self.spec
         self._ledger_handle = get_ledger().open(self.provider, cpu=s.cpu, ram_gib=s.mem_gb, disk_gib=s.disk_gb,
                                                 labels=s.labels, sandbox_id=self.sandbox_id)

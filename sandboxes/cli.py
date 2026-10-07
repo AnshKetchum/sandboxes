@@ -24,23 +24,47 @@ def _fmt_age(sb) -> str:
     return "-" if not sb.created_at else f"{(time.time() - sb.created_at) / 3600:.1f}h"
 
 
+def _fmt_sandbox(sb) -> str:
+    from .labels import owner_of, run_of
+    return f"{sb.provider:<8} {sb.id[:24]:<26} {_fmt_age(sb):>7}  owner={owner_of(sb.labels) or '-':<18} run={run_of(sb.labels) or '-':<24} {sb.state}"
+
+
 def cmd_ls(a) -> int:
     from . import fleet
     found = asyncio.run(fleet.ls(a.owner, a.run, a.older_than, a.providers.split(",") if a.providers else None))
-    from .labels import owner_of, run_of
     for sb in found:
-        print(f"{sb.provider:<8} {sb.id[:24]:<26} {_fmt_age(sb):>7}  owner={owner_of(sb.labels) or '-':<18} run={run_of(sb.labels) or '-':<24} {sb.state}")
+        print(_fmt_sandbox(sb))
     print(f"{len(found)} sandbox(es)")
     return 0
 
 
-def stop_for(owner: str, run: str | None = None, dry_run: bool = False, quiet: bool = False) -> int:
-    """What a project's own stop/clean command calls: stop everything `owner` started (optionally one run). Returns the count."""
+def _reporter(dry_run: bool, failed: list):
+    """The per-sandbox line `stop` prints as it goes: what it deletes (or would), and what it could not."""
+    def report(sb, err=None):
+        if err is not None:
+            failed.append(sb)
+        verb = "would delete" if dry_run else ("FAILED" if err is not None else "deleted")
+        print(f"  {verb:<12} {_fmt_sandbox(sb)}" + (f"  [{type(err).__name__}: {err}]" if err is not None else ""), flush=True)
+    return report
+
+
+def _stop_summary(done: list, failed: list, dry_run: bool) -> str:
+    from collections import Counter
+    by = ", ".join(f"{p}={n}" for p, n in sorted(Counter(sb.provider for sb in done).items())) or "none"
+    return (f"{'would delete' if dry_run else 'deleted'} {len(done)} sandbox(es) [{by}]"
+            + (f"; {len(failed)} FAILED (still alive; run stop again)" if failed else ""))
+
+
+def stop_for(owner: str, run: str | None = None, dry_run: bool = False, quiet: bool = False, providers=None) -> int:
+    """What a project's own stop/clean command calls: stop everything `owner` started (optionally one run, optionally only on
+    `providers`). Prints one line per sandbox unless `quiet`. Returns how many were deleted (or would be)."""
     from . import fleet
-    found = asyncio.run(fleet.stop(owner=owner, run=run, dry_run=dry_run))
+    failed: list = []
+    done = asyncio.run(fleet.stop(owner=owner, run=run, providers=providers, dry_run=dry_run,
+                                  on_result=None if quiet else _reporter(dry_run, failed)))
     if not quiet:
-        print(f"{'would stop' if dry_run else 'stopped'} {len(found)} {owner} sandbox(es)" + (f" of run {run}" if run else ""))
-    return len(found)
+        print(f"{owner}: {_stop_summary(done, failed, dry_run)}" + (f" of run {run}" if run else ""))
+    return len(done)
 
 
 def cmd_stop(a) -> int:
@@ -48,11 +72,11 @@ def cmd_stop(a) -> int:
     if not (a.owner or a.run or a.older_than is not None or a.all):
         print("stop needs a scope: --owner X, --run R, --older-than H or --all", file=sys.stderr)
         return 2
-    found = asyncio.run(fleet.stop(a.owner, a.run, a.older_than, a.providers.split(",") if a.providers else None, a.all, a.dry_run, a.batch, a.pause))
-    from collections import Counter
-    c = Counter(sb.provider for sb in found)
-    print(f"{'would stop' if a.dry_run else 'stopped'} {len(found)} sandbox(es): {dict(c)}")
-    return 0
+    failed: list = []
+    done = asyncio.run(fleet.stop(a.owner, a.run, a.older_than, a.providers.split(",") if a.providers else None, a.all, a.dry_run,
+                                  a.batch, a.pause, on_result=_reporter(a.dry_run, failed)))
+    print(_stop_summary(done, failed, a.dry_run))
+    return 1 if failed else 0
 
 
 def cmd_reap(a) -> int:

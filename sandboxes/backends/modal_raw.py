@@ -10,14 +10,38 @@ N processes' worth of CPU; a request without a limit lets a sandbox burst to ~4x
 from __future__ import annotations
 
 import asyncio
+from pathlib import Path
 
-from ..errors import CapacityError
+from ..errors import CapacityError, ImageBuildError
 from ..raw import ExecResult, LiveSandbox, RawSandbox
 
 _app = None
 _app_lock = None
-_images: dict = {}
+_images: dict = {}          # image key -> the Task that builds (or just resolves) it, shared by every sandbox of that image in this process
 APP_NAME = "sandboxes"
+
+
+async def _image(app, spec):
+    """The modal Image for `spec`: its registry image, or built from `extra["dockerfile"]` (+ `extra["context_dir"]`). Built once per
+    process however many sandboxes want it (the 3 tries of a task), and a failed build is remembered, so siblings fail at once."""
+    import modal
+    dockerfile = spec.extra.get("dockerfile")
+    key = f"{dockerfile}|{spec.extra.get('context_dir')}" if dockerfile else spec.image
+    if key not in _images:
+        if dockerfile:
+            image = modal.Image.from_dockerfile(str(dockerfile), context_dir=str(spec.extra.get("context_dir") or Path(dockerfile).parent))
+
+            async def build():
+                try:
+                    return await image.build.aio(app)
+                except modal.exception.ImageBuildError as e:
+                    raise ImageBuildError(f"modal: image build failed for {dockerfile}: {str(e)[:300]}") from e
+            _images[key] = asyncio.ensure_future(build())
+        else:
+            fut = asyncio.get_running_loop().create_future()
+            fut.set_result(modal.Image.from_registry(spec.image))
+            _images[key] = fut
+    return await asyncio.shield(_images[key])
 
 
 async def _get_app():
@@ -74,11 +98,14 @@ class ModalRaw(RawSandbox):
         import modal
         s = self.spec
         app = await _get_app()
-        img = _images.setdefault(s.image, modal.Image.from_registry(s.image))
+        img = await _image(app, s)
+        # modal 1.5 has no `runtime=` argument: the sandbox runtime is the process-wide MODAL_FUNCTION_RUNTIME setting (vm = a real VM
+        # with its own kernel and a large root disk; unset = gvisor). One runtime per process, which is how every config here uses it.
+        modal.config.config.override_locally("function_runtime", s.extra.get("runtime", "vm"))
         try:
             self._sb = await modal.Sandbox.create.aio(
                 app=app, image=img, cpu=(float(s.cpu), float(s.cpu)), memory=int(s.mem_gb) * 1024, timeout=int(s.lifetime_s),
-                runtime=s.extra.get("runtime", "vm"), tags={"sandboxes": "1", **{k: str(v) for k, v in (s.labels or {}).items()}},
+                tags={"sandboxes": "1", **{k: str(v) for k, v in (s.labels or {}).items()}},
                 env={k: str(v) for k, v in (s.env or {}).items()} or None, region=s.extra.get("region"))
         except Exception as e:  # noqa: BLE001
             if _is_capacity(e):

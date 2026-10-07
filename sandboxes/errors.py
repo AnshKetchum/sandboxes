@@ -40,3 +40,7 @@ class CapacityError(SandboxError):
 
 class SandboxCreateError(SandboxOpenError):
     """Every attempt to create a sandbox on a provider failed for a non-capacity reason."""
+
+
+class ImageBuildError(SandboxError):
+    """A provider could not build the sandbox's image from a Dockerfile. Not retried: the same build would fail the same way."""

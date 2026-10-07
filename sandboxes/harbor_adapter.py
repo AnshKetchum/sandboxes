@@ -24,7 +24,7 @@ from .lifetime import DEFAULT_IDLE_STOP_MIN, clamp_lifetime_min
 HARBOR_ENVS = {
     "daytona": ("harbor.environments.daytona.environment", "DaytonaEnvironment"),
     "e2b": ("sandboxes.harbor_e2b", "LifetimeE2BEnvironment"),   # harbor's E2BEnvironment with a real lifetime + our labels
-    "blaxel": ("harbor.environments.blaxel", "BlaxelEnvironment"),
+    "blaxel": ("sandboxes.harbor_blaxel", "LabelledBlaxelEnvironment"),   # harbor's BlaxelEnvironment + our labels
 }
 _live: dict = {}
 
@@ -54,7 +54,7 @@ def lifetime_kwargs(provider: str, size: dict, *, labels: dict, auto_snapshot: b
         return dict(auto_snapshot=auto_snapshot and not prebuilt, labels=labels,
                     auto_stop_interval_mins=int(size.get("auto_stop_minutes") or DEFAULT_IDLE_STOP_MIN), auto_delete_interval_mins=life)
     if provider == "blaxel":         # ttl ends it at that age (harbor's own default is 24 h)
-        return {"ttl": f"{life}m"}
+        return {"ttl": f"{life}m", "labels": labels}
     kw = dict(lifetime_s=life * 60, labels=labels)       # e2b (timeout, hard) and every raw-backed provider (hard cap in the provider)
     if provider not in HARBOR_ENVS:
         kw["sandbox_extra"] = dict(size.get("extra") or {})
@@ -87,11 +87,14 @@ def make_env(provider: str, *, task, trial_paths, session_id: str, size: dict, n
     if size.get("memory_mb"):
         kw["override_memory_mb"] = int(size["memory_mb"])
     env = harbor_env_class(provider)(**kw)
-    _track(env, provider, size, standard_labels(owner, run), on_release)
+    track_env(env, provider, size, standard_labels(owner, run), on_release)
     return env
 
 
-def _track(env, provider: str, size: dict, labels: dict, on_release) -> None:
+def track_env(env, provider: str, size: dict, labels: dict, on_release=None, on_acquire=None) -> None:
+    """Count `env` in the cost ledger from start() to stop() (with its sandbox id, so `fleet.reconcile` can close the entry if the
+    process dies before stop()), and register it for `stop_live`. `on_release` runs once when it is released (stop or failed start);
+    a caller that retries a failed start calls `env.reacquire_slot()` first, which runs `on_acquire` and arms the release again."""
     from .cost import get_ledger
     from .pricing import cost_model_for
     state = {"released": False, "handle": None}
@@ -107,9 +110,15 @@ def _track(env, provider: str, size: dict, labels: dict, on_release) -> None:
     own_ledger = not getattr(env, "LEDGER_NATIVE", False)       # a raw-backed environment's RawSandbox records its own entry
 
     async def start(*a, **k):
+        if own_ledger:                  # a raw-backed environment's RawSandbox waits for its own turn in start()
+            from .ratelimit import acquire_create
+            await acquire_create(provider)          # the provider's creation rate limit, shared by every process on this host
+        from .health import record
         try:
             r = await orig_start(*a, **k)
-        except BaseException:
+        except BaseException as e:
+            if own_ledger and isinstance(e, Exception):
+                record(provider, False)         # the circuit breaker (health.py) watches how starts go on each provider
             try:
                 await orig_stop(True)          # a start that failed part-way may have left a sandbox behind: delete it
             except BaseException:  # noqa: BLE001
@@ -118,6 +127,7 @@ def _track(env, provider: str, size: dict, labels: dict, on_release) -> None:
             raise
         if not own_ledger:
             return r
+        record(provider, True)
         state["handle"] = get_ledger().open(provider, cpu=float(size.get("cpu") or 1), ram_gib=(size.get("memory_mb") or 2048) / 1024.0,
                                             disk_gib=float(size.get("disk_gb") or 8), labels=labels, sandbox_id=_sandbox_id(env, provider))
         return r
@@ -131,7 +141,14 @@ def _track(env, provider: str, size: dict, labels: dict, on_release) -> None:
                 state["handle"] = None
             release()
 
-    env.start, env.stop = start, stop
+    def reacquire():
+        if state["released"]:
+            state["released"] = False
+            _live[id(env)] = env
+            if on_acquire:
+                on_acquire()
+
+    env.start, env.stop, env.reacquire_slot = start, stop, reacquire
     env.sandbox_provider = provider
     _live[id(env)] = env
 
@@ -145,6 +162,10 @@ def is_retryable_start_error(e: Exception) -> bool:
     except ImportError:
         pass
     m = str(e).lower()
+    if "blaxel sandbox deployment failed" in m or "blaxel sandbox did not become ready" in m:
+        return True
+    if "429" in m and ("too many requests" in m or "ratelimit" in type(e).__name__.lower()):      # a provider's API rate limit: back off and start again
+        return True
     return type(e).__name__ == "DaytonaError" and ("entered error state" in m or "sandboxstate.error" in m or "build_failed" in m)
 
 
