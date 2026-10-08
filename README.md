@@ -165,3 +165,19 @@ projects' harbor.* ones; the E2B and Blaxel accounts). The pr_task_synthesis spe
 `pytest tests` runs offline; `pytest tests/test_providers_live.py -s` opens one real sandbox per provider
 whose key is set (boots dockerd, builds and runs a container, round-trips a directory, runs a >60 s
 command, checks the ledger).
+## Sessions: one cost ledger per client
+
+Every client of the library (euphoria, greenhouse, pr_task_synthesis, ...) opens a **session** and gets its own ledger instead of appending to one shared file:
+
+```python
+from sandboxes.session import open_session
+with open_session("euphoria", "v3-b07") as s:       # ~/.cache/sandboxes/sessions/euphoria/<id>/costs.jsonl
+    ...                                             # this process and the workers it spawns write to s's ledger
+    print(s.cost())                                 # per-provider sandboxes, hours, $ of this session alone
+```
+
+- A launcher script can opt a process in with env vars alone: `SANDBOX_SESSION_CLIENT=euphoria SANDBOX_SESSION_NAME=v3-b07`.
+- `python -m sandboxes sessions [--client euphoria]` lists sessions with their cost; `... sessions cost <id|name> [--json]` shows one.
+- Spend caps are machine-wide and unchanged: they add up the legacy ledger and every session ledger (`cost.summary_all()`). Setting `SANDBOX_COST_LEDGER` still redirects everything to that one file (tests, experiments).
+- `reconcile` and `close_dead_entries` visit every ledger. Euphoria writes `<state dir>/sessions.json` at launch; `euphoria export` reads it and adds `cost.sandbox_ledger` (real spend, per provider) next to its flat-rate `env_cost` estimate.
+- Sandboxes opened before this change live in the legacy `~/.cache/sandboxes/costs.jsonl`; they cannot be attributed to a session after the fact.

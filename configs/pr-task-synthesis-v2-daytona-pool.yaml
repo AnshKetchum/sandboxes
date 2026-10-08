@@ -1,0 +1,6 @@
+# Cleanup pool for pr-task-synthesis-v2: Daytona only, same node shape as the main pool (2 vCPU / 4 GiB; Daytona caps disk at 10 GB per sandbox).
+# 120 x (2 CPU, 4 GiB, 10 GB) = 240 CPU / 480 GiB / 1200 GB, inside the org quota (250 / 500 / 2000). Daytona builds each Dockerfile server-side with its own builder
+# memory, so the tasks whose Modal image build was OOM-killed (Julia, Rust, .NET toolchains) have a chance here.
+total_spend_cap_usd: 2500
+sandbox_providers:
+  - {base: /ansh/sandboxes/configs/daytona.yaml, overrides: {cpu: 2, memory_mb: 4096, disk_gb: 10, peak_concurrent_sandboxes: 120}}

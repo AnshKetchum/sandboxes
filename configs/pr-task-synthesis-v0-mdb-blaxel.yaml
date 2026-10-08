@@ -18,3 +18,13 @@ sandbox_providers:
   # blaxel 100 at 8192 MiB: its root fs is RAM-backed (half the memory; the grove harness alone needs ~0.5 GiB of it), builds run ~10 at a time, and
   # a failed or stuck (>10 min of actual building) build fails fast. Evidence for these settings: /ansh/euphoria_runs/pr-task-synthesis-v0-blaxel-test-200.
   - {base: /ansh/sandboxes/configs/blaxel.yaml, overrides: {peak_concurrent_sandboxes: 100, memory_mb: 8192}}
+  # fly 60: builds a task's Dockerfile in a Fly builder VM, pushes it to registry.fly.io and boots from there (or boots a prebuilt image directly).
+  # Tested in isolation at this size (pr-task-synthesis-v0-fly-60: 0 machine-limit errors). The org's Fly machine limit is ~100 live machines INCLUDING
+  # builder VMs (SANDBOX_FLY_BUILD_SLOTS, default 12), so 60 + 12 stays under it; do not raise this without asking Fly what the limit is.
+  - name: fly
+    cpu: 1
+    memory_mb: 2048
+    peak_concurrent_sandboxes: 60
+    spend_cap_usd: 300
+    auto_delete_minutes: 180
+    extra: {cpu_kind: performance, region: iad}

@@ -29,7 +29,7 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from .cost import RUN_ENV, SpendCapExceeded, summary
+from .cost import RUN_ENV, SpendCapExceeded, summary, summary_all
 
 CACHE_DIR = Path(os.environ.get("SANDBOX_CACHE_DIR", Path.home() / ".cache" / "sandboxes"))
 CAPS_FILE = CACHE_DIR / "caps.json"
@@ -59,10 +59,11 @@ def load_caps() -> dict:
 
 
 def _spend(ledger_path, run: Optional[str]) -> tuple[dict, dict]:
+    """Machine-wide spend: the legacy shared ledger plus every session ledger (sessions/<client>/<id>/costs.jsonl), added together."""
     key = (str(ledger_path), run)
     if _cache["key"] != key or time.time() - _cache["t"] > _CACHE_S:
-        _cache.update({"t": time.time(), "key": key, "sum": summary(ledger_path),
-                       "run_sum": summary(ledger_path, run=run) if run else None})
+        _cache.update({"t": time.time(), "key": key, "sum": summary_all(),
+                       "run_sum": summary_all(run=run) if run else None})
     return _cache["sum"], _cache["run_sum"]
 
 
@@ -94,25 +95,27 @@ def check_admission(provider: Optional[str] = None, run: Optional[str] = None, p
 
 def status() -> dict:
     from .cost import get_ledger
-    caps = load_caps(); s = summary(get_ledger().path)
+    caps = load_caps(); s = summary_all()
     return {"caps": caps, "ledger": str(get_ledger().path), "total_usd": s["total_usd"], "running_usd": s["running_usd"],
             "burn_usd_per_hour": s["burn_usd_per_hour"], "headroom_usd": (caps["total_usd"] - s["total_usd"]) if caps["total_usd"] else None,
             "hours_to_cap_at_current_burn": ((caps["total_usd"] - s["total_usd"]) / s["burn_usd_per_hour"]) if caps["total_usd"] and s["burn_usd_per_hour"] else None,
-            "by_run": {r: summary(get_ledger().path, run=r)["total_usd"] for r in _runs(get_ledger().path)}}
+            "by_run": {r: summary_all(run=r)["total_usd"] for r in _runs()}}
 
 
-def _runs(path) -> list[str]:
+def _runs(path=None) -> list[str]:
+    from .cost import all_ledger_paths
     seen = []
-    try:
-        for line in open(path):
-            try:
-                r = json.loads(line).get("run", "")
-            except ValueError:
-                continue
-            if r and r not in seen:
-                seen.append(r)
-    except OSError:
-        pass
+    for p in ([path] if path else all_ledger_paths()):
+        try:
+            for line in open(p):
+                try:
+                    r = json.loads(line).get("run", "")
+                except ValueError:
+                    continue
+                if r and r not in seen:
+                    seen.append(r)
+        except OSError:
+            pass
     return seen
 
 

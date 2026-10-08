@@ -115,7 +115,7 @@ def main(argv=None) -> int:
     r.add_argument("--owner"); r.add_argument("--run"); r.add_argument("--creating-older-than", type=float, default=8.0, help="minutes")
     r.add_argument("--providers", default=""); r.add_argument("--dry-run", action="store_true")
     sub.add_parser("providers")
-    for name in ("cost", "guard", "janitor", "audit"):
+    for name in ("cost", "guard", "janitor", "audit", "sessions"):
         sub.add_parser(name, add_help=False)
     a, rest = ap.parse_known_args(argv)
     from .janitor import _load_keys
@@ -130,6 +130,9 @@ def main(argv=None) -> int:
         return cmd_providers(a)
     if a.cmd == "cost":
         from .cost import main as m
+        return m(rest)
+    if a.cmd == "sessions":
+        from .session import main as m
         return m(rest)
     if a.cmd == "guard":
         from .guard import main as m

@@ -5,8 +5,13 @@ cost from `pricing.CostModel`) when it ends, into one append-only JSONL ledger. 
 never closed (the process was killed) are counted as running until `max_age_s`, so a crash cannot
 hide spend. Storage (snapshots, images, volumes) goes in as `storage` events.
 
-    SANDBOX_COST_LEDGER=/path/costs.jsonl     where to write (default ~/.cache/sandboxes/costs.jsonl)
+    SANDBOX_COST_LEDGER=/path/costs.jsonl     where to write (default: the active session's ledger, else ~/.cache/sandboxes/costs.jsonl)
+    SANDBOX_SESSION_DIR=<dir>                 set by sandboxes.session.open_session(): the active session's own ledger directory
     SANDBOX_RUN_ID=v0-scale-200               tag events so one run can be reported on its own
+
+Each client (euphoria, greenhouse, pr_task_synthesis ...) opens a SESSION (sandboxes/session.py) and gets its own ledger,
+~/.cache/sandboxes/sessions/<client>/<session id>/costs.jsonl, so its spend can be read on its own without filtering a shared file.
+The spend caps still hold machine-wide: `summary_all()` sums the legacy ledger and every session ledger.
 
     python -m sandboxes.cost                  # totals per provider, now
     python -m sandboxes.cost --run v0-scale-200 --watch 30
@@ -40,7 +45,38 @@ from .pricing import CostModel, cost_model_for
 
 LEDGER_ENV = "SANDBOX_COST_LEDGER"
 RUN_ENV = "SANDBOX_RUN_ID"
+SESSION_ENV = "SANDBOX_SESSION_DIR"
 DEFAULT_LEDGER = Path.home() / ".cache" / "sandboxes" / "costs.jsonl"
+
+
+def cache_dir() -> Path:
+    return Path(os.environ.get("SANDBOX_CACHE_DIR", Path.home() / ".cache" / "sandboxes"))
+
+
+def sessions_dir() -> Path:
+    return cache_dir() / "sessions"
+
+
+def default_ledger_path() -> Path:
+    """Where this process writes: SANDBOX_COST_LEDGER, else the active session's ledger, else the legacy shared ledger."""
+    if os.environ.get(LEDGER_ENV):
+        return Path(os.environ[LEDGER_ENV])
+    if os.environ.get(SESSION_ENV):
+        return Path(os.environ[SESSION_ENV]) / "costs.jsonl"
+    return Path(os.environ["SANDBOX_CACHE_DIR"]) / "costs.jsonl" if os.environ.get("SANDBOX_CACHE_DIR") else DEFAULT_LEDGER
+
+
+def all_ledger_paths() -> list[Path]:
+    """The legacy shared ledger plus every session ledger (what the machine-wide spend cap adds up). An explicit SANDBOX_COST_LEDGER is a
+    deliberate redirect (tests, a one-off experiment): then that one file is the whole ledger, as before sessions existed."""
+    if os.environ.get(LEDGER_ENV):
+        return [Path(os.environ[LEDGER_ENV])]
+    legacy = Path(os.environ["SANDBOX_CACHE_DIR"]) / "costs.jsonl" if os.environ.get("SANDBOX_CACHE_DIR") else DEFAULT_LEDGER
+    out = [legacy] if legacy.exists() else []
+    sd = sessions_dir()
+    if sd.is_dir():
+        out += sorted(sd.glob("*/*/costs.jsonl"))
+    return out
 # an `open` with no `close` older than this is treated as dead (killed process), billed up to here
 from .lifetime import MAX_LIFETIME_MIN
 
@@ -53,7 +89,7 @@ class SpendCapExceeded(SandboxError):
 
 class CostLedger:
     def __init__(self, path: Optional[os.PathLike] = None, run: Optional[str] = None):
-        self.path = Path(path or os.environ.get(LEDGER_ENV) or DEFAULT_LEDGER)
+        self.path = Path(path) if path else default_ledger_path()
         self.run = run if run is not None else os.environ.get(RUN_ENV, "")
         self._lock = threading.Lock()
         self._open: dict[str, dict] = {}
@@ -113,9 +149,12 @@ _ledger_lock = threading.Lock()
 def get_ledger() -> CostLedger:
     """The process-wide ledger (path from SANDBOX_COST_LEDGER)."""
     global _ledger
+    if os.environ.get("SANDBOX_SESSION_CLIENT") and not os.environ.get(SESSION_ENV) and not os.environ.get(LEDGER_ENV):
+        from .session import ensure_env_session            # a launcher script opted this process in with env vars alone
+        ensure_env_session()
     with _ledger_lock:
-        path = os.environ.get(LEDGER_ENV)
-        if _ledger is None or (path and Path(path) != _ledger.path):
+        want = default_ledger_path()
+        if _ledger is None or want != _ledger.path:
             _ledger = CostLedger()
         return _ledger
 
@@ -129,7 +168,7 @@ def summary(path: Optional[os.PathLike] = None, *, run: Optional[str] = None, mo
                               "running_usd", "storage_usd", "total_usd", "burn_usd_per_hour"}},
          "total_usd", "running_usd", "burn_usd_per_hour", "as_of"}
     """
-    path = Path(path or os.environ.get(LEDGER_ENV) or DEFAULT_LEDGER)
+    path = Path(path) if path else default_ledger_path()
     now = now or time.time()
     models = models or {}
     opens: dict[str, dict] = {}
@@ -177,6 +216,30 @@ def summary(path: Optional[os.PathLike] = None, *, run: Optional[str] = None, mo
         for k in ("closed_usd", "running_usd", "storage_usd", "total_usd", "sandbox_hours", "burn_usd_per_hour"):
             a[k] = round(a[k], 4)
     return {"providers": out, "as_of": now,
+            "total_usd": round(sum(a["total_usd"] for a in out.values()), 4),
+            "running_usd": round(sum(a["running_usd"] for a in out.values()), 4),
+            "burn_usd_per_hour": round(sum(a["burn_usd_per_hour"] for a in out.values()), 4)}
+
+
+def summary_all(*, run: Optional[str] = None, models: Optional[dict] = None, now: Optional[float] = None) -> dict:
+    """`summary()` over the legacy ledger and every session ledger, added together. This is what a machine-wide spend cap compares against."""
+    now = now or time.time()
+    parts = [summary(p, run=run, models=models, now=now) for p in all_ledger_paths()]
+    return merge_summaries(parts, now)
+
+
+def merge_summaries(parts: list, now: Optional[float] = None) -> dict:
+    out: dict[str, dict] = {}
+    keys = ("opened", "running", "closed", "stale", "sandbox_hours", "closed_usd", "running_usd", "storage_usd", "total_usd", "burn_usd_per_hour")
+    for s in parts:
+        for p, a in s["providers"].items():
+            o = out.setdefault(p, {k: 0 for k in keys})
+            for k in keys:
+                o[k] += a.get(k, 0)
+    for a in out.values():
+        for k in ("closed_usd", "running_usd", "storage_usd", "total_usd", "sandbox_hours", "burn_usd_per_hour"):
+            a[k] = round(a[k], 4)
+    return {"providers": out, "as_of": now or time.time(),
             "total_usd": round(sum(a["total_usd"] for a in out.values()), 4),
             "running_usd": round(sum(a["running_usd"] for a in out.values()), 4),
             "burn_usd_per_hour": round(sum(a["burn_usd_per_hour"] for a in out.values()), 4)}

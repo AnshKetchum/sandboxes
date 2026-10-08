@@ -57,8 +57,10 @@ async def sweep(max_age_hours: float = 6.0, providers=None, dry_run: bool = Fals
 
 def _reconcile_core(path, live_now: dict, now: Optional[float] = None) -> int:
     """Close ledger entries whose sandbox is not in `live_now` ({provider: set of ids, or None if that provider could not be listed})."""
-    from .cost import get_ledger
-    led = get_ledger(); path = path or led.path
+    from .cost import CostLedger, all_ledger_paths
+    if path is None:                                   # no ledger named: every ledger (legacy shared + every session)
+        return sum(_reconcile_core(p, live_now, now) for p in all_ledger_paths())
+    led = CostLedger(path)
     now = now or time.time()
     opens, closed = {}, set()
     try:
@@ -90,9 +92,10 @@ def close_dead_entries(max_age_s: float = 3 * 3600.0, path=None, now: Optional[f
     """Close ledger entries still open after `max_age_s`. reconcile() only closes entries that carry a sandbox id, so a killed process's
     entries (no id yet, or an old record) would bill up to the stale ceiling and count against the spend cap for hours. A sandbox never
     outlives its own lifetime (<= 3 h in every config here), so one open longer than that is dead; it is billed at `max_age_s`."""
-    from .cost import CostLedger, get_ledger
-    led = CostLedger(path) if path else get_ledger()
-    path = path or led.path
+    from .cost import CostLedger, all_ledger_paths
+    if path is None:
+        return sum(close_dead_entries(max_age_s, p, now) for p in all_ledger_paths())
+    led = CostLedger(path)
     cut = (now or time.time()) - max_age_s
     opens, closed = {}, set()
     try:
