@@ -24,13 +24,15 @@ def make_pod(manifest: dict, created: float):
     return SimpleNamespace(
         metadata=SimpleNamespace(name=md["name"], namespace=md.get("namespace"), labels=dict(md.get("labels") or {}),
                                  annotations=dict(md.get("annotations") or {}), creation_timestamp=ts(created),
-                                 deletion_timestamp=None),
-        spec=SimpleNamespace(node_name=None, manifest=manifest["spec"]),
-        status=SimpleNamespace(phase="Pending", reason=None, message=None, conditions=[], container_statuses=[]))
+                                 deletion_timestamp=None, owner_references=None),
+        spec=SimpleNamespace(node_name=None, manifest=manifest["spec"],
+                             active_deadline_seconds=manifest["spec"].get("activeDeadlineSeconds")),
+        status=SimpleNamespace(phase="Pending", reason=None, message=None, conditions=[], container_statuses=[], start_time=None))
 
 
 def set_ready(pod, node: str = "node-a") -> None:
     pod.spec.node_name = node
+    pod.status.start_time = pod.status.start_time or pod.metadata.creation_timestamp
     pod.status.phase = "Running"
     pod.status.conditions = [SimpleNamespace(type="PodScheduled", status="True", reason=None, message=None)]
     pod.status.container_statuses = [SimpleNamespace(ready=True, state=SimpleNamespace(waiting=None, terminated=None, running=True))]
@@ -52,6 +54,15 @@ def set_finished(pod, phase: str = "Failed", reason: str = "DeadlineExceeded") -
     pod.status.reason = reason
 
 
+def other_pod(name: str, node: str, namespace: str = "kube-system", owner_kind: str = "", phase: str = "Running", mirror=False):
+    """A pod that is not a sandbox (a DaemonSet's, a static pod, someone's workload) on a node."""
+    owners = [SimpleNamespace(kind=owner_kind, name=f"{name}-owner")] if owner_kind else None
+    ann = {"kubernetes.io/config.mirror": "x"} if mirror else {}
+    return SimpleNamespace(metadata=SimpleNamespace(name=name, namespace=namespace, labels={}, annotations=ann, owner_references=owners,
+                                                    creation_timestamp=ts(0), deletion_timestamp=None),
+                           spec=SimpleNamespace(node_name=node), status=SimpleNamespace(phase=phase, reason=None))
+
+
 def make_node(name: str, created: float, machine: str = "c4d-standard-192", spot: bool = True, pool: str = "sandbox-spot",
               cpu: str = "192"):
     labels = {"node.kubernetes.io/instance-type": machine, "cloud.google.com/gke-nodepool": pool}
@@ -67,6 +78,8 @@ class FakeCore:
     def __init__(self, now=None):
         self.pods: dict = {}
         self.nodes: list = []
+        self.other_pods: list = []        # not ours: DaemonSets, system pods, other workloads
+        self.events: list = []
         self.deleted: list = []
         self.created: list = []
         self.delete_failures = 0          # the next N deletes raise a 500
@@ -121,6 +134,11 @@ class FakeCore:
         nxt = str(end) if limit and end < len(items) else None
         return SimpleNamespace(items=items[start:end], metadata=SimpleNamespace(_continue=nxt))
 
+    def list_pod_for_all_namespaces(self, field_selector=None):
+        key, _, value = (field_selector or "").partition("=")
+        pods = list(self.pods.values()) + list(self.other_pods)
+        return SimpleNamespace(items=[p for p in pods if key != "spec.nodeName" or p.spec.node_name == value])
+
     def list_node(self, label_selector=None):
         return SimpleNamespace(items=list(self.nodes))
 
@@ -130,7 +148,7 @@ class FakeCore:
     def list_event_for_all_namespaces(self, field_selector=None):
         if getattr(self, "events_fail", False):
             raise FakeApiError(403, "forbidden")
-        return SimpleNamespace(items=list(getattr(self, "events", [])))
+        return SimpleNamespace(items=list(self.events))
 
 
 def node_event(name: str, reason: str, when: float, last: float = None):

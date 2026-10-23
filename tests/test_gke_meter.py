@@ -104,30 +104,78 @@ def test_prices_spot_on_demand_disk_and_unknown_machine_fallback(capsys):
     assert "no ondemand price for 'n9-weird-8'" in capsys.readouterr().err
 
 
-def test_ledger_never_under_counts_random_node_lifetimes():
-    """Nodes born and dying at random, many living less than one pass (spot preemptions): with the lifecycle events Kubernetes
-    keeps for an hour, every node is charged at least its lifetime, and at most its lifetime plus one interval."""
-    rng = random.Random(7)
-    for trial in range(200):
-        births = {f"gke-c-sandbox-spot-{i:04d}": T0 + rng.uniform(0, 5000) for i in range(8)}
-        deaths = {n: b + rng.choice([rng.uniform(5, 120), rng.uniform(60, 8000)]) for n, b in births.items()}
-        t, st, charged = T0, {}, {}
-        while t < T0 + 15000:
-            t += rng.uniform(5, STALE_GAP_S)
-            alive = [node(n, created=b) for n, b in births.items() if b <= t < deaths[n]]
-            events = [{"name": n, "born": b, "died": deaths[n] if deaths[n] <= t else None, "pool": "sandbox-spot"}
-                      for n, b in births.items() if t - 3600 <= b <= t]
-            charges, st = compute_charges(t, st, alive, [], CFG, MODEL, ephemeral=events)
+def folded_events(lives: dict, flaps: dict, t: float) -> list:
+    """What list_event_for_all_namespaces returns at `t`: per node and reason ONE event (repeats fold into it: first and last
+    timestamps), dropped an hour after its last update."""
+    out = []
+    for name, ls in lives.items():
+        regs = [b for b, _ in ls if b <= t]
+        rems = sorted([d for _, d in ls if d <= t] + [f for f in flaps.get(name, []) if f <= t])
+        born = reborn = died = None
+        if regs and t - regs[-1] <= 3600:
+            reborn, born = regs[-1], regs[-1]
+            for prev in reversed(regs[:-1]):                          # the folded event goes back while it was kept alive
+                if born - prev > 3600:
+                    break
+                born = prev
+        if rems and t - rems[-1] <= 3600:
+            died = rems[-1]
+        if born is not None or died is not None:
+            out.append({"name": name, "born": born, "reborn": reborn, "died": died, "pool": "sandbox-spot"})
+    return out
+
+
+def random_history(rng, outages: bool):
+    """Up to 10 node names, each with up to 4 lives (a managed instance group recreates a preempted VM under its old name), lives
+    from 1 s (spot preemption) to 2.5 h, NotReady flaps, passes 1..300 s apart and, with `outages`, sometimes 1-2.5 h apart."""
+    lives, flaps = {}, {}
+    for i in range(rng.randint(1, 10)):
+        name, t = f"gke-c-sandbox-spot-{i:04d}", T0 + rng.uniform(0, 8000)
+        lives[name] = []
+        for _ in range(rng.choice([1, 1, 2, 3, 4])):
+            d = t + rng.choice([rng.uniform(1, 60), rng.uniform(5, 400), rng.uniform(60, 9000)])
+            lives[name].append((t, d))
+            flaps[name] = flaps.get(name, []) + [rng.uniform(t, d) for _ in range(rng.choice([0, 0, 1, 2]))]
+            t = d + rng.choice([rng.uniform(1, 60), rng.uniform(20, 2000)])
+    passes, t = [], T0
+    while t < T0 + 30000:
+        t += rng.uniform(4000, 9000) if outages and rng.random() < 0.05 else rng.uniform(1, STALE_GAP_S)
+        passes.append(t)
+    return lives, flaps, passes
+
+
+@pytest.mark.parametrize("outages", [False, True])
+def test_ledger_never_under_counts_random_node_histories(outages):
+    """Every life is charged in full or flagged (a meter_gap whose max_usd covers it), except a life no meter can know of: born
+    and gone inside an outage, its registration event expired (billing reconciliation's job). Without outages, at most one
+    pass interval (plus the gap between lives) too much per life. A 20 000-history version of this ran clean."""
+    rng = random.Random(11 if outages else 7)
+    for trial in range(400):
+        lives, flaps, passes = random_history(rng, outages)
+        st, charged, flagged = {}, {}, {}
+        for t in passes:
+            alive = [node(n, created=b) for n, ls in lives.items() for b, d in ls if b <= t < d]
+            charges, st = compute_charges(t, st, alive, [], CFG, MODEL, ephemeral=folded_events(lives, flaps, t))
             for c in charges:
                 if c["kind"] == "node":
                     charged[c["label"]] = charged.get(c["label"], 0.0) + c["usd"]
-        for n in births:
-            if births[n] > t:
-                continue
-            life = (min(deaths[n], t) - births[n]) * PRICE / 3600
+                elif c["kind"] == "meter_gap":
+                    flagged[c["label"]] = flagged.get(c["label"], 0.0) + (c.get("max_usd") or float("inf"))
+        end = passes[-1]
+
+        def knowable(n, b, d):
+            if any(b <= p < d for p in passes):
+                return True
+            nxt = next((p for p in passes if p >= b), None)
+            evs = folded_events({n: lives[n]}, {n: flaps.get(n, [])}, nxt) if nxt else []
+            return bool(evs) and evs[0]["born"] is not None and evs[0]["born"] <= b <= evs[0]["reborn"]
+        for n, ls in lives.items():
+            known = [(b, d) for b, d in ls if not outages or knowable(n, b, d)]
+            life = sum(max(0.0, min(d, end) - b) for b, d in known if b <= end) * PRICE / 3600
             got = charged.get(n, 0.0)
-            assert got >= life - 1e-9, (trial, n, got, life)
-            assert got <= life + PRICE * STALE_GAP_S / 3600 + 1e-9, (trial, n, got, life)
+            assert got + flagged.get(n, 0.0) >= life - 1e-9, (trial, n, got, life, ls)
+            if not outages:
+                assert got <= life + len(ls) * PRICE * (STALE_GAP_S + 2000) / 3600 + 1e-9, (trial, n, got, life, ls)
 
 
 def test_a_node_born_and_gone_between_passes_is_charged_from_its_events():
@@ -294,3 +342,55 @@ def test_only_pods_with_an_open_entry_count_as_covered(env):
     led._append({"t": T0, "ev": "close", "id": "h-leaked", "provider": "gke", "run": "r", "seconds": 0, "usd": 0})
     meter_once(api, now=T0 + 3600, force=True, cfg=CFG, ledger_path=led_path)
     assert node_usd(led_path) == pytest.approx(PRICE / 2)           # half the node is covered by the tracked pod's entry
+
+
+def test_a_known_node_gone_during_an_outage_is_charged_to_its_removal_event():
+    st = {"version": 1, "last_pass": T0, "nodes": {"n1": {"until": T0, "price_h": PRICE, "pool": "sandbox-spot"}}}
+    ev = [{"name": "n1", "born": None, "died": T0 + 1800, "pool": "sandbox-spot"}]
+    charges, st = compute_charges(T0 + 3000, st, [], [], CFG, MODEL, ephemeral=ev)          # 50 min gap: the meter was down
+    n1 = [c for c in charges if c["label"] == "n1"]
+    assert [c["kind"] for c in n1] == ["node"] and n1[0]["usd"] == pytest.approx(PRICE * 1800 / 3600)
+
+
+def test_a_stale_removal_event_does_not_shorten_a_known_nodes_charge():
+    st = {"version": 1, "last_pass": T0, "nodes": {"n1": {"until": T0, "price_h": PRICE, "pool": "sandbox-spot"}}}
+    ev = [{"name": "n1", "born": None, "died": T0 - 600, "pool": "sandbox-spot"}]           # NotReady before, then came back
+    charges, _ = compute_charges(T0 + 3000, st, [], [], CFG, MODEL, ephemeral=ev)
+    kinds = {c["kind"]: c for c in charges if c["label"] == "n1"}
+    assert kinds["node"]["usd"] == pytest.approx(PRICE * STALE_GAP_S / 3600) and kinds["meter_gap"]["max_usd"] > 0
+
+
+def test_a_node_never_seen_with_only_a_removal_event_is_flagged_once_for_reconciliation():
+    ev = [{"name": "ghost", "born": None, "died": T0 + 10, "pool": "sandbox-spot"}]
+    charges, st = compute_charges(T0 + 60, {"version": 1, "last_pass": T0, "nodes": {}}, [], [], CFG, MODEL, ephemeral=ev)
+    assert [(c["kind"], c["usd"]) for c in charges if c["label"] == "ghost"] == [("meter_gap", 0.0)]
+    charges, _ = compute_charges(T0 + 120, st, [], [], CFG, MODEL, ephemeral=ev)
+    assert not [c for c in charges if c["label"] == "ghost"]
+
+
+def test_a_name_charged_as_gone_and_registered_again_is_charged_for_its_new_life_only():
+    st = {"version": 1, "last_pass": T0, "nodes": {"n1": {"until": T0, "price_h": PRICE, "pool": "sandbox-spot"}}}
+    charges, st = compute_charges(T0 + 60, st, [], [], CFG, MODEL)                          # gone: charged to T0+60
+    ev = [{"name": "n1", "born": T0 + 100, "reborn": T0 + 100, "died": T0 + 160, "pool": "sandbox-spot"}]
+    charges, st = compute_charges(T0 + 200, st, [], [], CFG, MODEL, ephemeral=ev)           # second life between passes
+    assert sum(c["usd"] for c in charges if c["label"] == "n1") == pytest.approx(PRICE * 60 / 3600)   # at its pool's price
+    ev = [{"name": "n1", "born": T0 + 100, "reborn": T0 + 300, "died": T0 + 160, "pool": "sandbox-spot"}]
+    charges, st = compute_charges(T0 + 400, st, [node("n1", created=T0 + 300)], [], CFG, MODEL, ephemeral=ev)   # third, alive
+    assert sum(c["usd"] for c in charges if c["label"] == "n1") == pytest.approx(PRICE * 200 / 3600)
+    # registrations fold into one event: it cannot say whether a life began between the last pass and this node's creation,
+    # so the node is charged from the last pass (at most one interval too much), never from its creation alone
+
+
+def test_a_folded_registration_older_than_the_gone_time_charges_from_the_gone_time():
+    st = {"version": 1, "last_pass": T0, "nodes": {"n1": {"until": T0, "price_h": PRICE, "pool": "sandbox-spot"}}}
+    charges, st = compute_charges(T0 + 60, st, [], [], CFG, MODEL)
+    ev = [{"name": "n1", "born": T0 - 3000, "reborn": T0 + 100, "died": T0 + 160, "pool": "sandbox-spot"}]
+    charges, st = compute_charges(T0 + 200, st, [], [], CFG, MODEL, ephemeral=ev)
+    assert sum(c["usd"] for c in charges if c["label"] == "n1") == pytest.approx(PRICE * 100 / 3600)
+
+
+def test_after_a_close_out_the_cluster_fee_is_not_charged_again_from_the_clusters_creation():
+    st = {"version": 1, "last_pass": T0, "nodes": {}, "gone": {}, "cluster_until": None, "cluster_closed": T0}
+    cfg = MeterConfig(machine_prices=CFG.machine_prices, disk_gb_month=0.0, cluster_fee_hour=0.10)
+    charges, st = compute_charges(T0 + 3600, st, [], [], cfg, MODEL, cluster_created=T0 - 86400)
+    assert sum(c["usd"] for c in charges if c["kind"] == "cluster_fee") == pytest.approx(0.10)

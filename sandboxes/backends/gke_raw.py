@@ -8,6 +8,8 @@ Deletion is layered so that no pod outlives its use, whatever dies:
   3. list_live/kill expose every pod with our labels (finished ones too) to the janitor, `sandboxes stop|reap` and the watchdog
   4. a create that fails at ANY point after the API call (unschedulable, image pull, timeout, cancellation) deletes the pod
      before raising: the pod name is fixed before the call, so even a create whose response was lost is cleaned up
+  5. the GKE watchdog (gke_ops.py) deletes what a dead process leaves: finished pods, pods past their deadline, and Pending
+     pods past their creator's wait (a pod never scheduled never starts its deadline clock, and keeps the autoscaler adding nodes)
 Pods are not what Google bills; nodes are. The node bill goes into the cost ledger through gke_meter.py, and node pools are
 scaled back to zero by gke_ops.py. Pod ledger entries carry the pod's share of a node (CostModel vcpu_hour), the meter adds
 the rest, so pods + meter = what the nodes cost.
@@ -29,6 +31,7 @@ Credentials: a kubeconfig (`gcloud container clusters get-credentials`), from KU
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import functools
 import json
 import os
@@ -48,6 +51,7 @@ from ..raw import ExecResult, LiveSandbox, RawSandbox
 
 MANAGED_SELECTOR = "sandboxes.managed=true"
 LABELS_ANNOTATION = "sandboxes/labels"          # the exact labels (k8s label values are restricted to 63 safe characters)
+READY_ANNOTATION = "sandboxes/ready-within-s"   # how long its creator waits for it: Pending past that, the pod is an orphan
 CONTAINER = "sandbox"
 # PID 1 of every pod: sleeps until deleted, and exits at once on SIGTERM (no 30 s grace wait).
 KEEPALIVE = "trap 'exit 0' TERM INT; while :; do sleep 3600 & wait $!; done"
@@ -113,6 +117,11 @@ def namespace() -> str:
     return os.environ.get("GKE_NAMESPACE") or "sandboxes"
 
 
+def ready_timeout_s(spec) -> float:
+    """How long a create waits for its pod to be ready, scale-up and image pull included."""
+    return float((spec.extra or {}).get("ready_timeout_s", max(1200, spec.create_timeout)))
+
+
 def pod_manifest(name: str, spec, namespace: str) -> dict:
     """The pod for one sandbox. A hard lifetime (activeDeadlineSeconds), no service account token, no restarts."""
     x = spec.extra or {}
@@ -141,7 +150,8 @@ def pod_manifest(name: str, spec, namespace: str) -> dict:
         pod_spec["runtimeClassName"] = str(x["runtime_class"])
     return {"apiVersion": "v1", "kind": "Pod",
             "metadata": {"name": name, "namespace": namespace, "labels": labels,
-                         "annotations": {LABELS_ANNOTATION: json.dumps(spec.labels or {}, sort_keys=True)}},
+                         "annotations": {LABELS_ANNOTATION: json.dumps(spec.labels or {}, sort_keys=True),
+                                         READY_ANNOTATION: str(int(ready_timeout_s(spec)))}},
             "spec": pod_spec}
 
 
@@ -258,12 +268,50 @@ def _pending_path() -> Path:
     return cache_dir() / PENDING_DELETES
 
 
+def list_managed_pods(api, ns: str) -> list:
+    """Every pod of ours in the namespace (pod objects), page by page."""
+    out, token = [], None
+    while True:
+        kw = {"label_selector": MANAGED_SELECTOR, "limit": 500}
+        if token:
+            kw["_continue"] = token
+        res = api.list_namespaced_pod(ns, **kw)
+        out.extend(res.items or [])
+        token = getattr(res.metadata, "_continue", None) if getattr(res, "metadata", None) else None
+        if not token:
+            return out
+
+
 def queue_pending_delete(name: str, namespace: str, error: str) -> None:
     """A pod that could not be deleted: the watchdog retries it (its deadline is the backstop under that)."""
     p = _pending_path()
     p.parent.mkdir(parents=True, exist_ok=True)
-    with open(p, "a") as f:
-        f.write(json.dumps({"t": time.time(), "name": name, "namespace": namespace, "error": error[:300]}) + "\n")
+    with open(p.with_name(p.name + ".lock"), "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)                # never between the watchdog's taking the queue and its reading it
+        with open(p, "a") as f:
+            f.write(json.dumps({"t": time.time(), "name": name, "namespace": namespace, "error": error[:300]}) + "\n")
+
+
+def take_pending_deletes() -> tuple[list, list]:
+    """(queued deletes, the files they are in): delete the files once every entry is handled. The queue is moved aside under its
+    lock, so a delete queued meanwhile starts a fresh queue; files a crashed taker left behind are taken again."""
+    p = _pending_path()
+    if p.exists():
+        with open(p.with_name(p.name + ".lock"), "a+") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if p.exists():
+                os.replace(p, p.with_name(f"{p.name}.{os.getpid()}.{time.time_ns()}.taken"))
+    files = sorted(p.parent.glob(p.name + ".*.taken")) if p.parent.exists() else []
+    entries = []
+    for f in files:
+        for line in f.read_text().splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if r.get("name"):
+                entries.append(r)
+    return entries, files
 
 
 def delete_pod_sync(api, name: str, namespace: str, tries: int = DELETE_TRIES) -> bool:
@@ -310,18 +358,8 @@ class GKERaw(RawSandbox):
     @classmethod
     async def list_live(cls):
         """Every pod of ours in the namespace, finished ones included (they still hold the pod object; reap/sweep delete them)."""
-        ns = namespace()
-        out, token = [], None
-        while True:
-            kw = {"label_selector": MANAGED_SELECTOR, "limit": 500}
-            if token:
-                kw["_continue"] = token
-            res = await _call(_core().list_namespaced_pod, ns, **kw)
-            for p in res.items or []:
-                out.append(LiveSandbox("gke", p.metadata.name, epoch(p.metadata.creation_timestamp), live_state(p), labels_of(p)))
-            token = getattr(res.metadata, "_continue", None) if getattr(res, "metadata", None) else None
-            if not token:
-                return out
+        pods = await _call(list_managed_pods, _core(), namespace())
+        return [LiveSandbox("gke", p.metadata.name, epoch(p.metadata.creation_timestamp), live_state(p), labels_of(p)) for p in pods]
 
     @classmethod
     async def kill(cls, sandbox_id):
@@ -334,6 +372,12 @@ class GKERaw(RawSandbox):
         """Put the node bill into the cost ledger (see gke_meter). Called by the guard/janitor cadence and by every create."""
         from .. import gke_meter
         return await _call(gke_meter.meter_once, _core())
+
+    @classmethod
+    async def housekeep(cls) -> dict:
+        """The GKE watchdog pass (gke_ops.housekeep): queued deletes, finished/overdue/orphaned pods, idle node pools."""
+        from .. import gke_ops
+        return await _call(gke_ops.housekeep, _core())
 
     # -- one sandbox -------------------------------------------------------------------------------------------------------------
     async def _create(self) -> None:
@@ -357,7 +401,7 @@ class GKERaw(RawSandbox):
     async def _wait_ready(self, name: str) -> None:
         x = self.spec.extra or {}
         capacity_wait = float(x.get("capacity_wait_s", 900))
-        ready_timeout = float(x.get("ready_timeout_s", max(1200, self.spec.create_timeout)))
+        ready_timeout = ready_timeout_s(self.spec)
         t0 = time.time()
         unschedulable_since = None
         detail = ""

@@ -301,6 +301,22 @@ def test_a_preempted_pod_is_closed_in_the_ledger_by_reconcile(k8s):
     assert closes[0]["note"].startswith("reconciled")
 
 
+def test_reconcile_does_not_close_a_sandbox_that_opened_while_the_listing_ran(k8s, monkeypatch):
+    early = GKERaw(spec()); run(early.start())
+    late = {}
+    real_live = fleet.live
+
+    async def slow_live(providers=None):
+        listing = await real_live(providers)            # the listing is taken ...
+        late["sb"] = GKERaw(spec()); await late["sb"].start()   # ... and a sandbox opens before reconcile reads the ledger
+        return listing
+    monkeypatch.setattr(fleet, "live", slow_live)
+    del k8s.pods[early.sandbox_id]
+    assert fleet.reconcile(Path(k8s.ledger)) == 1                       # the one really gone
+    assert {e["sid"] for e in ledger_events(k8s) if e["ev"] == "open" and e["id"] in open_entries(k8s)} == {late["sb"].sandbox_id}
+    run(late["sb"].stop())
+
+
 def test_janitor_sweep_kills_old_pods_and_reap_deletes_finished_ones(k8s):
     old = GKERaw(spec()); run(old.start())
     k8s.pods[old.sandbox_id].metadata.creation_timestamp = fk.ts(time.time() - 7 * 3600)

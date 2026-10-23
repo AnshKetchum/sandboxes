@@ -55,11 +55,12 @@ async def sweep(max_age_hours: float = 6.0, providers=None, dry_run: bool = Fals
     return found
 
 
-def _reconcile_core(path, live_now: dict, now: Optional[float] = None) -> int:
-    """Close ledger entries whose sandbox is not in `live_now` ({provider: set of ids, or None if that provider could not be listed})."""
+def _reconcile_core(path, live_now: dict, now: Optional[float] = None, listed_at: Optional[float] = None) -> int:
+    """Close ledger entries whose sandbox is not in `live_now` ({provider: set of ids, or None if that provider could not be listed}).
+    Entries opened at or after `listed_at` (when the listing started) are left alone: the listing cannot have seen them."""
     from .cost import CostLedger, all_ledger_paths
     if path is None:                                   # no ledger named: every ledger (legacy shared + every session)
-        return sum(_reconcile_core(p, live_now, now) for p in all_ledger_paths())
+        return sum(_reconcile_core(p, live_now, now, listed_at) for p in all_ledger_paths())
     led = CostLedger(path)
     now = now or time.time()
     opens, closed = {}, set()
@@ -78,7 +79,7 @@ def _reconcile_core(path, live_now: dict, now: Optional[float] = None) -> int:
     n = 0
     for h, o in opens.items():
         ids = live_now.get(o["provider"])
-        if h in closed or ids is None or o["sid"] in ids:
+        if h in closed or ids is None or o["sid"] in ids or (listed_at is not None and float(o["t"]) >= listed_at):
             continue
         sec = max(0.0, now - o["t"])
         usd = raw_class(o["provider"]).cost_model().sandbox_usd(o["cpu"], o["ram_gib"], o["disk_gib"], sec) if o["provider"] in PROVIDERS else 0.0
@@ -121,22 +122,25 @@ def close_dead_entries(max_age_s: float = 3 * 3600.0, path=None, now: Optional[f
     return n
 
 
-async def areconcile(path=None, live_now: Optional[dict] = None, now: Optional[float] = None, gone=()) -> int:
+async def areconcile(path=None, live_now: Optional[dict] = None, now: Optional[float] = None, gone=(),
+                     listed_at: Optional[float] = None) -> int:
     """Close ledger entries whose sandbox no longer exists on its provider (killed by a stop script, a janitor, the provider's own
     lifetime, a crashed process). Closed at `now`, so run it often. Entries without a sandbox id are left to the stale cutoff.
     Use this from async code; `reconcile()` is the same for plain scripts."""
     if live_now is None:
+        listed_at = time.time()                # a sandbox opening while we list is not in the listing, and not dead
         live_now = {n: ({x.id for x in v} if v is not None else None) for n, v in (await live()).items()}
     if gone:                                   # ids just killed: providers take a few seconds to stop listing them
         live_now = {n: (ids - set(gone) if ids is not None else None) for n, ids in live_now.items()}
-    return _reconcile_core(path, live_now, now)
+    return _reconcile_core(path, live_now, now, listed_at)
 
 
-def reconcile(path=None, live_now: Optional[dict] = None, now: Optional[float] = None) -> int:
-    """Synchronous `areconcile` (it starts its own event loop: do not call it from async code)."""
+def reconcile(path=None, live_now: Optional[dict] = None, now: Optional[float] = None, listed_at: Optional[float] = None) -> int:
+    """Synchronous `areconcile` (it starts its own event loop: do not call it from async code). With `live_now`, pass `listed_at`
+    (when that listing started) so a sandbox that opened meanwhile is not closed."""
     import asyncio
     if live_now is not None:
-        return _reconcile_core(path, live_now, now)
+        return _reconcile_core(path, live_now, now, listed_at)
     return asyncio.run(areconcile(path, None, now))
 
 
@@ -149,6 +153,20 @@ async def meter_all(seconds: float = 0.0, providers=None) -> float:
         except Exception as e:  # noqa: BLE001 — one provider's meter must not stop the others
             print(f"[sandboxes] meter for {n} failed: {e!r}", flush=True)
     return total
+
+
+async def housekeep_all(providers=None) -> dict:
+    """Each provider's `housekeep`. Returns {provider: report} for the providers that reported something."""
+    out = {}
+    for n in providers or providers_available():
+        try:
+            rep = await raw_class(n).housekeep()
+        except Exception as e:  # noqa: BLE001 — one provider's cleanup must not stop the others
+            print(f"[sandboxes] housekeeping for {n} failed: {e!r}", flush=True)
+            continue
+        if rep:
+            out[n] = rep
+    return out
 
 
 async def accrue_storage(seconds: float, providers=None) -> float:

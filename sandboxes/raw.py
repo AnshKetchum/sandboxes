@@ -126,6 +126,12 @@ class RawSandbox(ABC):
         return 0.0
 
     @classmethod
+    async def housekeep(cls) -> dict:
+        """Provider-specific cleanup the generic janitor cannot do (GKE: queued deletes, orphaned pods, idle node pools).
+        Called on the janitor cadence; returns a report. Default: nothing to do."""
+        return {}
+
+    @classmethod
     def cost_model(cls, overrides: Optional[dict] = None) -> CostModel:
         return cost_model_for(cls.provider, overrides)
 

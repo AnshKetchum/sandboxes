@@ -12,7 +12,10 @@ in proportion to their share; an empty node is charged to no run ("" = idle capa
   - a node alive now is charged from where the last pass left it, or from its creation time if it is new or the meter was not
     running: a node that is still alive is never under-charged, however long the gap
   - a node gone since the last pass is charged up to now when passes were close together (at most one interval too much),
-    else up to (last charged + STALE_GAP_S), with a `meter_gap` record that the billing reconciliation must explain
+    else up to its removal event (Kubernetes keeps events about an hour), else up to (last charged + STALE_GAP_S) with a
+    `meter_gap` record that the billing reconciliation must explain
+  - a node born and gone between passes (a spot node preempted within minutes) is charged from its registration event to
+    its last removal event; a node remembered as gone (GONE_MEMORY_S) is never charged again
   - the cluster fee is charged for the whole time since the last pass (from the cluster's creation on the first pass)
 
 State (how far each node and the cluster are charged) is ~/.cache/sandboxes/gke_meter_state.json, read and written under an
@@ -44,6 +47,8 @@ PROVIDER = "gke"
 STATE_FILE = "gke_meter_state.json"
 LOCK_FILE = "gke_meter.lock"
 MIN_INTERVAL_S = 30.0          # a pass sooner than this after the previous one is skipped
+STATE_VERSION = 1
+REREGISTER_MARGIN_S = 5.0        # a node's registration event can trail its creation timestamp; earlier than this is another life
 STALE_GAP_S = 300.0            # passes further apart than this mean the meter was down
 GONE_MEMORY_S = 3 * 3600.0     # how long a charged-as-gone node is remembered: longer than Kubernetes keeps its events (1 h)
 REGISTERED_REASONS = ("RegisteredNode",)
@@ -106,15 +111,17 @@ def node_price_hour(node: Node, cfg: MeterConfig) -> float:
     return float(price) + disk
 
 
-def ephemeral_price_hour(pool: str, prev_nodes: dict, nodes: list, cfg: MeterConfig) -> float:
-    """Price of a node seen only in events: what nodes of its pool cost, else the most expensive price we know (an
-    over-charge is safe, an under-charge is not)."""
+def ephemeral_price_hour(pool: str, prev_nodes: dict, nodes: list, cfg: MeterConfig, pool_prices: Optional[dict] = None) -> float:
+    """Price of a node seen only in events: what nodes of its pool cost (now, at the last pass, or when one was last seen; a
+    node pool has one machine type), else the most expensive price we know (an over-charge is safe, an under-charge is not)."""
     for n in nodes:
         if n.pool == pool:
             return node_price_hour(n, cfg)
     for s in prev_nodes.values():
         if s.get("pool") == pool and s.get("price_h"):
             return float(s["price_h"])
+    if (pool_prices or {}).get(pool):
+        return float(pool_prices[pool])
     known = [float(s.get("price_h") or 0) for s in prev_nodes.values()] + [node_price_hour(n, cfg) for n in nodes]
     known += [max(p.values()) for p in cfg.machine_prices.values() if p]
     return max(known) if known else 0.0
@@ -125,8 +132,11 @@ def compute_charges(now: float, state: dict, nodes: list, pods: list, cfg: Meter
     """One meter pass, as pure arithmetic. Returns (charges, new_state); each charge is
     {"usd", "kind", "label", "run", "seconds"}: kind "node" (a node's unattributed cost, split by run), "cluster_fee", or
     "meter_gap" (usd 0; `max_usd` says how much more the vanished node might have cost).
-    `ephemeral`: nodes known only from their lifecycle events ({"name", "pool", "born", "died" or None}): a node born and gone
-    between two passes is never seen alive, so it is charged from these (registration to removal, else to now)."""
+    `ephemeral`: nodes known only from their lifecycle events ({"name", "pool", "born", "reborn", "died"}; born/reborn are its
+    first/latest registration, died its latest removal, each None when there is no such event): a node born and gone between two
+    passes is never seen alive, so it is charged from these (registration to removal, else to now). A name can come back (a
+    managed instance group recreates a preempted VM under its old name): a node charged as gone is charged again only for a
+    registration after that, never for the time already charged."""
     model = model or cost_model_for(PROVIDER)
     prev_nodes = dict(state.get("nodes") or {})
     gone_before = dict(state.get("gone") or {})
@@ -134,11 +144,28 @@ def compute_charges(now: float, state: dict, nodes: list, pods: list, cfg: Meter
     charges, new_nodes = [], {}
     gone_now: dict = {}
     by_node: dict = {}
+    events = {e["name"]: e for e in ephemeral}
     for p in pods:
         by_node.setdefault(p.node, []).append(p)
     for n in nodes:
         price = node_price_hour(n, cfg)
-        start = max(float(prev_nodes.get(n.name, {}).get("until", n.created)), n.created)
+        # a known node from where the last pass left it, even if it is a new node under the old name (a recreated VM: the gap
+        # between its lives is charged too, at most one interval); a new one from its creation, never over time charged before
+        start = float(prev_nodes[n.name].get("until", n.created)) if n.name in prev_nodes else n.created
+        start = max(start, float(gone_before.get(n.name, 0.0)))
+        e = events.get(n.name)
+        if e and n.name not in prev_nodes:
+            # Registered before this node was created: earlier lives under this name. Repeats of an event fold into one (first and
+            # last timestamps only), so how many and when is unknown: charge from where this name is accounted for (the last
+            # pass: alive then, it would be in prev_nodes; or when it was charged as gone), else from its first registration.
+            known = [float(x) for x in (last_pass, gone_before.get(n.name)) if x is not None]
+            floor = max(known) if known else None
+            first = float(e["born"]) if e.get("born") is not None else None
+            if first is not None and first < n.created - REREGISTER_MARGIN_S:
+                start = min(start, first if floor is None else max(floor, first))
+            elif floor is None and e.get("died") is not None and float(e["died"]) < n.created:
+                charges.append({"usd": 0.0, "kind": "meter_gap", "label": n.name, "run": "", "seconds": 0.0,
+                                "died": float(e["died"])})            # an earlier life of unknown length: for reconciliation
         seconds = max(0.0, now - start)
         node_usd = price * seconds / 3600.0
         allocated_by_run: dict = {}
@@ -157,6 +184,7 @@ def compute_charges(now: float, state: dict, nodes: list, pods: list, cfg: Meter
         new_nodes[n.name] = {"until": now, "price_h": price, "pool": n.pool, "machine": n.machine, "spot": n.spot}
     alive = {n.name for n in nodes}
     gap = (now - last_pass) if last_pass else None
+    died_at = {e["name"]: float(e["died"]) for e in ephemeral if e.get("died")}
     for name, s in prev_nodes.items():
         if name in alive:
             continue
@@ -164,6 +192,8 @@ def compute_charges(now: float, state: dict, nodes: list, pods: list, cfg: Meter
         price = float(s.get("price_h", 0.0))
         if gap is not None and gap <= STALE_GAP_S:
             seconds = max(0.0, now - until)
+        elif died_at.get(name, 0.0) >= until:                         # the meter was down, but the node's removal event says when
+            seconds = max(0.0, min(died_at[name], now) - until)
         else:
             seconds = max(0.0, min(now, until + STALE_GAP_S) - until)
             unknown = max(0.0, now - until - seconds)
@@ -175,24 +205,44 @@ def compute_charges(now: float, state: dict, nodes: list, pods: list, cfg: Meter
         gone_now[name] = now
     for e in ephemeral:
         name = e["name"]
-        if name in alive or name in prev_nodes or name in gone_before or name in gone_now:
-            continue                                                  # seen alive, or already charged
-        born = float(e["born"])
-        died = float(e["died"]) if e.get("died") else now             # no removal event: charged up to now
+        if name in alive or name in prev_nodes:
+            continue                                                  # charged above
+        charged_to = gone_now.get(name, gone_before.get(name))
+        if charged_to is not None:                                    # charged as gone up to then, and every pass since saw
+            floor = max(float(charged_to), float(last_pass or 0.0))   # its events: only a registration after both is a new life,
+            if e.get("reborn") is None or float(e["reborn"]) <= floor:  # charged from the first registration after that
+                continue                                              # (folded: unknown, so from `floor` at the earliest)
+            born = max(floor, float(e["born"]))
+        elif e.get("born") is None:                                   # a node never seen, registered before the events kept: its
+            charges.append({"usd": 0.0, "kind": "meter_gap", "label": name, "run": "", "seconds": 0.0,   # cost is unknown here
+                             "died": e.get("died")})
+            gone_now[name] = now
+            continue
+        else:
+            born = e["born"]
+        born = float(born)
+        died = float(e["died"]) if e.get("died") and float(e["died"]) >= born else now   # no removal since: up to now
         seconds = max(0.0, min(died, now) - born)
-        price = ephemeral_price_hour(e.get("pool", ""), prev_nodes, nodes, cfg)
+        price = ephemeral_price_hour(e.get("pool", ""), prev_nodes, nodes, cfg, state.get("pool_prices"))
         charges.append({"usd": price * seconds / 3600.0, "kind": "node", "label": name, "run": "", "seconds": seconds,
                         "price_h": price, "gone": True})
         gone_now[name] = now
     fee_from = state.get("cluster_until") or cluster_created
+    if fee_from is not None and state.get("cluster_closed"):          # close_out charged a deleted cluster up to then
+        fee_from = max(float(fee_from), float(state["cluster_closed"]))
     if fee_from is not None and cfg.cluster_fee_hour:
         seconds = max(0.0, now - float(fee_from))
         if seconds > 0:
             charges.append({"usd": cfg.cluster_fee_hour * seconds / 3600.0, "kind": "cluster_fee", "label": "cluster", "run": "",
                             "seconds": seconds})
     keep_gone = {n: t for n, t in {**gone_before, **gone_now}.items() if now - float(t) < GONE_MEMORY_S}
-    new_state = {"version": 1, "last_pass": now, "nodes": new_nodes, "gone": keep_gone,
+    pool_prices = dict(state.get("pool_prices") or {})
+    for known in (prev_nodes, new_nodes):                            # the nodes just gone, then the nodes alive
+        pool_prices.update({s["pool"]: s["price_h"] for s in known.values() if s.get("pool") and s.get("price_h")})
+    new_state = {"version": STATE_VERSION, "last_pass": now, "nodes": new_nodes, "gone": keep_gone, "pool_prices": pool_prices,
                  "cluster_until": now if fee_from is not None else state.get("cluster_until")}
+    if state.get("cluster_closed"):
+        new_state["cluster_closed"] = state["cluster_closed"]
     return charges, new_state
 
 
@@ -264,7 +314,7 @@ def ephemeral_from_api(api, known_pools=()) -> list:
         print(f"[sandboxes] gke_meter: cannot read node events ({e!r}); nodes living less than one pass may be missed",
               file=sys.stderr, flush=True)
         return []
-    born, died = {}, {}
+    born, reborn, died = {}, {}, {}
     for ev in events:
         name = getattr(getattr(ev, "involved_object", None), "name", None)
         if not name:
@@ -274,11 +324,13 @@ def ephemeral_from_api(api, known_pools=()) -> list:
         t_last = epoch(getattr(ev, "last_timestamp", None)) or t_first
         if t_first is None:
             continue
-        if ev.reason in REGISTERED_REASONS:
+        if ev.reason in REGISTERED_REASONS:                         # repeats fold into one event: first and last timestamps
             born[name] = min(born.get(name, t_first), t_first)
+            reborn[name] = max(reborn.get(name, t_last), t_last)
         elif ev.reason in REMOVED_REASONS:
             died[name] = max(died.get(name, t_last), t_last)
-    return [{"name": n, "born": b, "died": died.get(n), "pool": pool_of(n, known_pools)} for n, b in born.items()]
+    return [{"name": n, "born": born.get(n), "reborn": reborn.get(n), "died": died.get(n), "pool": pool_of(n, known_pools)}
+            for n in {*born, *died}]
 
 
 def cluster_created_from_api(api) -> Optional[float]:
@@ -298,7 +350,7 @@ def load_state(paths=None) -> dict:
     """The meter's state; a missing or corrupt file is rebuilt from the meter's own ledger records."""
     try:
         s = json.loads(state_path().read_text())
-        if isinstance(s, dict) and isinstance(s.get("nodes", {}), dict) and s.get("version") == 1:
+        if isinstance(s, dict) and isinstance(s.get("nodes", {}), dict) and s.get("version") == STATE_VERSION:
             return s
     except (OSError, ValueError):
         pass
@@ -332,7 +384,7 @@ def rebuild_state(paths=None) -> dict:
             continue
     if last is None:
         return {}
-    return {"version": 1, "last_pass": last, "cluster_until": cluster_until,
+    return {"version": STATE_VERSION, "last_pass": last, "cluster_until": cluster_until,
             "nodes": {n: {"until": s["until"], "price_h": s["price_h"]} for n, s in nodes.items() if not s["gone"]},
             "gone": {n: s["until"] for n, s in nodes.items() if s["gone"] and last - s["until"] < GONE_MEMORY_S}}
 
@@ -364,12 +416,43 @@ def meter_once(api, *, now: Optional[float] = None, force: bool = False, cfg: Op
         pools = {n.pool for n in nodes} | {s.get("pool", "") for s in (state.get("nodes") or {}).values()}
         ephemeral = ephemeral_from_api(api, pools)
         charges, new_state = compute_charges(now, state, nodes, pods, cfg, cluster_created=created, ephemeral=ephemeral)
-        path = Path(ledger_path) if ledger_path else get_ledger().path
-        led = CostLedger(Path(ledger_path) if ledger_path else get_ledger().path)
-        for c in charges:                                  # ledger first, state second: a crash in between over-charges, never under
-            rec = {"t": now, "ev": "storage", "provider": PROVIDER, "run": c["run"], "kind": c["kind"], "gib": 0,
-                   "seconds": round(c["seconds"], 1), "usd": round(c["usd"], 6), "label": c["label"]}
-            rec.update({k: (round(c[k], 6) if isinstance(c[k], float) else c[k]) for k in ("price_h", "max_usd", "gone") if k in c})
-            led._append(rec)
+        _write(charges, now, ledger_path)                 # ledger first, state second: a crash in between over-charges, never under
         save_state(new_state)
+        return sum(c["usd"] for c in charges)
+
+
+def _write(charges: list, now: float, ledger_path=None) -> None:
+    led = CostLedger(Path(ledger_path) if ledger_path else get_ledger().path)
+    for c in charges:
+        rec = {"t": now, "ev": "storage", "provider": PROVIDER, "run": c["run"], "kind": c["kind"], "gib": 0,
+               "seconds": round(c["seconds"], 1), "usd": round(c["usd"], 6), "label": c["label"]}
+        rec.update({k: (round(c[k], 6) if isinstance(c[k], float) else c[k]) for k in ("price_h", "max_usd", "gone", "died") if k in c})
+        led._append(rec)
+
+
+def close_out(*, now: Optional[float] = None, cfg: Optional[MeterConfig] = None, ledger_path: Optional[os.PathLike] = None) -> float:
+    """The cluster was deleted (call this when the deletion has finished, after a last meter_once while the API still answered):
+    charge every node the meter last saw, and the cluster fee, up to `now`. A node may have gone earlier in the deletion: over,
+    never under. Waits for a pass in progress instead of skipping. Returns USD charged."""
+    cache_dir().mkdir(parents=True, exist_ok=True)
+    with open(cache_dir() / LOCK_FILE, "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        state = load_state()
+        now = now or time.time()
+        cfg = cfg or MeterConfig.load()
+        charges = []
+        gone = dict(state.get("gone") or {})
+        for name, s in (state.get("nodes") or {}).items():
+            seconds = max(0.0, now - float(s.get("until", now)))
+            price = float(s.get("price_h", 0.0))
+            charges.append({"usd": price * seconds / 3600.0, "kind": "node", "label": name, "run": "", "seconds": seconds,
+                            "price_h": price, "gone": True})
+            gone[name] = now
+        if state.get("cluster_until") and cfg.cluster_fee_hour:
+            seconds = max(0.0, now - float(state["cluster_until"]))
+            charges.append({"usd": cfg.cluster_fee_hour * seconds / 3600.0, "kind": "cluster_fee", "label": "cluster", "run": "",
+                            "seconds": seconds})
+        _write(charges, now, ledger_path)
+        save_state({"version": STATE_VERSION, "last_pass": now, "nodes": {}, "gone": gone, "cluster_until": None, "cluster_closed": now,
+                    "pool_prices": state.get("pool_prices") or {}})
         return sum(c["usd"] for c in charges)
