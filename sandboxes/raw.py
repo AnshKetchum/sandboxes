@@ -195,7 +195,8 @@ class RawSandbox(ABC):
         record(self.provider, True)             # the circuit breaker (health.py) watches how starts go on each provider
         s = self.spec
         self._ledger_handle = get_ledger().open(self.provider, cpu=s.cpu, ram_gib=s.mem_gb, disk_gib=s.disk_gb,
-                                                labels=s.labels, sandbox_id=self.sandbox_id)
+                                                labels=s.labels, sandbox_id=self.sandbox_id,
+                                                usd_per_hour=self.model.hourly_usd(s.cpu, s.mem_gb, s.disk_gb))
         try:
             loop_gb = int(s.extra.get("docker_loop_gb") or 0)
             if loop_gb:      # docker's overlay2 cannot sit on an overlay root (blaxel, fly): give it an ext4 loop file instead

@@ -97,6 +97,8 @@ class OpenPod:
     ram_gib: float
     disk_gib: float
     run: str
+    usd_per_hour: Optional[float] = None   # recorded when its entry opened: what the entry is actually charged at
+    closed: Optional[float] = None         # its entry closed at (since the last pass): it covered its node up to then
 
 
 def node_price_hour(node: Node, cfg: MeterConfig) -> float:
@@ -170,8 +172,9 @@ def compute_charges(now: float, state: dict, nodes: list, pods: list, cfg: Meter
         node_usd = price * seconds / 3600.0
         allocated_by_run: dict = {}
         for p in by_node.get(n.name, []):
-            overlap = max(0.0, now - max(start, p.opened))
-            share = model.sandbox_usd(p.cpu, p.ram_gib, p.disk_gib, overlap)
+            overlap = max(0.0, (min(now, p.closed) if p.closed is not None else now) - max(start, p.opened))
+            share = (p.usd_per_hour * overlap / 3600.0 if p.usd_per_hour is not None
+                     else model.sandbox_usd(p.cpu, p.ram_gib, p.disk_gib, overlap))
             allocated_by_run[p.run] = allocated_by_run.get(p.run, 0.0) + share
         allocated = sum(allocated_by_run.values())
         rest = max(0.0, node_usd - allocated)
@@ -240,6 +243,7 @@ def compute_charges(now: float, state: dict, nodes: list, pods: list, cfg: Meter
     for known in (prev_nodes, new_nodes):                            # the nodes just gone, then the nodes alive
         pool_prices.update({s["pool"]: s["price_h"] for s in known.values() if s.get("pool") and s.get("price_h")})
     new_state = {"version": STATE_VERSION, "last_pass": now, "nodes": new_nodes, "gone": keep_gone, "pool_prices": pool_prices,
+                 "pod_nodes": {p.sid: p.node for p in pods if p.closed is None},
                  "cluster_until": now if fee_from is not None else state.get("cluster_until")}
     if state.get("cluster_closed"):
         new_state["cluster_closed"] = state["cluster_closed"]
@@ -262,9 +266,9 @@ def nodes_from_api(api) -> list:
     return out
 
 
-def open_entries(paths=None) -> dict:
-    """sid -> the open ledger entry (no close yet) of every sandbox of this provider, across every ledger."""
-    opens, closed = {}, set()
+def ledger_entries(paths=None, closed_since: Optional[float] = None) -> tuple[dict, dict]:
+    """(sid -> open entry, sid -> (entry, close time) for entries closed after `closed_since`) of this provider, every ledger."""
+    opens, closed = {}, {}
     for p in paths if paths is not None else all_ledger_paths():
         try:
             with open(p) as f:
@@ -276,23 +280,43 @@ def open_entries(paths=None) -> dict:
                     if r.get("ev") == "open" and r.get("provider") == PROVIDER and r.get("sid"):
                         opens[r["id"]] = r
                     elif r.get("ev") == "close":
-                        closed.add(r["id"])
+                        closed[r["id"]] = float(r.get("t") or 0.0)
         except OSError:
             continue
-    return {r["sid"]: r for h, r in opens.items() if h not in closed}
+    still = {r["sid"]: r for h, r in opens.items() if h not in closed}
+    recent = {r["sid"]: (r, closed[h]) for h, r in opens.items()
+              if h in closed and closed_since is not None and closed[h] > float(closed_since)}
+    return still, recent
+
+
+def open_entries(paths=None) -> dict:
+    """sid -> the open ledger entry (no close yet) of every sandbox of this provider, across every ledger."""
+    return ledger_entries(paths)[0]
+
+
+def closed_pods(recent: dict, pod_nodes: dict) -> list:
+    """Entries closed since the last pass whose node that pass saw: each covered its node up to its close."""
+    out = []
+    for sid, (e, t) in recent.items():
+        if sid in pod_nodes:
+            out.append(OpenPod(sid, pod_nodes[sid], float(e["t"]), float(e.get("cpu") or 0), float(e.get("ram_gib") or 0),
+                               float(e.get("disk_gib") or 0), e.get("run", ""),
+                               float(e["usd_per_hour"]) if e.get("usd_per_hour") is not None else None, closed=t))
+    return out
 
 
 def open_pods_from_api(api, entries: dict) -> list:
     """Pods running on a node that have an open ledger entry (their share is being charged by that entry)."""
-    from .backends.gke_raw import MANAGED_SELECTOR, namespace
+    from .backends.gke_raw import list_managed_pods, namespace
     out = []
-    for p in api.list_namespaced_pod(namespace(), label_selector=MANAGED_SELECTOR).items or []:
+    for p in list_managed_pods(api, namespace()):
         e = entries.get(p.metadata.name)
         node = getattr(p.spec, "node_name", None)
         if e is None or not node:
             continue
         out.append(OpenPod(p.metadata.name, node, float(e["t"]), float(e.get("cpu") or 0), float(e.get("ram_gib") or 0),
-                           float(e.get("disk_gib") or 0), e.get("run", "")))
+                           float(e.get("disk_gib") or 0), e.get("run", ""),
+                           float(e["usd_per_hour"]) if e.get("usd_per_hour") is not None else None))
     return out
 
 
@@ -411,7 +435,8 @@ def meter_once(api, *, now: Optional[float] = None, force: bool = False, cfg: Op
             return 0.0
         cfg = cfg or MeterConfig.load()
         nodes = nodes_from_api(api)
-        pods = open_pods_from_api(api, open_entries())
+        still, recent = ledger_entries(closed_since=state.get("last_pass"))
+        pods = open_pods_from_api(api, still) + closed_pods(recent, state.get("pod_nodes") or {})
         created = None if state.get("cluster_until") else cluster_created_from_api(api)
         pools = {n.pool for n in nodes} | {s.get("pool", "") for s in (state.get("nodes") or {}).values()}
         ephemeral = ephemeral_from_api(api, pools)
@@ -430,18 +455,23 @@ def check_pod_rate(nodes: list, pods: list, cfg: MeterConfig, model=None) -> lis
     process. Totals stay right either way (the meter charges what pods do not cover, and pods covering more than the node is an
     over-charge), but runs are then charged the wrong share."""
     model = model or cost_model_for(PROVIDER)
-    used = {p.node for p in pods}
+    per_vcpu = {}                                                  # what pod entries on each node are charged per vCPU-hour
+    for p in pods:
+        if p.usd_per_hour is not None and p.cpu:
+            per_vcpu.setdefault(p.node, p.usd_per_hour / p.cpu)
+        else:
+            per_vcpu.setdefault(p.node, model.vcpu_hour)
     off = []
     for n in nodes:
-        if n.name not in used or not n.vcpus:
+        if n.name not in per_vcpu or not n.vcpus:
             continue
-        price, pods_rate = node_price_hour(n, cfg), model.vcpu_hour * n.vcpus
+        price, pods_rate = node_price_hour(n, cfg), per_vcpu[n.name] * n.vcpus
         if price and abs(pods_rate - price) / price > 0.05:
             off.append(n.machine)
             if n.machine not in _rate_warned:
                 _rate_warned.add(n.machine)
                 print(f"[sandboxes] gke_meter: {n.machine} costs ${price:.3f}/h but its pods are charged ${pods_rate:.3f}/h "
-                      f"(SANDBOX_GKE_VCPU_HOUR {model.vcpu_hour:.5f} x {n.vcpus:.0f}): set SANDBOX_GKE_VCPU_HOUR={price / n.vcpus:.5f}",
+                      f"({per_vcpu[n.name]:.5f}/vCPU-h x {n.vcpus:.0f}): set SANDBOX_GKE_VCPU_HOUR={price / n.vcpus:.5f}",
                       file=sys.stderr, flush=True)
     return off
 

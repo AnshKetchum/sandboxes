@@ -22,6 +22,8 @@ Configuration (the provider config's `extra:` mapping):
   tolerations       [...]              e.g. the sandbox pool's taint and cloud.google.com/gke-spot
   runtime_class     "gvisor" or unset
   cpu_request       fraction of `cpu` requested (default 0.95, so N one-vCPU pods fit an N-vCPU node's allocatable)
+  ephemeral_request_gb  disk the scheduler reserves per pod (default disk_gb, the limit): 192 pods x 10 GiB is 1.9 TB a node;
+                    a smaller request packs them, the limit still evicts a pod that writes more
   capacity_wait_s   how long a pod may stay unschedulable before CapacityError (default 900: covers a node scale-up)
   ready_timeout_s   how long a pod may take to become ready in total (default 1200: scale-up plus a large image pull)
 
@@ -129,7 +131,8 @@ def pod_manifest(name: str, spec, namespace: str) -> dict:
     labels = {k: v for k, v in labels.items() if v}
     labels["sandboxes.managed"] = "true"
     cpu_request = round(float(spec.cpu) * float(x.get("cpu_request", 0.95)), 3)
-    resources = {"requests": {"cpu": str(cpu_request), "memory": f"{int(spec.mem_gb)}Gi", "ephemeral-storage": f"{int(spec.disk_gb)}Gi"},
+    disk_request = min(float(x.get("ephemeral_request_gb", spec.disk_gb)), float(spec.disk_gb))
+    resources = {"requests": {"cpu": str(cpu_request), "memory": f"{int(spec.mem_gb)}Gi", "ephemeral-storage": f"{disk_request:g}Gi"},
                  "limits": {"cpu": str(float(spec.cpu)), "memory": f"{int(spec.mem_gb)}Gi", "ephemeral-storage": f"{int(spec.disk_gb)}Gi"}}
     pod_spec = {
         "restartPolicy": "Never",

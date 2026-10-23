@@ -55,6 +55,14 @@ async def sweep(max_age_hours: float = 6.0, providers=None, dry_run: bool = Fals
     return found
 
 
+def _entry_usd(o: dict, seconds: float) -> float:
+    """An open entry's cost for `seconds`: at its recorded rate, else at its provider's model (0 for an unknown provider)."""
+    from .cost import entry_usd
+    if o.get("usd_per_hour") is None and o["provider"] not in PROVIDERS:
+        return 0.0
+    return entry_usd(o, seconds, raw_class(o["provider"]).cost_model() if o["provider"] in PROVIDERS else None)
+
+
 def _reconcile_core(path, live_now: dict, now: Optional[float] = None, listed_at: Optional[float] = None) -> int:
     """Close ledger entries whose sandbox is not in `live_now` ({provider: set of ids, or None if that provider could not be listed}).
     Entries opened at or after `listed_at` (when the listing started) are left alone: the listing cannot have seen them."""
@@ -82,7 +90,7 @@ def _reconcile_core(path, live_now: dict, now: Optional[float] = None, listed_at
         if h in closed or ids is None or o["sid"] in ids or (listed_at is not None and float(o["t"]) >= listed_at):
             continue
         sec = max(0.0, now - o["t"])
-        usd = raw_class(o["provider"]).cost_model().sandbox_usd(o["cpu"], o["ram_gib"], o["disk_gib"], sec) if o["provider"] in PROVIDERS else 0.0
+        usd = _entry_usd(o, sec)
         led._append({"t": now, "ev": "close", "id": h, "provider": o["provider"], "run": o.get("run", ""), "seconds": round(sec, 2),
                      "usd": round(usd, 6), "note": "reconciled: sandbox no longer exists"})
         n += 1
@@ -115,7 +123,7 @@ def close_dead_entries(max_age_s: float = 3 * 3600.0, path=None, now: Optional[f
     for h, o in opens.items():
         if h in closed or o["t"] > cut:
             continue
-        usd = raw_class(o["provider"]).cost_model().sandbox_usd(o["cpu"], o["ram_gib"], o["disk_gib"], max_age_s) if o["provider"] in PROVIDERS else 0.0
+        usd = _entry_usd(o, max_age_s)
         led._append({"t": o["t"] + max_age_s, "ev": "close", "id": h, "provider": o["provider"], "run": o.get("run", ""), "seconds": max_age_s,
                      "usd": round(usd, 6), "note": "closed: open past the lifetime ceiling (dead process)"})
         n += 1

@@ -4,6 +4,7 @@ interleaving of node births and deaths, pods, meter outages, lost state and conc
 from __future__ import annotations
 
 import json
+import time
 import random
 import threading
 from pathlib import Path
@@ -396,11 +397,121 @@ def test_after_a_close_out_the_cluster_fee_is_not_charged_again_from_the_cluster
     assert sum(c["usd"] for c in charges if c["kind"] == "cluster_fee") == pytest.approx(0.10)
 
 
-def test_a_pod_rate_that_disagrees_with_the_node_price_is_reported(capsys):
+def test_a_pod_rate_that_disagrees_with_the_node_price_is_reported(capsys, monkeypatch):
     from sandboxes.gke_meter import OpenPod, check_pod_rate
     from sandboxes.pricing import CostModel
+    monkeypatch.setattr(gke_meter, "_rate_warned", set())
     pods = [OpenPod("s1", "n1", T0, 1, 2, 10, "r")]
     assert check_pod_rate([node("n1")], pods, CFG, CostModel("gke", vcpu_hour=PRICE / VCPUS)) == []
     assert check_pod_rate([node("n1")], pods, CFG, CostModel("gke", vcpu_hour=2 * PRICE / VCPUS)) == ["c4d-standard-192"]
     assert "set SANDBOX_GKE_VCPU_HOUR=" in capsys.readouterr().err
     assert check_pod_rate([node("n2")], pods, CFG, CostModel("gke", vcpu_hour=2 * PRICE / VCPUS)) == []   # no pods of ours on it
+    recorded = [OpenPod("s1", "n1", T0, 2, 4, 10, "r", usd_per_hour=2 * PRICE / VCPUS)]   # the recorded rate is what counts
+    assert check_pod_rate([node("n1")], recorded, CFG, CostModel("gke", vcpu_hour=5 * PRICE / VCPUS)) == []
+
+
+def test_coverage_uses_the_rate_each_pod_entry_recorded_not_the_meters_own():
+    """A pod entry opened by a process whose rate is half the meter's: the meter must subtract only what that entry is charged,
+    or the node's bill would come out short."""
+    half = PRICE / VCPUS / 2
+    pods = [OpenPod(f"s{i}", "n1", T0, 1, 2, 10, "r", usd_per_hour=half) for i in range(96)]
+    st = {"version": 1, "last_pass": T0, "nodes": {"n1": {"until": T0, "price_h": PRICE, "pool": "sandbox-spot"}}}
+    charges, _ = compute_charges(T0 + 3600, st, [node("n1")], pods, CFG, MODEL)
+    meter = sum(c["usd"] for c in charges if c["kind"] == "node")
+    assert meter + 96 * half == pytest.approx(PRICE)
+
+
+def test_an_entry_is_charged_at_its_recorded_rate_by_every_later_reader(tmp_path, monkeypatch):
+    from sandboxes import fleet
+    from sandboxes.cost import entry_usd
+    monkeypatch.setenv("SANDBOX_COST_LEDGER", str(tmp_path / "led.jsonl"))
+    led = CostLedger(tmp_path / "led.jsonl")
+    h = led.open("gke", cpu=1, ram_gib=2, disk_gib=10, sandbox_id="sbx-a", usd_per_hour=0.5)
+    rec = json.loads((tmp_path / "led.jsonl").read_text().splitlines()[0])
+    assert rec["usd_per_hour"] == 0.5 and entry_usd(rec, 3600, CostModel("gke", vcpu_hour=9.0)) == pytest.approx(0.5)
+    s = summary(tmp_path / "led.jsonl", models={"gke": CostModel("gke", vcpu_hour=9.0)}, now=rec["t"] + 3600)
+    assert s["providers"]["gke"]["running_usd"] == pytest.approx(0.5) and s["providers"]["gke"]["burn_usd_per_hour"] == pytest.approx(0.5)
+    fleet.reconcile(tmp_path / "led.jsonl", live_now={"gke": set()}, now=rec["t"] + 7200)     # another process closes it
+    close = json.loads((tmp_path / "led.jsonl").read_text().splitlines()[-1])
+    assert close["ev"] == "close" and close["usd"] == pytest.approx(1.0)
+    assert led.close(h, CostModel("gke", vcpu_hour=9.0)) == pytest.approx(0.5 * (time.time() - rec["t"]) / 3600, abs=1e-6)
+
+
+def test_a_pod_closed_since_the_last_pass_covers_its_node_up_to_its_close():
+    rate = PRICE / VCPUS
+    st = {"version": 1, "last_pass": T0, "nodes": {"n1": {"until": T0, "price_h": PRICE, "pool": "sandbox-spot"}}}
+    gone = OpenPod("s1", "n1", T0 - 600, 1, 2, 10, "r", usd_per_hour=rate, closed=T0 + 1800)
+    charges, st = compute_charges(T0 + 3600, st, [node("n1")], [gone], CFG, MODEL)
+    meter = sum(c["usd"] for c in charges if c["kind"] == "node")
+    assert meter + rate * 1800 / 3600 == pytest.approx(PRICE)                 # the pod's entry charged T0..T0+1800 of it
+    assert "s1" not in st["pod_nodes"]
+
+
+def test_the_meter_learns_pod_nodes_and_uses_them_for_entries_that_close_between_passes(env):
+    api, led_path = env
+    api.nodes = [fk.make_node("n1", T0)]
+    led = CostLedger(led_path)
+    h = led.open("gke", cpu=1, ram_gib=2, disk_gib=10, sandbox_id="sbx-1", usd_per_hour=PRICE / VCPUS)
+    api.pods["sbx-1"] = fk.make_pod({"metadata": {"name": "sbx-1", "labels": {"sandboxes.managed": "true"}}, "spec": {}}, T0)
+    fk.set_ready(api.pods["sbx-1"], node="n1")
+    meter_once(api, now=T0 + 1800, force=True, cfg=CFG, ledger_path=led_path)
+    assert gke_meter.load_state()["pod_nodes"] == {"sbx-1": "n1"}
+    led.close(h, MODEL); del api.pods["sbx-1"]
+    meter_once(api, now=time.time() + 1, force=True, cfg=CFG, ledger_path=led_path)
+    assert gke_meter.load_state()["pod_nodes"] == {}
+
+
+
+def test_pods_and_meter_add_up_to_the_node_bill_through_random_churn(tmp_path, monkeypatch):
+    """End to end through meter_once, the ledger and the API: pods opening and closing at random (some within one pass), each
+    charged at its own process's rate, meter passes at random. Exactly: pods + meter = the node's cost + the charges of pods
+    no pass ever saw (opened and closed between two passes: the meter cannot know their node, so it cannot subtract them)."""
+    from types import SimpleNamespace
+    from sandboxes import cost
+    rng = random.Random(3)
+    clock = [T0]
+    monkeypatch.setattr(cost, "time", SimpleNamespace(time=lambda: clock[0]))
+    monkeypatch.setattr(gke_meter, "cost_model_for", lambda p: MODEL)
+    monkeypatch.setattr(gke_meter, "_rate_warned", {"c4d-standard-192"})
+    cfg = MeterConfig(machine_prices=CFG.machine_prices, disk_gb_month=0.0, cluster_fee_hour=0.0)
+    for trial in range(60):
+        d = tmp_path / f"t{trial}"
+        monkeypatch.setenv("SANDBOX_CACHE_DIR", str(d / "cache"))
+        monkeypatch.setenv("SANDBOX_COST_LEDGER", str(d / "led.jsonl"))
+        api = fk.FakeCore(now=lambda: clock[0])
+        api.nodes = [fk.make_node("n1", T0)]
+        led = CostLedger(d / "led.jsonl")
+        H = 7200.0
+        events = []
+        for i in range(rng.randint(1, 40)):
+            o = T0 + rng.uniform(0, H - 10)
+            c = min(T0 + H, o + rng.choice([rng.uniform(1, 30), rng.uniform(5, 400), rng.uniform(60, 3000)]))
+            rate = rng.uniform(0.5, 1.0) * PRICE / VCPUS * (cpu := rng.choice([1, 2]))
+            events += [(o, 0, "open", (f"sbx-{i}", cpu, rate)), (c, 1, "close", f"sbx-{i}")]
+        t = T0
+        while True:
+            t += rng.uniform(5, STALE_GAP_S)
+            if t >= T0 + H:
+                break
+            events.append((t, 2, "pass", None))
+        events.append((T0 + H, 3, "pass", None))
+        handles, opened, passes = {}, {}, []
+        for when, _, kind, arg in sorted(events, key=lambda e: (e[0], e[1])):
+            clock[0] = when
+            if kind == "open":
+                sid, cpu, rate = arg
+                handles[sid] = led.open("gke", cpu=cpu, ram_gib=2 * cpu, disk_gib=10, sandbox_id=sid, usd_per_hour=rate)
+                api.pods[sid] = fk.make_pod({"metadata": {"name": sid, "labels": {"sandboxes.managed": "true"}}, "spec": {}}, when)
+                fk.set_ready(api.pods[sid], node="n1")
+                opened[sid] = [when, None, rate]
+            elif kind == "close":
+                led.close(handles[arg], MODEL)
+                del api.pods[arg]
+                opened[arg][1] = when
+            else:
+                meter_once(api, now=when, force=True, cfg=cfg, ledger_path=d / "led.jsonl")
+                passes.append(when)
+        recs = [json.loads(l) for l in (d / "led.jsonl").read_text().splitlines()]
+        total = sum(r.get("usd", 0.0) for r in recs if r["ev"] in ("close", "storage"))
+        unseen = sum(rate * (c - o) / 3600 for o, c, rate in opened.values() if not any(o <= p < c for p in passes))
+        assert total == pytest.approx(PRICE * H / 3600 + unseen, abs=1e-5 * (1 + len(recs))), trial

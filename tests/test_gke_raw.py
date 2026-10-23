@@ -86,6 +86,14 @@ def open_entries(api) -> set:
 
 
 # -- manifest and label rules ---------------------------------------------------------------------------------------------------
+def test_the_disk_request_can_be_smaller_than_its_limit_but_never_larger():
+    r = pod_manifest("sbx-1", spec(disk_gb=10, extra={"ephemeral_request_gb": 2}), "ns")["spec"]["containers"][0]["resources"]
+    assert r["requests"]["ephemeral-storage"] == "2Gi" and r["limits"]["ephemeral-storage"] == "10Gi"
+    r = pod_manifest("sbx-1", spec(disk_gb=10, extra={"ephemeral_request_gb": 50}), "ns")["spec"]["containers"][0]["resources"]
+    assert r["requests"]["ephemeral-storage"] == "10Gi"
+    assert pod_manifest("sbx-1", spec(disk_gb=10), "ns")["spec"]["containers"][0]["resources"]["requests"]["ephemeral-storage"] == "10Gi"
+
+
 def test_manifest_has_a_hard_lifetime_no_token_no_restarts_and_exact_labels():
     s = spec(labels={"sandboxes.owner": "euphoria", "sandboxes.run": "lhg ab3/weird*run" + "x" * 80, "prefix": "t-1"}, lifetime_s=5400,
              extra={"node_selector": {"sandboxes.pool": "sandbox"}, "runtime_class": "gvisor",

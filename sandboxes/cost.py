@@ -107,11 +107,14 @@ class CostLedger:
 
     # -- sandboxes ------------------------------------------------------------------------------
     def open(self, provider: str, *, cpu: float, ram_gib: float, disk_gib: float,
-             labels: Optional[dict] = None, sandbox_id: str = "") -> str:
-        """Record a sandbox start; returns the handle to pass to `close`."""
+             labels: Optional[dict] = None, sandbox_id: str = "", usd_per_hour: Optional[float] = None) -> str:
+        """Record a sandbox start; returns the handle to pass to `close`. `usd_per_hour` (the sandbox's rate at open) is what every
+        later reader charges it at (its close, a reconcile or a meter in another process), whatever their own price settings."""
         h = uuid.uuid4().hex[:12]
         rec = {"t": time.time(), "ev": "open", "id": h, "provider": provider, "run": self.run,
                "sid": sandbox_id, "cpu": cpu, "ram_gib": ram_gib, "disk_gib": disk_gib, "labels": labels or {}}
+        if usd_per_hour is not None:
+            rec["usd_per_hour"] = round(float(usd_per_hour), 8)
         self._open[h] = rec
         self._append(rec)
         return h
@@ -122,7 +125,7 @@ class CostLedger:
         if rec is None:
             return 0.0
         seconds = time.time() - rec["t"]
-        usd = model.sandbox_usd(rec["cpu"], rec["ram_gib"], rec["disk_gib"], seconds)
+        usd = entry_usd(rec, seconds, model)
         self._append({"t": time.time(), "ev": "close", "id": handle, "provider": rec["provider"], "run": self.run,
                       "seconds": round(seconds, 2), "usd": round(usd, 6)})
         return usd
@@ -140,6 +143,14 @@ class CostLedger:
         """A one-off charge (an image build, a plan fee share)."""
         self._append({"t": time.time(), "ev": "storage", "provider": provider, "run": self.run,
                       "kind": kind, "gib": 0, "seconds": 0, "usd": round(usd, 6), "label": label})
+
+
+def entry_usd(rec: dict, seconds: float, model: Optional[CostModel] = None) -> float:
+    """What a sandbox entry costs for `seconds`: at the rate recorded when it opened, else at `model` (or the provider's)."""
+    if rec.get("usd_per_hour") is not None:
+        return float(rec["usd_per_hour"]) * max(0.0, seconds) / 3600.0
+    m = model or cost_model_for(rec["provider"])
+    return m.sandbox_usd(rec["cpu"], rec["ram_gib"], rec["disk_gib"], seconds)
 
 
 _ledger: Optional[CostLedger] = None
@@ -202,13 +213,13 @@ def summary(path: Optional[os.PathLike] = None, *, run: Optional[str] = None, mo
         else:
             m = models.get(p) or cost_model_for(p)
             age = now - o["t"]; billed = min(age, STALE_AFTER_S)
-            a["running_usd"] += m.sandbox_usd(o["cpu"], o["ram_gib"], o["disk_gib"], billed)
+            a["running_usd"] += entry_usd(o, billed, m)
             a["sandbox_hours"] += billed / 3600.0
             if age > STALE_AFTER_S:
                 a["stale"] += 1
             else:
                 a["running"] += 1
-                a["burn_usd_per_hour"] += m.hourly_usd(o["cpu"], o["ram_gib"], o["disk_gib"])
+                a["burn_usd_per_hour"] += entry_usd(o, 3600.0, m)
     for p, usd in storage.items():
         row(p)["storage_usd"] += usd
     for a in out.values():
