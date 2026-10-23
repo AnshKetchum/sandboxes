@@ -47,7 +47,8 @@ from pathlib import Path
 from typing import ClassVar, Optional, Union
 
 from .base import SandboxProvider
-from .errors import BuildError, PushError, SandboxNotOpenError, SandboxOpenError
+from .buildctx import resolve_dockerfile
+from .errors import BuildError, ImageBuildError, PushError, SandboxNotOpenError, SandboxOpenError
 from .models import BuildResult, CommandResult, DependencyEntry, PushResult, SandboxProviderConfig
 
 # Bound how many sandbox builds+starts are in flight at once, process-wide.
@@ -142,6 +143,20 @@ def _is_retryable_start_error(e: Exception) -> bool:
         m = str(e).lower()
         return "entered error state" in m or "sandboxstate.error" in m or "build_failed" in m
     return False
+
+
+def _is_build_failure(e: Optional[BaseException]) -> bool:
+    """A start error that is the image build failing (harbor's
+    SandboxBuildFailedError, or Daytona's build_failed state)."""
+    if e is None:
+        return False
+    try:
+        from harbor.environments.base import SandboxBuildFailedError
+        if isinstance(e, SandboxBuildFailedError):
+            return True
+    except ImportError:
+        pass
+    return "build_failed" in str(e).lower()
 
 
 async def _start_env(env, attempts: int = _SANDBOX_START_ATTEMPTS) -> None:
@@ -387,7 +402,59 @@ class DaytonaProvider(SandboxProvider):
         self._opened_at_wall = datetime.now(timezone.utc)
         self._closed_at_wall = None
 
+    def can_open_from_dockerfile(self) -> bool:
+        return True
+
+    def open_from_dockerfile(
+        self,
+        context_dir: Union[str, Path],
+        *,
+        dockerfile: Optional[str] = None,
+        workdir: str = "/",
+        network: str = "bridge",
+        name_prefix: Optional[str] = None,
+        labels: Optional[dict[str, str]] = None,
+        build_timeout: float = 1800.0,
+    ) -> None:
+        """Daytona builds-and-starts from a harbor task dir, so this is
+        `open()` on one: the context's own parent when it is a task's
+        environment/ beside a task.toml (that task.toml's [environment]
+        settings then apply, as with `open(task_dir)`), else a throwaway
+        task dir around it. Daytona builds environment/Dockerfile only, so
+        another `dockerfile` is rejected. `labels` are not applied (the
+        sandbox carries this module's standard labels); `build_timeout` is
+        DAYTONA_START_TIMEOUT_S's job here. A harbor build failure becomes
+        ImageBuildError."""
+        ctx = Path(context_dir).resolve()
+        if dockerfile and resolve_dockerfile(ctx, dockerfile).resolve() != ctx / "Dockerfile":
+            raise SandboxOpenError("DaytonaProvider builds <context>/Dockerfile only; "
+                                   f"got dockerfile={dockerfile!r}")
+        tmp = None
+        if ctx.name == "environment" and (ctx.parent / "task.toml").is_file():
+            task_dir = ctx.parent
+        else:
+            tmp = Path(tempfile.mkdtemp(prefix="sbx-daytona-task-"))
+            task_dir = tmp / (ctx.name if ctx.name != "environment" else ctx.parent.name or "task")
+            task_dir.mkdir()
+            (task_dir / "task.toml").write_text("")
+            (task_dir / "instruction.md").write_text("")
+            (task_dir / "environment").symlink_to(ctx, target_is_directory=True)
+        try:
+            self.open(str(task_dir), workdir=workdir, network=network, name_prefix=name_prefix)
+        except SandboxOpenError as e:
+            if tmp is not None:
+                import shutil
+                shutil.rmtree(tmp, ignore_errors=True)
+            if _is_build_failure(e.__cause__):
+                raise ImageBuildError(f"daytona: image build failed for {ctx}: {e.__cause__}") from e
+            raise
+        self._tmp_task_dir = tmp      # the environment dir harbor holds on to; removed in close()
+
     def close(self) -> None:
+        tmp_task, self._tmp_task_dir = getattr(self, "_tmp_task_dir", None), None
+        if tmp_task is not None:
+            import shutil
+            shutil.rmtree(tmp_task, ignore_errors=True)
         if not self._is_open:
             return
         try:

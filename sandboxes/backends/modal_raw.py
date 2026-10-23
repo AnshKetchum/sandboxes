@@ -10,8 +10,10 @@ N processes' worth of CPU; a request without a limit lets a sandbox burst to ~4x
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 
+from ..buildctx import context_digest
 from ..errors import CapacityError, ImageBuildError
 from ..raw import ExecResult, LiveSandbox, RawSandbox
 
@@ -19,23 +21,51 @@ _app = None
 _app_lock = None
 _images: dict = {}          # image key -> the Task that builds (or just resolves) it, shared by every sandbox of that image in this process
 APP_NAME = "sandboxes"
+_LOG_TAIL_LINES = 40
+
+
+async def _build_log_tail(err: Exception) -> str:
+    """Modal's ImageBuildError names the image (`modal image logs im-...`) but not what failed; the failing step's
+    output is what a caller repairing the Dockerfile needs, so fetch the last layer's log. Best-effort: "" if unavailable."""
+    import modal
+    image_id = getattr(err, "image_id", None)
+    if not image_id:
+        m = re.search(r"\b(im-[A-Za-z0-9]+)\b", " ".join(str(a) for a in (*getattr(err, "args", ()), err)))
+        image_id = m.group(1) if m else None
+    if not image_id:
+        return ""
+    lines: list = []
+
+    async def fetch():
+        async for entry in modal.Image.from_id(image_id).logs.fetch.aio(layers=1):
+            lines.extend((entry.message or "").splitlines())
+    try:
+        await asyncio.wait_for(fetch(), timeout=60)
+    except Exception:  # noqa: BLE001 — older modal (no Image.logs), network, timeout: the short error still stands
+        pass
+    lines = [ln for ln in lines if ln.strip() and not ln.startswith("[notice]")]
+    return ("\nbuild log tail:\n" + "\n".join(lines[-_LOG_TAIL_LINES:]))[-2000:] if lines else ""
 
 
 async def _image(app, spec):
     """The modal Image for `spec`: its registry image, or built from `extra["dockerfile"]` (+ `extra["context_dir"]`). Built once per
-    process however many sandboxes want it (the 3 tries of a task), and a failed build is remembered, so siblings fail at once."""
+    process however many sandboxes want it (the 3 tries of a task), and a failed build is remembered, so siblings fail at once.
+    A Dockerfile build is keyed by the context's CONTENT (buildctx.context_digest), not its path: a repair that edits the
+    Dockerfile or its context in place gets a fresh build instead of the stale (or failed) image of the old content."""
     import modal
     dockerfile = spec.extra.get("dockerfile")
-    key = f"{dockerfile}|{spec.extra.get('context_dir')}" if dockerfile else spec.image
+    context_dir = str(spec.extra.get("context_dir") or Path(dockerfile).parent) if dockerfile else ""
+    key = f"ctx:{context_digest(context_dir, str(dockerfile))}" if dockerfile else spec.image
     if key not in _images:
         if dockerfile:
-            image = modal.Image.from_dockerfile(str(dockerfile), context_dir=str(spec.extra.get("context_dir") or Path(dockerfile).parent))
+            image = modal.Image.from_dockerfile(str(dockerfile), context_dir=context_dir)
 
             async def build():
                 try:
                     return await image.build.aio(app)
                 except modal.exception.ImageBuildError as e:
-                    raise ImageBuildError(f"modal: image build failed for {dockerfile}: {str(e)[:300]}") from e
+                    raise ImageBuildError(f"modal: image build failed for {dockerfile}: {str(e)[:300]}"
+                                          f"{await _build_log_tail(e)}") from e
             _images[key] = asyncio.ensure_future(build())
         else:
             fut = asyncio.get_running_loop().create_future()
