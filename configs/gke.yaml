@@ -1,0 +1,40 @@
+# GKE sandboxes: one pod per sandbox on a spot node pool (see sandboxes/backends/gke_raw.py, docs/gke.md). Images must be in a
+# registry the cluster can pull from (Artifact Registry): GKE does not build Dockerfiles. Credentials: a kubeconfig from
+# `gcloud container clusters get-credentials` (scripts/gke/setup.sh writes it).
+# Housekeeping: `python -m sandboxes.gke_ops watch` (or the janitor) beside any workload; `gke_ops status` for the burn rate.
+sandbox_providers:
+  - name: gke
+    cpu: 1
+    memory_mb: 2048
+    disk_gb: 10
+    peak_concurrent_sandboxes: 1000       # the namespace ResourceQuota (scripts/gke/setup.sh) is the hard ceiling
+    spend_cap_usd: 50                     # raise deliberately after the first live verification
+    auto_delete_minutes: 240              # activeDeadlineSeconds: the kubelet kills the pod here even if every process of ours died
+    extra:
+      node_selector: {sandboxes.pool: sandbox}
+      tolerations:
+        - {key: sandboxes.pool, operator: Equal, value: sandbox, effect: NoSchedule}
+      cpu_request: 0.95                   # so 192 one-vCPU pods fit a 192-vCPU node's allocatable (system pods take the rest)
+      capacity_wait_s: 900                # a node scale-up is 1-3 min; spot capacity can take longer
+      ready_timeout_s: 1200
+
+# Cluster coordinates for gke_ops (resize, teardown). Env GKE_PROJECT / GKE_LOCATION / GKE_CLUSTER override these.
+gke:
+  project: ""
+  location: ""                            # region (regional cluster) or zone
+  cluster: ""
+  sandbox_pools: [sandbox-spot]           # only sandboxes run here (tainted); resized to 0 after idle_scale_down_min idle
+  idle_scale_down_min: 15
+  orphan_pending_min: 30                  # for pods without the ready-within annotation (created by an older backend)
+
+# The node meter's prices (sandboxes/gke_meter.py). UNVERIFIED until `scripts/gke/prices.py` fills them from the Cloud
+# Billing Catalog for the cluster's region; spot prices move up to once a day. Keep SANDBOX_GKE_VCPU_HOUR (the pods' rate) equal
+# to the sandbox pool's spot price / its vCPUs: the meter warns when they differ by more than 5%.
+gke_meter:
+  machine_prices:
+    c4d-standard-192: {spot: 3.40}        # from the plan's ~$22/h for 6 nodes incl. extras; replace with the catalog price
+  fallback_vcpu_hour: {spot: 0.02, ondemand: 0.05}   # an unknown machine type: a deliberately high per-vCPU price
+  disk_gb_month: 0.10                     # pd-balanced boot disks
+  pool_disk_gb: {sandbox-spot: 100}
+  default_disk_gb: 100
+  cluster_fee_hour: 0.10                  # GKE Standard management fee (the free tier credit covers one zonal cluster)

@@ -394,3 +394,13 @@ def test_after_a_close_out_the_cluster_fee_is_not_charged_again_from_the_cluster
     cfg = MeterConfig(machine_prices=CFG.machine_prices, disk_gb_month=0.0, cluster_fee_hour=0.10)
     charges, st = compute_charges(T0 + 3600, st, [], [], cfg, MODEL, cluster_created=T0 - 86400)
     assert sum(c["usd"] for c in charges if c["kind"] == "cluster_fee") == pytest.approx(0.10)
+
+
+def test_a_pod_rate_that_disagrees_with_the_node_price_is_reported(capsys):
+    from sandboxes.gke_meter import OpenPod, check_pod_rate
+    from sandboxes.pricing import CostModel
+    pods = [OpenPod("s1", "n1", T0, 1, 2, 10, "r")]
+    assert check_pod_rate([node("n1")], pods, CFG, CostModel("gke", vcpu_hour=PRICE / VCPUS)) == []
+    assert check_pod_rate([node("n1")], pods, CFG, CostModel("gke", vcpu_hour=2 * PRICE / VCPUS)) == ["c4d-standard-192"]
+    assert "set SANDBOX_GKE_VCPU_HOUR=" in capsys.readouterr().err
+    assert check_pod_rate([node("n2")], pods, CFG, CostModel("gke", vcpu_hour=2 * PRICE / VCPUS)) == []   # no pods of ours on it

@@ -416,9 +416,34 @@ def meter_once(api, *, now: Optional[float] = None, force: bool = False, cfg: Op
         pools = {n.pool for n in nodes} | {s.get("pool", "") for s in (state.get("nodes") or {}).values()}
         ephemeral = ephemeral_from_api(api, pools)
         charges, new_state = compute_charges(now, state, nodes, pods, cfg, cluster_created=created, ephemeral=ephemeral)
+        check_pod_rate(nodes, pods, cfg)
         _write(charges, now, ledger_path)                 # ledger first, state second: a crash in between over-charges, never under
         save_state(new_state)
         return sum(c["usd"] for c in charges)
+
+
+_rate_warned: set = set()
+
+
+def check_pod_rate(nodes: list, pods: list, cfg: MeterConfig, model=None) -> list:
+    """Machine types whose node price and the pods' rate (SANDBOX_GKE_VCPU_HOUR x vCPUs) differ by more than 5%, warned once per
+    process. Totals stay right either way (the meter charges what pods do not cover, and pods covering more than the node is an
+    over-charge), but runs are then charged the wrong share."""
+    model = model or cost_model_for(PROVIDER)
+    used = {p.node for p in pods}
+    off = []
+    for n in nodes:
+        if n.name not in used or not n.vcpus:
+            continue
+        price, pods_rate = node_price_hour(n, cfg), model.vcpu_hour * n.vcpus
+        if price and abs(pods_rate - price) / price > 0.05:
+            off.append(n.machine)
+            if n.machine not in _rate_warned:
+                _rate_warned.add(n.machine)
+                print(f"[sandboxes] gke_meter: {n.machine} costs ${price:.3f}/h but its pods are charged ${pods_rate:.3f}/h "
+                      f"(SANDBOX_GKE_VCPU_HOUR {model.vcpu_hour:.5f} x {n.vcpus:.0f}): set SANDBOX_GKE_VCPU_HOUR={price / n.vcpus:.5f}",
+                      file=sys.stderr, flush=True)
+    return off
 
 
 def _write(charges: list, now: float, ledger_path=None) -> None:
