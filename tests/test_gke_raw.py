@@ -15,7 +15,6 @@ import pytest
 from sandboxes import fleet
 from sandboxes.backends import gke_raw
 from sandboxes.backends.gke_raw import GKERaw, exec_argv, k8s_label_key, k8s_label_value, pod_manifest, pod_start_state
-from sandboxes.cost import summary
 from sandboxes.errors import CapacityError, ImageBuildError, SandboxCreateError, SandboxError
 from sandboxes.pricing import cost_model_for
 from sandboxes.raw import SandboxSpec
@@ -340,7 +339,6 @@ def test_janitor_sweep_kills_old_pods_and_reap_deletes_finished_ones(k8s):
 
 
 def test_stop_by_run_deletes_that_run_only(k8s):
-    from sandboxes.labels import standard_labels
     a = GKERaw(spec(labels={"sandboxes.run": "run-a"})); run(a.start())
     b = GKERaw(spec(labels={"sandboxes.run": "run-b"})); run(b.start())
     gone = run(fleet.stop(run="run-a", providers=["gke"]))

@@ -13,11 +13,10 @@ import pytest
 from sandboxes import fleet, gke_meter, gke_ops
 from sandboxes.backends import gke_raw
 from sandboxes.backends.gke_raw import GKERaw, pod_manifest, queue_pending_delete, take_pending_deletes
-from sandboxes.cost import summary
 from sandboxes.gke_ops import OpsConfig, housekeep, why_delete
 
 import gke_fakes as fk
-from test_gke_raw import k8s, ledger_events, run, spec  # noqa: F401 — k8s is a fixture
+from test_gke_raw import k8s, ledger_events, run, spec  # noqa: F401  (k8s is a fixture, used by name)
 
 POOL = "sandbox-spot"
 CFG = OpsConfig(project="p", location="us-central1", cluster="c", sandbox_pools=[POOL], idle_scale_down_min=15,
