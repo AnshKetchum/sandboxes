@@ -49,11 +49,20 @@ DEFAULT_CAPABILITIES = {
     "docker": {"dind": False, "image_ref": True, "requires_prebuilt_image": False, "persistent_disk_gb": 0, "local": True},
     "fly": {"create_rate_per_s": 1, "create_burst": 3, "dind": True, "image_ref": True, "requires_prebuilt_image": False, "builds_dockerfile": True, "persistent_disk_gb": 8, "note": "Firecracker microVM, real disk (8 GB rootfs by default)"},
     "modal": {"create_rate_per_s": 5, "create_burst": 5, "dind": True, "image_ref": True, "requires_prebuilt_image": False, "builds_dockerfile": True, "persistent_disk_gb": 500, "note": "runtime=vm (real VM, large root disk); gvisor cannot run a daemon"},
+    #   gke    20/s, 40  our own cluster: bounded by the API server, not a vendor quota (tune per cluster size)
+    "gke": {"create_rate_per_s": 20, "create_burst": 40, "dind": False, "image_ref": True, "requires_prebuilt_image": True, "persistent_disk_gb": 10,
+            "note": "one pod per sandbox on our own GKE cluster; registry images only (build and push first); nodes billed via gke_meter"},
 }
 
 
 def _modal_credentials() -> bool:
     return bool(os.environ.get("MODAL_TOKEN_ID") and os.environ.get("MODAL_TOKEN_SECRET")) or os.path.exists(os.path.expanduser("~/.modal.toml"))
+
+
+def _gke_credentials() -> bool:
+    """A kubeconfig to reach the cluster (`gcloud container clusters get-credentials` writes one)."""
+    paths = [p for p in os.environ.get("KUBECONFIG", "").split(os.pathsep) if p] or [os.path.expanduser("~/.kube/config")]
+    return any(os.path.exists(p) for p in paths)
 
 PROVIDERS: dict[str, ProviderInfo] = {
     "docker": ProviderInfo("docker", (), None, "sandboxes.docker_provider:DockerProvider", DEFAULT_CAPABILITIES["docker"]),
@@ -66,6 +75,9 @@ PROVIDERS: dict[str, ProviderInfo] = {
     "fly": ProviderInfo("fly", ("FLY_API_KEY",), "sandboxes.backends.fly_raw:FlyRaw", "sandboxes.generic_provider:FlyProvider", DEFAULT_CAPABILITIES["fly"]),
     "modal": ProviderInfo("modal", (), "sandboxes.backends.modal_raw:ModalRaw", "sandboxes.generic_provider:ModalProvider",
                           DEFAULT_CAPABILITIES["modal"], available=_modal_credentials),
+    "gke": ProviderInfo("gke", (), "sandboxes.backends.gke_raw:GKERaw", "sandboxes.generic_provider:GKEProvider",
+                        DEFAULT_CAPABILITIES["gke"], extra_env=("GKE_NAMESPACE", "GKE_KUBE_CONTEXT", "SANDBOX_GKE_VCPU_HOUR"),
+                        available=_gke_credentials),
 }
 
 

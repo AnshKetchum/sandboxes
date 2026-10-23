@@ -140,6 +140,17 @@ def reconcile(path=None, live_now: Optional[dict] = None, now: Optional[float] =
     return asyncio.run(areconcile(path, None, now))
 
 
+async def meter_all(seconds: float = 0.0, providers=None) -> float:
+    """Each provider's `meter` (costs billed per machine rather than per sandbox, e.g. GKE nodes). Returns USD added."""
+    total = 0.0
+    for n in providers or providers_available():
+        try:
+            total += await raw_class(n).meter(seconds)
+        except Exception as e:  # noqa: BLE001 — one provider's meter must not stop the others
+            print(f"[sandboxes] meter for {n} failed: {e!r}", flush=True)
+    return total
+
+
 async def accrue_storage(seconds: float, providers=None) -> float:
     """Record `seconds` of storage cost for whatever each provider holds now (images, snapshots, volumes). Returns USD added.
     Call it on a fixed cadence (the guard does, every cycle) with the time since the previous call."""

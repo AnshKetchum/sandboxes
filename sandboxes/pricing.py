@@ -18,6 +18,7 @@ contract differs. `CostModel` is pure arithmetic; `sandboxes.cost` does the book
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field, replace
 from typing import Optional
 
@@ -86,6 +87,13 @@ DEFAULT_MODELS: dict[str, CostModel] = {
         notes="performance CPU, Ashburn list price: $0.000012732 per vCPU-second, 2 GB RAM per vCPU included, extra RAM $0.000002316 per GB-second; "
               "shared CPU is ~15x cheaper per vCPU (override: vcpu_hour 0.003047, included_ram_gib_per_vcpu 0.25); volumes $0.15/GB-month"),
     "docker": CostModel("docker", notes="local daemon, free"),
+    # A pod's share of its node: the node's price per vCPU-hour, per requested vCPU. Google bills nodes, not pods; gke_meter
+    # charges whatever the pods' shares do not cover, so this rate only splits a node's cost between runs. Set it with
+    # SANDBOX_GKE_VCPU_HOUR (the node price / its vCPUs), never with a config `pricing:` override: the meter must use the same rate.
+    "gke": CostModel(
+        "gke", vcpu_hour=float(os.environ.get("SANDBOX_GKE_VCPU_HOUR", 3.40 / 192)),
+        notes="default: c4d-standard-192 spot ~$3.40/h over 192 vCPU (us-central1, check the day's spot price); "
+              "nodes, disks and the cluster fee are charged by gke_meter"),
 }
 
 

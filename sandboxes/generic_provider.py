@@ -174,3 +174,7 @@ class ModalProvider(RawBackedProvider):
 
 class FlyProvider(RawBackedProvider):
     name: ClassVar[str] = "fly"
+
+
+class GKEProvider(RawBackedProvider):
+    name: ClassVar[str] = "gke"

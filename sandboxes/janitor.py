@@ -70,9 +70,10 @@ def main(argv=None) -> int:
     while True:
         found = asyncio.run(sweep(a.max_age_hours, [p for p in a.providers.split(",") if p] or None, a.dry_run))
         if not a.dry_run:
-            from .fleet import close_dead_entries, reconcile
+            from .fleet import close_dead_entries, meter_all, reconcile
             reconcile()                                  # the sandboxes just deleted stop accruing in the cost ledger
             close_dead_entries()                         # and so do entries a dead process left open past any sandbox's lifetime
+            asyncio.run(meter_all())                     # machine-billed costs (GKE nodes) keep being charged while nodes exist
         if os.environ.get("BL_API_KEY") and (not a.providers or "blaxel" in a.providers):
             from .blaxel_images import purge_images
             try:

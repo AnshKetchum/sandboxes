@@ -134,9 +134,10 @@ def main(argv=None) -> int:
     while True:
         n = reconcile()
         import asyncio
-        from .fleet import accrue_storage
+        from .fleet import accrue_storage, meter_all
         now_t = time.time()
         added = asyncio.run(accrue_storage(now_t - last)) if a.watch else 0.0       # stored images/snapshots/volumes, per provider
+        added += asyncio.run(meter_all(now_t - last))                              # machine-billed costs (GKE nodes), before caps are read
         last = now_t
         if added:
             print(f"  guard: stored artifacts accrued ${added:.4f}", flush=True)

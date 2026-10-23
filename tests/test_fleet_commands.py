@@ -148,8 +148,7 @@ def test_harbor_adapter_labels_tracks_cost_and_respects_caps(tmp_path, monkeypat
     assert s["opened"] == 1 and s["closed"] == 1 and released == [1]
     (tmp_path / "caps.json").write_text(json.dumps({"total_usd": 1.0}))
     CostLedger(tmp_path / "led.jsonl")._append({"t": time.time(), "ev": "storage", "provider": "daytona", "run": "", "kind": "image", "gib": 0, "seconds": 0, "usd": 5.0, "label": "x"})
-    import sandboxes.guard as g
-    g._CACHE_S = 0.0
+    monkeypatch.setattr("sandboxes.guard._CACHE_S", 0.0)
     with pytest.raises(SpendCapExceeded):
         harbor_adapter.make_env("daytona", task=task, trial_paths=None, session_id="t1__y", size={})
 

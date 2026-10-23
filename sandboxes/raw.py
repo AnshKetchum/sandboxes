@@ -120,6 +120,12 @@ class RawSandbox(ABC):
         return []
 
     @classmethod
+    async def meter(cls, seconds: float = 0.0) -> float:
+        """Put costs that no sandbox entry carries into the ledger (a provider that bills machines, not sandboxes: GKE's nodes).
+        Called on the guard / janitor cadence; returns USD added. Default: nothing to add."""
+        return 0.0
+
+    @classmethod
     def cost_model(cls, overrides: Optional[dict] = None) -> CostModel:
         return cost_model_for(cls.provider, overrides)
 
