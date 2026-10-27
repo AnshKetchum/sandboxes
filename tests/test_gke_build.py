@@ -15,7 +15,7 @@ import yaml
 
 from sandboxes import gke_build
 from sandboxes.errors import ImageBuildError
-from sandboxes.gke_build import BUILDER, BuildConfig, purge, purge_staging
+from sandboxes.gke_build import BuildConfig, purge, purge_staging
 
 REG = "us-central1-docker.pkg.dev/p/envs"
 GiB = 2 ** 30

@@ -4,14 +4,12 @@ through the backend so a pod lands on its pool and its ledger entry carries its 
 
 from __future__ import annotations
 
-import asyncio
 import json
 import time
 
 import pytest
 
 from sandboxes import gke_place as gp
-from sandboxes.backends import gke_raw
 from sandboxes.backends.gke_raw import GKERaw
 from sandboxes.gke_place import Machine, Overhead, Pool, Shape, Snapshot, per_node, place, plan, reserve
 
