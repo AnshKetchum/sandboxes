@@ -185,6 +185,7 @@ async def main_async(a) -> dict:
                 report["vms"][node] = vm_facts(node, "us-central1-a")
     finally:
         await asyncio.gather(*(sb.stop() for sb in live), return_exceptions=True)
+        Path(a.out, f"{a.run}.partial.json").write_text(json.dumps(report, indent=1, default=str))   # whatever happens next
     report["housekeep"] = {k: v for k, v in gke_ops.housekeep(api, cfg).items() if v}
     if a.down:
         report["down"] = {k: v for k, v in gke_ops.down(api, cfg).items() if k != "residue"}

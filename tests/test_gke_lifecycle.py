@@ -271,3 +271,23 @@ def test_a_system_pool_that_will_not_stay_empty_is_an_error_not_a_silent_bill(g,
     monkeypatch.setattr(gke_ops, "gcloud", stubborn)
     with pytest.raises(RuntimeError, match="keeps a node"):
         gke_ops.drain_system_pool(k8s, cfg(), tries=3, settle_s=0.01, poll_s=0.001, drain_s=0.01)
+
+
+def test_a_cluster_operation_waits_for_the_one_already_running(g, monkeypatch):
+    """Found live: GKE runs one operation at a time; a pool resize right after another failed with CLUSTER_ALREADY_HAS_OPERATION."""
+    calls = []
+
+    def busy_twice(*args, timeout=0):
+        calls.append(args)
+        if len(calls) <= 2:
+            raise RuntimeError("FAILED_PRECONDITION: Cluster is running incompatible operation op-1. reason: CLUSTER_ALREADY_HAS_OPERATION")
+        return ""
+    monkeypatch.setattr(gke_ops, "gcloud", busy_twice)
+    gke_ops.resize_pool(cfg(), "c3d-180-spot", 0)
+    assert len(calls) == 3
+
+    def denied(*args, timeout=0):
+        raise RuntimeError("PERMISSION_DENIED: no")
+    monkeypatch.setattr(gke_ops, "gcloud", denied)
+    with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
+        gke_ops.resize_pool(cfg(), "c3d-180-spot", 0)                       # other errors are not retried

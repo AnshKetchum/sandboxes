@@ -115,9 +115,27 @@ def gcloud(*args: str, timeout: float = 1800) -> str:
     return p.stdout
 
 
+BUSY = ("CLUSTER_ALREADY_HAS_OPERATION", "incompatible operation")
+BUSY_WAIT_S = 900.0
+
+
+def cluster_op(*args, timeout: float = 1800) -> str:
+    """A gcloud call that changes the cluster. GKE runs one such operation at a time (found live: a second pool resize right
+    after the first failed with CLUSTER_ALREADY_HAS_OPERATION): wait for the running one and retry, up to BUSY_WAIT_S."""
+    t0, delay = time.time(), 5.0
+    while True:
+        try:
+            return gcloud(*args, timeout=timeout)
+        except RuntimeError as e:
+            if not any(b in str(e) for b in BUSY) or time.time() - t0 > BUSY_WAIT_S:
+                raise
+            time.sleep(delay)
+            delay = min(delay * 1.5, 30.0)
+
+
 def resize_pool(cfg: OpsConfig, pool: str, nodes: int = 0, wait: bool = False) -> None:
-    gcloud("container", "clusters", "resize", *cfg.cluster_args(), "--node-pool", pool, "--num-nodes", str(nodes), "--quiet",
-           *([] if wait else ["--async"]))
+    cluster_op("container", "clusters", "resize", *cfg.cluster_args(), "--node-pool", pool, "--num-nodes", str(nodes), "--quiet",
+               *([] if wait else ["--async"]))
 
 
 # -- state -----------------------------------------------------------------------------------------------------------------------
@@ -422,7 +440,7 @@ def teardown(api, cfg: Optional[OpsConfig] = None, *, run: Optional[str] = None,
             rep["metered_usd"] += gke_meter.meter_once(api)
         rep["metered_usd"] += gke_meter.meter_once(api, force=True)
     if delete_cluster:
-        gcloud("container", "clusters", "delete", *cfg.cluster_args(), "--quiet", timeout=3600)
+        cluster_op("container", "clusters", "delete", *cfg.cluster_args(), "--quiet", timeout=3600)
         rep["cluster_deleted"] = True
         rep["metered_usd"] += gke_meter.close_out()
     return rep
@@ -503,9 +521,9 @@ def apply_pools(api, cfg: OpsConfig, actions: list, *, replace: bool = False, pr
     by_name = {p["name"]: p for p in cfg.pools}
     for action, name, detail in actions:
         if action == "create":
-            gcloud(*create_pool_args(cfg, by_name[name]), "--quiet", timeout=3600)
+            cluster_op(*create_pool_args(cfg, by_name[name]), "--quiet", timeout=3600)
         elif action == "update":
-            gcloud("container", "clusters", "update", *cfg.cluster_args(), "--node-pool", name, "--enable-autoscaling",
+            cluster_op("container", "clusters", "update", *cfg.cluster_args(), "--node-pool", name, "--enable-autoscaling",
                    "--total-min-nodes", "0", "--total-max-nodes", str(max_nodes_of(by_name[name], max(1, len(cfg.zones)))), "--quiet")
         elif action in ("replace", "delete"):
             if not (replace if action == "replace" else prune):
@@ -513,10 +531,10 @@ def apply_pools(api, cfg: OpsConfig, actions: list, *, replace: bool = False, pr
             if pool_has_nodes(api, name):
                 print(f"[sandboxes] gke_ops: not deleting pool {name}: it has nodes", file=sys.stderr, flush=True)
                 continue
-            gcloud("container", "node-pools", "delete", name, "--cluster", cfg.cluster, "--location", cfg.location,
+            cluster_op("container", "node-pools", "delete", name, "--cluster", cfg.cluster, "--location", cfg.location,
                    "--project", cfg.project, "--quiet", timeout=3600)
             if action == "replace":
-                gcloud(*create_pool_args(cfg, by_name[name]), "--quiet", timeout=3600)
+                cluster_op(*create_pool_args(cfg, by_name[name]), "--quiet", timeout=3600)
         else:
             continue
         done.append((action, name))
@@ -540,8 +558,8 @@ def is_up(api, cfg: OpsConfig) -> bool:
 
 def up(api, cfg: OpsConfig, *, wait: bool = True, poll_s: float = 10.0, timeout_s: float = 900.0) -> dict:
     """Bring the system pool back (1 node, autoscaled to system_max_nodes). Sandbox pools grow from 0 as sandboxes ask."""
-    gcloud("container", "clusters", "update", *cfg.cluster_args(), "--node-pool", cfg.system_pool, "--enable-autoscaling",
-           "--min-nodes", "1", "--max-nodes", str(cfg.system_max_nodes), "--quiet")
+    cluster_op("container", "clusters", "update", *cfg.cluster_args(), "--node-pool", cfg.system_pool, "--enable-autoscaling",
+               "--min-nodes", "1", "--max-nodes", str(cfg.system_max_nodes), "--quiet")
     resize_pool(cfg, cfg.system_pool, 1, wait=False)
     t0 = time.time()
     while wait and not is_up(api, cfg):
@@ -561,8 +579,8 @@ def down(api, cfg: OpsConfig, *, wait: bool = True, poll_s: float = 30.0) -> dic
     tier covers one zonal cluster's fee); `teardown --delete-cluster` removes that too."""
     from . import gke_build
     rep = teardown(api, cfg, pools=True, wait=False)
-    gcloud("container", "clusters", "update", *cfg.cluster_args(), "--node-pool", cfg.system_pool, "--no-enable-autoscaling",
-           "--quiet")
+    cluster_op("container", "clusters", "update", *cfg.cluster_args(), "--node-pool", cfg.system_pool, "--no-enable-autoscaling",
+               "--quiet")
     rep["system_pool_resizes"] = drain_system_pool(api, cfg, poll_s=poll_s)
     rep["resized"].append(cfg.system_pool)
     bcfg = gke_build.BuildConfig.load()
