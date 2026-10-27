@@ -277,10 +277,28 @@ def collect_exec(resp, stdout_only: bool) -> tuple[Optional[int], bytes]:
     return rc, bytes(out)
 
 
+_exec_local = threading.local()
+
+
+def _exec_api():
+    """This thread's own API client for exec streams. kubernetes.stream.stream() swaps `request` on the ApiClient it is given
+    for the length of the call: on the shared client, every other thread's call in that window goes out as a websocket
+    (found live: list_node failed with "'NoneType' object has no attribute 'decode'"), and two overlapping execs can leave the
+    shared client in websocket mode for good. One client per worker thread: the swap only ever touches that thread's."""
+    api = getattr(_exec_local, "api", None)
+    if api is None:
+        from kubernetes import client
+        _core()                                         # kubeconfig loaded (default Configuration)
+        api = _exec_local.api = client.CoreV1Api(client.ApiClient())
+    return api
+
+
 def _stream_exec(api, name: str, namespace: str, argv: list, *, stdin: Optional[bytes], timeout: float,
                  stdout_only: bool) -> tuple[Optional[int], bytes]:
-    """Run argv in the pod; returns (exit code, or None if the stream ended without one; output bytes)."""
+    """Run argv in the pod; returns (exit code, or None if the stream ended without one; output bytes). `api` is not used for
+    the stream itself (see _exec_api)."""
     from kubernetes.stream import stream
+    api = _exec_api()
     resp = stream(api.connect_get_namespaced_pod_exec, name, namespace, command=argv, container=CONTAINER,
                   stderr=True, stdin=stdin is not None, stdout=True, tty=False, _preload_content=False, binary=True)
     try:

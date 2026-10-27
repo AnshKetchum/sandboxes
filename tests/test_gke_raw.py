@@ -460,3 +460,33 @@ def test_a_stream_still_open_has_no_exit_code():
     ws = finished_stream(b"", b"", {"status": "Success"})
     ws._connected = True
     assert gke_raw.exit_code(ws) is None
+
+
+def test_exec_streams_never_touch_the_shared_api_client(monkeypatch):
+    """kubernetes.stream.stream() swaps `request` on the client it gets: each worker thread must get its own client."""
+    import threading
+    from kubernetes import client
+    import kubernetes.stream as ks
+    shared = client.CoreV1Api(client.ApiClient())
+    monkeypatch.setattr(gke_raw, "_core", lambda: shared)
+    monkeypatch.setattr(gke_raw, "_exec_local", threading.local())
+    seen = []
+
+    def fake_stream(method, *a, **kw):
+        seen.append((threading.get_ident(), method.__self__.api_client))
+        raise RuntimeError("stop here")
+    monkeypatch.setattr(ks, "stream", fake_stream)
+
+    def go():
+        with pytest.raises(RuntimeError):
+            gke_raw._stream_exec(shared, "p", "ns", ["true"], stdin=None, timeout=1, stdout_only=False)
+        with pytest.raises(RuntimeError):
+            gke_raw._stream_exec(shared, "p", "ns", ["true"], stdin=None, timeout=1, stdout_only=False)
+    ts = [threading.Thread(target=go) for _ in range(3)]
+    for th in ts:
+        th.start()
+    for th in ts:
+        th.join()
+    clients = {id(c) for _, c in seen}
+    assert len(seen) == 6 and id(shared.api_client) not in clients
+    assert len(clients) == 3                                                # one per thread, reused within it
