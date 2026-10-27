@@ -15,7 +15,9 @@
 #   - the sandbox node pools of the catalog (gke_ops pools apply): spot or on demand, 0 nodes until a sandbox needs one,
 #     256 pods a node, tainted so only sandboxes land there, GKE metadata server (pods get no node credentials)
 #   - namespace with a ResourceQuota (the ceiling on concurrent sandboxes), a LimitRange and a NetworkPolicy (no ingress;
-#     egress to the internet and DNS only: no metadata server, no VPC or cluster addresses)
+#     egress to the internet and DNS only: no metadata server, no VPC or cluster addresses). DNS must be allowed to
+#     node-local-dns as well as kube-dns: GKE enables NodeLocal DNSCache, and under Dataplane V2 a pod's DNS goes to the
+#     node-local-dns pod on its node (found live: with kube-dns alone every lookup in a sandbox failed)
 #   - optionally a billing budget alert (BILLING_ACCOUNT=...)
 set -euo pipefail
 
@@ -160,7 +162,7 @@ spec:
     - ipBlock: {cidr: 0.0.0.0/0, except: [169.254.0.0/16, 10.0.0.0/8, 172.16.0.0/12, 192.168.0.0/16, 100.64.0.0/10]}
   - to:
     - namespaceSelector: {matchLabels: {kubernetes.io/metadata.name: kube-system}}
-      podSelector: {matchLabels: {k8s-app: kube-dns}}
+      podSelector: {matchExpressions: [{key: k8s-app, operator: In, values: [kube-dns, node-local-dns]}]}
     ports: [{protocol: UDP, port: 53}, {protocol: TCP, port: 53}]
 EOF
 echo "+ kubectl apply -f <namespace, quota, limits, network policy>"
