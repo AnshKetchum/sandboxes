@@ -1,37 +1,83 @@
 # GKE sandboxes
 
-One Kubernetes pod per sandbox on a spot node pool of a GKE cluster. Large machines (c4d-standard-192: 192 one-vCPU sandboxes
-a node) on spot pricing make a sandbox-hour roughly ten times cheaper than per-sandbox providers, with no provider-side
-concurrency limit: the cluster's node pool size and the namespace quota are the limits, and both are ours.
+One Kubernetes pod per sandbox on our own GKE cluster. A sandbox asks for a size (vCPUs, memory, disk); it lands on the node
+pool that runs that size most cheaply; a harbor task's Dockerfile is built once per context and every sandbox of that task runs
+the image; pools sit at zero nodes (free) until sandboxes need them; after a run nothing is left that bills.
 
-| | Modal (measured) | GKE spot (planned) |
-|---|---|---|
-| 1 vCPU / 2 GiB sandbox-hour | $0.190 | ~$0.018 (node price / 192), plus idle capacity |
-| concurrency limit | the workspace's | `MAX_PODS` quota and `SANDBOX_MAX_PER_ZONE` x zones nodes |
-| images | built by the provider | prebuilt, pushed to Artifact Registry |
-| lifetime enforcement | provider timeout | `activeDeadlineSeconds` (kubelet) |
+1,000 sandboxes of 1 vCPU / 4 GiB / 10 GB (disk reserved, not over-committed), us-central1 catalog prices on 2026-10-27
+(`python -m sandboxes.gke_place plan --cpu 1 --mem 4 --disk 10 --count 1000 --max-usd-h 75`):
 
-The GKE figure is unverified until `scripts/gke/prices.py` reads the catalog price and `scripts/verify_costs_gke.py` reconciles a
-real run against the billing export (docs below).
+| machine | per node | nodes | $/h with boot disks |
+|---|---|---|---|
+| c3d-standard-180 spot | 174 | 6 | 13.65 |
+| c3d-standard-90 spot | 86 | 12 | 13.81 |
+| n2d-standard-96 spot | 91 | 11 | 23.41 |
+| c4d-standard-192 spot | 180 | 6 | 26.03 |
+| c3d-standard-180 on demand | 174 | 6 | 50.84 |
+
+Plus the cluster fee and a small system node (~$0.17/h), and image builds once per distinct task (~$0.06 each). Modal measured
+$0.238 per sandbox-hour at 1 vCPU / 4 GiB: $238/h for the same fleet.
+
+**Quota decides what runs.** In us-central1 the project has CPUS 200 (all families, regional), N2D 200, E2 72, C3D 24, C4D 24
+(2026-10-27). The catalog's C3D/C4D pools are `enabled: false` until those are raised (~1,100 C3D vCPUs, and CPUS / CPUS for all
+regions to match, for 1,000 sandboxes); today two n2d-standard-96 spot nodes, ~180 sandboxes, is the ceiling.
+
+## Placement (sandboxes/gke_place.py)
+
+A sandbox's cost on a pool = the node's price (machine + boot disk) / how many sandboxes of its size fit a node: GKE's
+allocatable (CPU: 6% of the first core, 1% of the next, 0.5% of the next two, 0.25% above; memory: 25% of the first 4 GiB, 20%
+of the next 4, 10% of the next 8, 6% of the next 112, 2% above, plus 100 MiB) minus the DaemonSets (`node_overhead`), then the
+tightest of CPU, memory, disk and the pod limit. Each start: room on a running node first (already paid for), else the pool
+cheapest per sandbox that can still grow (its `max_nodes`), spot preferred, on demand as the fallback. A pool whose pod stays
+unschedulable for 300 s (spot stockout, quota) is cooled down for 10 min and the next pool tried; only when every pool that
+fits has failed does the start raise CapacityError (the router then tries another provider). The sandbox's ledger entry
+records its share of the node; the meter charges the rest of the node (idle room) to run "".
+
+The catalog is `gke.pools` in configs/gke.yaml; `python -m sandboxes.gke_ops pools plan|apply` makes the cluster match it
+(creates pools at 0 nodes, updates ceilings; replacing or deleting a pool needs `--replace` / `--prune` and an empty pool).
+`python scripts/gke/prices.py --pools --write` refreshes machine shapes and prices from Compute Engine and the Billing Catalog.
+
+## Dockerfiles (sandboxes/gke_build.py)
+
+GKE is a `builds_dockerfile` provider: a sandbox opened with `extra.dockerfile` + `extra.context_dir` (what harbor_raw passes for
+a task without a prebuilt image) runs `<gke.registry>/ctx:<digest>`, the digest being the content hash euphoria and greenhouse
+tag their images with. Missing, it is built by Cloud Build (BuildKit; the task's own Dockerfile path; logs in Cloud Logging),
+once: concurrent starts of one task wait for the one build (per process, and per machine through a lock), at most
+`max_concurrent` builds at a time. The sandbox then has its whole 1 vCPU / 4 GiB / 10 GB: image layers live in the node's shared
+image cache, not in the sandbox's disk. A failed build raises ImageBuildError with the build log's tail.
+
+## Nothing left that bills
+
+- build minutes: charged when each build ends (`image_build`)
+- build source uploads: deleted when the build ends; the bucket's lifecycle rule deletes leftovers after a day
+- images: every push recorded; deleted by `down`, by the watchdog once no pod runs it and it is unused for `image_ttl_h`, and
+  by the repository's cleanup policy after `cleanup_days` whatever happens to this machine. Storage is charged for each image's
+  whole life when it is deleted (or found deleted by the policy)
+- nodes: sandbox pools go to 0 after `idle_scale_down_min`; `down` (also automatic after `auto_down_min` idle) takes every pool
+  to 0, the system pool too; a sandbox start on a cluster that is down brings it back up (`auto_up`, ~2 min)
+- `python -m sandboxes.gke_ops residue` lists everything in the project that bills while idle (clusters, VMs, disks and
+  orphaned disks, snapshots, VM images, addresses, load balancers, registry and bucket storage), priced per month, and what it
+  could not list. `down` ends with it.
+- the control plane: GKE's free tier credits one zonal cluster's fee per billing account; `teardown --delete-cluster --yes`
+  removes it if that credit is used elsewhere
 
 ## Setup
 
 1. A GCP project with billing, and gcloud authenticated as someone who can create clusters (`roles/container.admin`,
    `roles/iam.serviceAccountAdmin`, `roles/resourcemanager.projectIamAdmin`, `roles/artifactregistry.admin`).
-2. `PROJECT=<id> scripts/gke/setup.sh` prints every command and the burn ceiling; read it, then add `--apply`. It creates the
-   node service account, the cluster (zonal control plane: free tier; Dataplane V2, Workload Identity, image streaming, cost
-   allocation), the spot sandbox pool (0..N per zone, 256 pods a node, tainted), the namespace with its quota, limits and
-   network policy, and the Artifact Registry repo. `BILLING_ACCOUNT=...` adds a budget alert.
+2. `scripts/gke/setup.sh` (names from configs/gke.yaml) prints every command; read it, then add `--apply`. It creates the node
+   and build service accounts, the build bucket (1-day lifecycle), the image repository (cleanup policy), the cluster (zonal
+   control plane: free tier; Dataplane V2, Workload Identity, image streaming, cost allocation; a small system pool), the
+   catalog's sandbox pools at 0 nodes, and the namespace with its quota, limits and network policy.
 3. `python scripts/gke/prices.py --project <id> --region us-central1 --write` puts the real on-demand and spot prices into
    `configs/gke.yaml`, and prints the `SANDBOX_GKE_VCPU_HOUR` to export (the pods' rate: spot price / vCPUs).
 4. Billing export to BigQuery (console only: Billing > Billing export > Detailed usage cost) for the reconciliation.
 5. `export GKE_PROJECT=<id> GKE_LOCATION=<zone> GKE_CLUSTER=sandboxes` and run the watchdog beside any workload:
    `python -m sandboxes.gke_ops watch &` (or the janitor, which runs the same pass).
-6. Build and push task images (`euphoria build`, or `docker build` + `docker push <region>-docker.pkg.dev/<id>/envs/<task>:<tag>`)
-   and open sandboxes with that image reference. GKE does not build Dockerfiles: a sandbox without an image fails at once.
+6. Open sandboxes with a harbor task's `environment/` (built once per context) or a registry image. After the run:
+   `python -m sandboxes.gke_ops down` (or let `auto_down_min` do it).
 
-The provider entry is `configs/gke.yaml`; it selects the sandbox pool (`node_selector` + `tolerations`) and starts with a
-$50 provider spend cap.
+The provider entry is `configs/gke.yaml` (1 vCPU / 4 GiB / 10 GB by default) and starts with a $50 provider spend cap.
 
 ### Capacity, per node
 

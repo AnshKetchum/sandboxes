@@ -1,41 +1,88 @@
-# GKE sandboxes: one pod per sandbox on a spot node pool (see sandboxes/backends/gke_raw.py, docs/gke.md). Images must be in a
-# registry the cluster can pull from (Artifact Registry): GKE does not build Dockerfiles. Credentials: a kubeconfig from
-# `gcloud container clusters get-credentials` (scripts/gke/setup.sh writes it).
-# Housekeeping: `python -m sandboxes.gke_ops watch` (or the janitor) beside any workload; `gke_ops status` for the burn rate.
+# GKE sandboxes (docs/gke.md): one pod per sandbox, on the node pool that runs its size most cheaply (gke_place). A harbor
+# task's Dockerfile is built once per context by Cloud Build into Artifact Registry (gke_build) and deleted when unused; nodes are
+# billed through the node meter (gke_meter). Credentials: a kubeconfig from `gcloud container clusters get-credentials`.
+# Watchdog: `python -m sandboxes.gke_ops watch` (or the janitor). `gke_ops down` leaves nothing that bills; `gke_ops residue` checks.
 sandbox_providers:
   - name: gke
     cpu: 1
-    memory_mb: 2048
-    disk_gb: 10
+    memory_mb: 4096
+    disk_gb: 10                           # requested in full (guaranteed); extra.ephemeral_request_gb < disk_gb over-commits
     peak_concurrent_sandboxes: 1000       # the namespace ResourceQuota (scripts/gke/setup.sh) is the hard ceiling
     spend_cap_usd: 50                     # raise deliberately after the first live verification
     auto_delete_minutes: 240              # activeDeadlineSeconds: the kubelet kills the pod here even if every process of ours died
     extra:
-      node_selector: {sandboxes.pool: sandbox}
-      tolerations:
-        - {key: sandboxes.pool, operator: Equal, value: sandbox, effect: NoSchedule}
-      cpu_request: 0.95                   # so 192 one-vCPU pods fit a 192-vCPU node's allocatable (system pods take the rest)
-      ephemeral_request_gb: 2             # scheduled at 2 GiB, evicted past disk_gb: 192 x 2 GiB fits the 1 TB boot disk with images
-      capacity_wait_s: 900                # a node scale-up is 1-3 min; spot capacity can take longer
+      cpu_request: 0.95                   # so N one-vCPU pods fit an N-vCPU node's allocatable (system pods take the rest)
+      spot: prefer                        # prefer | only | never; on-demand pools are the fallback when no spot pool can grow
       ready_timeout_s: 1200
 
-# Cluster coordinates for gke_ops (resize, teardown). Env GKE_PROJECT / GKE_LOCATION / GKE_CLUSTER override these.
 gke:
-  project: ""
-  location: ""                            # region (regional cluster) or zone
-  cluster: ""
-  sandbox_pools: [sandbox-spot]           # only sandboxes run here (tainted); resized to 0 after idle_scale_down_min idle
-  idle_scale_down_min: 15
-  orphan_pending_min: 30                  # for pods without the ready-within annotation (created by an older backend)
+  project: agentic-rollouts               # env GKE_PROJECT / GKE_LOCATION / GKE_CLUSTER override these three
+  location: us-central1-a                 # zonal control plane: GKE's free tier credits one zonal cluster's fee
+  cluster: sandboxes
+  zones: [us-central1-a, us-central1-b, us-central1-c, us-central1-f]   # where sandbox nodes may run (spot capacity varies)
+  system_pool: default-pool               # kube-system: 1 node while up, 0 after `down`
+  node_service_account: gke-sandbox-nodes@agentic-rollouts.iam.gserviceaccount.com
+  max_pods_per_node: 256
+  idle_scale_down_min: 15                 # a sandbox pool with no pod of ours this long: resized to 0
+  auto_down_min: 60                       # no pod of ours this long: `down` (system pool, images, uploads). 0: never
+  auto_up: true                           # a sandbox start on a cluster that is down brings it up (about 2 min)
+  orphan_pending_min: 30
+  node_overhead: {cpu: 0.5, mem_gib: 1.5, pods: 12, image_cache_gib: 200}   # DaemonSets and task images, per node
+  # The pool catalog. Placement picks, per sandbox size, the pool cheapest per sandbox that can still grow (room on a running
+  # node first); pools sit at 0 nodes, free, until a sandbox needs one. `gke_ops pools plan|apply` makes the cluster match.
+  # max_nodes is over all zones. Quotas in us-central1 on 2026-10-27: CPUS 200 (regional, all families), N2D 200, E2 72,
+  # C3D 24, C4D 24. The C3D/C4D pools need a quota increase to run at all: enable them once it is granted.
+  pools:
+    - {name: c3d-180-spot, machine: c3d-standard-180, spot: true, disk_gb: 2200, max_nodes: 6, enabled: false}   # 174 x (1 vCPU, 4 GiB, 10 GB) a node; 1K for ~$13.7/h
+    - {name: c3d-180-od, machine: c3d-standard-180, spot: false, disk_gb: 2200, max_nodes: 6, enabled: false}    # on-demand fallback, 1K for ~$51/h
+    - {name: c4d-192-spot, machine: c4d-standard-192, spot: true, disk_gb: 2250, max_nodes: 6, enabled: false}
+    - {name: n2d-96-spot, machine: n2d-standard-96, spot: true, disk_gb: 1250, max_nodes: 2}     # 91 a node; what quota allows today
+    - {name: n2d-96-od, machine: n2d-standard-96, spot: false, disk_gb: 1250, max_nodes: 2}
+    - {name: e2-32-spot, machine: e2-standard-32, spot: true, disk_gb: 600, max_nodes: 2}
+  registry: us-central1-docker.pkg.dev/agentic-rollouts/envs    # built task images (ctx:<context digest>)
+  build:
+    bucket: agentic-rollouts-sandbox-builds   # Cloud Build source uploads; lifecycle rule deletes anything older than a day
+    machine_type: E2_HIGHCPU_8
+    usd_per_minute: 0.0156                # catalog: E2 $0.0016/vCPU-min + $0.00035/GiB-min (the 2,500 free minutes not counted)
+    storage_gib_month: 0.10               # Artifact Registry (first 0.5 GiB free, not counted)
+    timeout_s: 1800
+    max_concurrent: 20                    # Cloud Build allows 30 concurrent builds per region by default
+    image_ttl_h: 6                        # an image no pod runs, unused this long: deleted by the watchdog
+    cleanup_days: 2                       # the repository's own cleanup policy: deletes any image older than this, regardless
+    service_account: sandbox-builder@agentic-rollouts.iam.gserviceaccount.com
 
-# The node meter's prices (sandboxes/gke_meter.py). UNVERIFIED until `scripts/gke/prices.py` fills them from the Cloud
-# Billing Catalog for the cluster's region; spot prices move up to once a day. Keep SANDBOX_GKE_VCPU_HOUR (the pods' rate) equal
-# to the sandbox pool's spot price / its vCPUs: the meter warns when they differ by more than 5%.
+# Machine shapes and prices (node meter, pool placement): `python scripts/gke/prices.py --project agentic-rollouts --region
+# us-central1 --pools --write` refills them from Compute Engine and the Cloud Billing Catalog (spot prices move up to daily).
+# Last refreshed 2026-10-27.
 gke_meter:
+  machine_shapes:
+    n2d-standard-96: {vcpus: 96, mem_gib: 384}
+    n2d-standard-32: {vcpus: 32, mem_gib: 128}
+    n2d-highmem-96: {vcpus: 96, mem_gib: 768}
+    e2-standard-32: {vcpus: 32, mem_gib: 128}
+    e2-highmem-16: {vcpus: 16, mem_gib: 128}
+    c4d-standard-96: {vcpus: 96, mem_gib: 372}
+    c4d-standard-192: {vcpus: 192, mem_gib: 744}
+    c4d-highmem-96: {vcpus: 96, mem_gib: 756}
+    c3d-standard-90: {vcpus: 90, mem_gib: 360}
+    c3d-standard-180: {vcpus: 180, mem_gib: 720}
+    c3d-highmem-180: {vcpus: 180, mem_gib: 1440}
+    c3d-highcpu-180: {vcpus: 180, mem_gib: 354}
   machine_prices:
-    c4d-standard-192: {spot: 3.40}        # from the plan's ~$22/h for 6 nodes incl. extras; replace with the catalog price
+    n2d-standard-96: {spot: 1.9567, ondemand: 4.0556}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    n2d-standard-32: {spot: 0.6522, ondemand: 1.3519}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    n2d-highmem-96: {spot: 2.6394, ondemand: 5.471}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    e2-standard-32: {spot: 0.6434, ondemand: 1.0722}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    e2-highmem-16: {spot: 0.434, ondemand: 0.7232}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c4d-standard-96: {spot: 2.0146, ondemand: 4.5358}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c4d-highmem-96: {spot: 2.6554, ondemand: 5.9771}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c3d-standard-90: {spot: 0.9866, ondemand: 4.0859}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c3d-standard-180: {spot: 1.9732, ondemand: 8.1718}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c3d-highmem-180: {spot: 2.6629, ondemand: 11.0223}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c3d-highcpu-180: {spot: 1.6225, ondemand: 6.7228}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c4d-standard-192: {spot: 4.0293, ondemand: 9.0716}   # Cloud Billing Catalog (scripts/gke/prices.py)
   fallback_vcpu_hour: {spot: 0.02, ondemand: 0.05}   # an unknown machine type: a deliberately high per-vCPU price
   disk_gb_month: 0.10                     # Hyperdisk Balanced capacity (C4D boots only from Hyperdisk); verify in billing
-  pool_disk_gb: {sandbox-spot: 1000}
+  pool_disk_gb: {default-pool: 50}       # sandbox pools: their catalog disk_gb
   default_disk_gb: 100
   cluster_fee_hour: 0.10                  # GKE Standard management fee (the free tier credit covers one zonal cluster)

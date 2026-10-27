@@ -26,7 +26,12 @@ def make_pod(manifest: dict, created: float):
                                  annotations=dict(md.get("annotations") or {}), creation_timestamp=ts(created),
                                  deletion_timestamp=None, owner_references=None),
         spec=SimpleNamespace(node_name=None, manifest=manifest["spec"],
-                             active_deadline_seconds=manifest["spec"].get("activeDeadlineSeconds")),
+                             active_deadline_seconds=manifest["spec"].get("activeDeadlineSeconds"),
+                             node_selector=dict(manifest["spec"].get("nodeSelector") or {}),
+                             tolerations=list(manifest["spec"].get("tolerations") or []),
+                             containers=[SimpleNamespace(image=c.get("image"), resources=SimpleNamespace(
+                                 requests=dict((c.get("resources") or {}).get("requests") or {})))
+                                 for c in manifest["spec"].get("containers") or []]),
         status=SimpleNamespace(phase="Pending", reason=None, message=None, conditions=[], container_statuses=[], start_time=None))
 
 
@@ -64,12 +69,18 @@ def other_pod(name: str, node: str, namespace: str = "kube-system", owner_kind: 
 
 
 def make_node(name: str, created: float, machine: str = "c4d-standard-192", spot: bool = True, pool: str = "sandbox-spot",
-              cpu: str = "192"):
+              cpu: str = "192", allocatable: dict = None, ready: bool = True, sandbox_pool: str = None):
     labels = {"node.kubernetes.io/instance-type": machine, "cloud.google.com/gke-nodepool": pool}
     if spot:
         labels["cloud.google.com/gke-spot"] = "true"
+    if sandbox_pool:
+        labels["sandboxes.pool"] = sandbox_pool
     return SimpleNamespace(metadata=SimpleNamespace(name=name, labels=labels, creation_timestamp=ts(created)),
-                           status=SimpleNamespace(capacity={"cpu": cpu, "memory": "768Gi"}))
+                           spec=SimpleNamespace(unschedulable=False),
+                           status=SimpleNamespace(capacity={"cpu": cpu, "memory": "768Gi"},
+                                                  allocatable=allocatable or {"cpu": cpu, "memory": "740Gi",
+                                                                              "ephemeral-storage": "2000Gi", "pods": "256"},
+                                                  conditions=[SimpleNamespace(type="Ready", status="True" if ready else "False")]))
 
 
 class FakeCore:
@@ -140,6 +151,8 @@ class FakeCore:
         return SimpleNamespace(items=[p for p in pods if key != "spec.nodeName" or p.spec.node_name == value])
 
     def list_node(self, label_selector=None):
+        if label_selector and "=" not in label_selector:                       # "key": nodes that carry the label
+            return SimpleNamespace(items=[n for n in self.nodes if label_selector in (n.metadata.labels or {})])
         return SimpleNamespace(items=list(self.nodes))
 
     def read_namespace(self, name):

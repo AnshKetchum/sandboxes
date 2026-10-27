@@ -50,8 +50,10 @@ DEFAULT_CAPABILITIES = {
     "fly": {"create_rate_per_s": 1, "create_burst": 3, "dind": True, "image_ref": True, "requires_prebuilt_image": False, "builds_dockerfile": True, "persistent_disk_gb": 8, "note": "Firecracker microVM, real disk (8 GB rootfs by default)"},
     "modal": {"create_rate_per_s": 5, "create_burst": 5, "dind": True, "image_ref": True, "requires_prebuilt_image": False, "builds_dockerfile": True, "persistent_disk_gb": 500, "note": "runtime=vm (real VM, large root disk); gvisor cannot run a daemon"},
     #   gke    20/s, 40  our own cluster: bounded by the API server, not a vendor quota (tune per cluster size)
-    "gke": {"create_rate_per_s": 20, "create_burst": 40, "dind": False, "image_ref": True, "requires_prebuilt_image": True, "persistent_disk_gb": 10,
-            "note": "one pod per sandbox on our own GKE cluster; registry images only (build and push first); nodes billed via gke_meter"},
+    "gke": {"create_rate_per_s": 20, "create_burst": 40, "dind": False, "image_ref": True, "requires_prebuilt_image": False,
+            "builds_dockerfile": True, "persistent_disk_gb": 10,
+            "note": "one pod per sandbox on our own GKE cluster, on the node pool that runs its size most cheaply; Dockerfiles built "
+                    "once per context by Cloud Build (gke_build); nodes billed via gke_meter"},
 }
 
 

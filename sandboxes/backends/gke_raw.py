@@ -33,6 +33,7 @@ Credentials: a kubeconfig (`gcloud container clusters get-credentials`), from KU
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import fcntl
 import functools
 import json
@@ -154,7 +155,8 @@ def pod_manifest(name: str, spec, namespace: str) -> dict:
     return {"apiVersion": "v1", "kind": "Pod",
             "metadata": {"name": name, "namespace": namespace, "labels": labels,
                          "annotations": {LABELS_ANNOTATION: json.dumps(spec.labels or {}, sort_keys=True),
-                                         READY_ANNOTATION: str(int(ready_timeout_s(spec)))}},
+                                         READY_ANNOTATION: str(int(ready_timeout_s(spec))),
+                                         **({"sandboxes/dockerfile": str(x["dockerfile"])} if x.get("dockerfile") else {})}},
             "spec": pod_spec}
 
 
@@ -340,6 +342,22 @@ async def _delete_pod(name: str, namespace: str) -> bool:
     return await asyncio.shield(_call(delete_pod_sync, _core(), name, namespace))
 
 
+_UP = {"t": 0.0}
+UP_CHECK_S = 60.0
+
+
+def _ensure_up() -> None:
+    """The cluster is up (gke_ops.ensure_up: brought up if it was down), checked at most once a minute per process."""
+    if time.time() - _UP["t"] < UP_CHECK_S:
+        return
+    from .. import gke_ops
+    try:
+        gke_ops.ensure_up(_core())
+    except RuntimeError as e:
+        raise SandboxCreateError(str(e))
+    _UP["t"] = time.time()
+
+
 class GKERaw(RawSandbox):
     provider = "gke"
     hard_lifetime = True            # activeDeadlineSeconds: the kubelet ends the pod at its lifetime
@@ -348,14 +366,20 @@ class GKERaw(RawSandbox):
     max_call_s = 7200
 
     def __init__(self, spec, model=None):
-        # One rate for pods and the meter (the meter subtracts exactly what pod entries charge): config `pricing:` overrides
-        # are refused, the rate comes from SANDBOX_GKE_VCPU_HOUR.
+        # A pod's ledger entry is charged its share of the node its pool gives it (hourly_rate, recorded in the entry; the meter
+        # adds the rest of the node): config `pricing:` overrides do not apply. Without a pool catalog the rate is
+        # SANDBOX_GKE_VCPU_HOUR x vCPUs.
         default = cost_model_for("gke")
         if model is not None and model != default:
-            print("[sandboxes] gke: ignoring a `pricing:` override (set SANDBOX_GKE_VCPU_HOUR instead; the node meter must "
-                  "use the same rate)", file=sys.stderr, flush=True)
+            print("[sandboxes] gke: ignoring a `pricing:` override (pods are charged their share of a node; set prices in "
+                  "configs/gke.yaml)", file=sys.stderr, flush=True)
         super().__init__(spec, default)
         self._ns = namespace()
+        self._rate: Optional[float] = None
+        self.pool = ""
+
+    def hourly_rate(self) -> float:
+        return self._rate if self._rate is not None else super().hourly_rate()
 
     # -- fleet -------------------------------------------------------------------------------------------------------------------
     @classmethod
@@ -383,10 +407,62 @@ class GKERaw(RawSandbox):
         return await _call(gke_ops.housekeep, _core())
 
     # -- one sandbox -------------------------------------------------------------------------------------------------------------
+    async def _image(self) -> str:
+        """The image to run: the spec's, or the one built from `extra.dockerfile` (+ `extra.context_dir`), once per context."""
+        x = self.spec.extra or {}
+        if not x.get("dockerfile"):
+            if not self.spec.image:
+                raise ImageBuildError("gke: a sandbox needs an image or a Dockerfile (extra.dockerfile + extra.context_dir)")
+            return self.spec.image
+        from .. import gke_build
+        from ..cost import get_ledger
+        ctx = x.get("context_dir") or str(Path(x["dockerfile"]).parent)
+        return await _call(gke_build.BUILDER.ensure, gke_build.BuildConfig.load(), ctx, x["dockerfile"], run=get_ledger().run)
+
+    def _place(self, exclude=()):
+        """The pool for this sandbox (gke_place), or None when configs/gke.yaml has no pool catalog. CapacityError when no
+        pool that fits can take it (every one full, failed, or excluded): the router can then try another provider."""
+        from .. import gke_place as gp
+        pools, oh, max_pods = gp.load_catalog()
+        if not pools:
+            return None
+        s, x = self.spec, self.spec.extra or {}
+        shape = gp.Shape(float(s.cpu), float(s.mem_gb), float(s.disk_gb), float(x.get("cpu_request", 0.95)),
+                         x.get("ephemeral_request_gb"))
+        try:
+            return gp.PLACER.choose(_core(), shape, pools, oh=oh, max_pods=max_pods, spot=x.get("spot", "prefer"),
+                                    only=x.get("pool"), exclude=exclude)
+        except LookupError as e:
+            raise CapacityError("gke", str(e))
+
     async def _create(self) -> None:
+        """Build (if a Dockerfile), place, create, wait. A pool that cannot get a node (spot stockout, quota) is cooled down and
+        the next cheapest pool tried; CapacityError only when no pool is left."""
+        await _call(_ensure_up)
+        image = await self._image()
+        tried: list = []
+        while True:
+            placement = await _call(self._place, tuple(tried))
+            try:
+                return await self._create_on(image, placement)
+            except CapacityError:
+                if placement is None:
+                    raise
+                from ..gke_place import PLACER
+                PLACER.failed(placement.pool)
+                tried.append(placement.pool)
+
+    async def _create_on(self, image: str, placement) -> None:
         s = self.spec
-        if not s.image:
-            raise ImageBuildError("gke: a sandbox needs a registry image; GKE does not build Dockerfiles (build and push it first)")
+        x = dict(s.extra or {})
+        if placement is not None:
+            x.setdefault("capacity_wait_s", 300)       # other pools are waiting to be tried
+        if placement is not None:
+            from ..gke_place import POOL_LABEL
+            x["node_selector"] = {**dict(x.get("node_selector") or {}), POOL_LABEL: placement.pool}
+            x["tolerations"] = [t for t in (x.get("tolerations") or []) if t.get("key") != POOL_LABEL] + \
+                [{"key": POOL_LABEL, "operator": "Exists", "effect": "NoSchedule"}]
+        pod_spec = dataclasses.replace(s, image=image, extra=x)
         name = "sbx-" + uuid.uuid4().hex[:16]
         self.sandbox_id = name                          # fixed before the API call: a failure from here on deletes this name
         try:
@@ -394,15 +470,17 @@ class GKERaw(RawSandbox):
         except Exception:  # noqa: BLE001 — metering must never block a sandbox
             pass
         try:
-            await _call(_core().create_namespaced_pod, self._ns, pod_manifest(name, s, self._ns))
-            await self._wait_ready(name)
+            await _call(_core().create_namespaced_pod, self._ns, pod_manifest(name, pod_spec, self._ns))
+            await self._wait_ready(name, x)
         except BaseException:
             await _delete_pod(name, self._ns)
             self.sandbox_id = ""
             raise
+        if placement is not None:
+            self._rate, self.pool = placement.rate_h, placement.pool
 
-    async def _wait_ready(self, name: str) -> None:
-        x = self.spec.extra or {}
+    async def _wait_ready(self, name: str, extra: Optional[dict] = None) -> None:
+        x = extra if extra is not None else (self.spec.extra or {})
         capacity_wait = float(x.get("capacity_wait_s", 900))
         ready_timeout = ready_timeout_s(self.spec)
         t0 = time.time()

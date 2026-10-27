@@ -135,6 +135,12 @@ class RawSandbox(ABC):
     def cost_model(cls, overrides: Optional[dict] = None) -> CostModel:
         return cost_model_for(cls.provider, overrides)
 
+    def hourly_rate(self) -> float:
+        """What this sandbox costs per hour, recorded in its ledger entry when it opens. Default: its size at the cost model's
+        rates; a provider that knows better once the sandbox exists (GKE: its share of the node it was placed on) overrides it."""
+        s = self.spec
+        return self.model.hourly_usd(s.cpu, s.mem_gb, s.disk_gb)
+
     def __init__(self, spec: SandboxSpec, model: Optional[CostModel] = None):
         self.spec = spec
         self.model = model or cost_model_for(self.provider)
@@ -196,7 +202,7 @@ class RawSandbox(ABC):
         s = self.spec
         self._ledger_handle = get_ledger().open(self.provider, cpu=s.cpu, ram_gib=s.mem_gb, disk_gib=s.disk_gb,
                                                 labels=s.labels, sandbox_id=self.sandbox_id,
-                                                usd_per_hour=self.model.hourly_usd(s.cpu, s.mem_gb, s.disk_gb))
+                                                usd_per_hour=self.hourly_rate())
         try:
             loop_gb = int(s.extra.get("docker_loop_gb") or 0)
             if loop_gb:      # docker's overlay2 cannot sit on an overlay root (blaxel, fly): give it an ext4 loop file instead

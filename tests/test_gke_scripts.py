@@ -23,18 +23,23 @@ prices = load("scripts/gke/prices.py")
 verify = load("scripts/verify_costs_gke.py")
 
 
+BASE = {"h": ("s", 3600), "GBy.h": ("By.s", 3.6e12), "GiBy.h": ("By.s", 2 ** 30 * 3600)}
+
+
 def sku(desc, usage, price, unit="h", regions=("us-central1", "us-east1"), sid=None):
     units, nanos = int(price), round((price - int(price)) * 1e9)
+    base, factor = BASE[unit]
     return {"description": desc, "skuId": sid or desc[:8], "serviceRegions": list(regions), "category": {"usageType": usage},
-            "pricingInfo": [{"pricingExpression": {"usageUnit": unit, "tieredRates": [
+            "pricingInfo": [{"pricingExpression": {"usageUnit": unit, "baseUnit": base, "baseUnitConversionFactor": factor,
+                                                   "tieredRates": [
                 {"unitPrice": {"units": "0", "nanos": 0}}, {"unitPrice": {"units": str(units), "nanos": nanos}}]}}]}
 
 
 CATALOG = [
     sku("C4D Instance Core running in Americas", "OnDemand", 0.0400),
-    sku("C4D Instance Ram running in Americas", "OnDemand", 0.0050, "GiBy.h"),
+    sku("C4D Instance Ram running in Americas", "OnDemand", 0.0050, "GBy.h"),
     sku("Spot Preemptible C4D Instance Core running in Americas", "Preemptible", 0.0120),
-    sku("Spot Preemptible C4D Instance Ram running in Americas", "Preemptible", 0.0015, "GiBy.h"),
+    sku("Spot Preemptible C4D Instance Ram running in Americas", "Preemptible", 0.0015, "GBy.h"),
     # decoys
     sku("C4 Instance Core running in Americas", "OnDemand", 0.0480),
     sku("C4D Custom Instance Core running in Americas", "OnDemand", 0.0500),
@@ -45,33 +50,63 @@ CATALOG = [
 ]
 
 
+GiB = 2 ** 30
+
+
 def test_a_machine_is_priced_from_exactly_its_family_region_and_usage_skus():
-    p = prices.machine_price(CATALOG, "C4D", "us-central1", 192, 720)
-    assert p["ondemand"] == pytest.approx(192 * 0.04 + 720 * 0.005)
-    assert p["spot"] == pytest.approx(192 * 0.012 + 720 * 0.0015)
+    p = prices.machine_price(CATALOG, "C4D", "us-central1", 192, 720 * GiB)
+    assert p["ondemand"] == pytest.approx(192 * 0.04 + 720 * GiB / 1e9 * 0.005, rel=1e-4)    # RAM priced per 10^9 bytes
+    assert p["spot"] == pytest.approx(192 * 0.012 + 720 * GiB / 1e9 * 0.0015, rel=1e-4)
+
+
+def test_ram_priced_per_gib_is_converted_through_its_own_base_unit():
+    gib_catalog = [s for s in CATALOG if "Ram" not in s["description"]] + [
+        sku("C4D Instance Ram running in Americas", "OnDemand", 0.0050, "GiBy.h"),
+        sku("Spot Preemptible C4D Instance Ram running in Americas", "Preemptible", 0.0015, "GiBy.h")]
+    p = prices.machine_price(gib_catalog, "C4D", "us-central1", 192, 720 * GiB)
+    assert p["ondemand"] == pytest.approx(192 * 0.04 + 720 * 0.005, rel=1e-4)
     assert "Spot Preemptible C4D Instance Core" in p["skus"]["spot Core"]
 
 
 def test_a_missing_or_ambiguous_sku_is_an_error_never_a_guess():
     with pytest.raises(ValueError, match="0 candidate"):
-        prices.machine_price(CATALOG, "C4D", "europe-west3", 192, 720)          # no RAM SKUs there
+        prices.machine_price(CATALOG, "C4D", "europe-west3", 192, 720 * GiB)          # no RAM SKUs there
     twice = CATALOG + [sku("C4D AMD Instance Core running in Americas", "OnDemand", 0.041)]
     with pytest.raises(ValueError, match="2 candidate"):
-        prices.machine_price(twice, "C4D", "us-central1", 192, 720)
+        prices.machine_price(twice, "C4D", "us-central1", 192, 720 * GiB)
     with pytest.raises(ValueError):
-        prices.machine_price(CATALOG, "N4", "us-central1", 4, 16)
+        prices.machine_price(CATALOG, "N4", "us-central1", 4, 16 * GiB)
+
+
+SAMPLE = """# a comment that must survive
+gke:
+  project: p                              # and this one
+gke_meter:
+  machine_prices:
+    c4d-standard-192: {spot: 3.40}        # old
+  disk_gb_month: 0.10
+"""
 
 
 def test_writing_a_price_keeps_the_rest_of_the_config():
-    text = (ROOT / "configs" / "gke.yaml").read_text()
-    out = prices.update_config(text, "c4d-standard-192", {"spot": 2.65, "ondemand": 11.28})
-    assert "c4d-standard-192: {spot: 2.65, ondemand: 11.28}" in out and "c4d-standard-192: {spot: 3.40}" not in out
-    assert out.count("\n") == text.count("\n") and "# Cluster coordinates for gke_ops" in out
-    out2 = prices.update_config(out, "n4-standard-80", {"spot": 1.0, "ondemand": 3.0})
-    assert "n4-standard-80: {spot: 1.0, ondemand: 3.0}" in out2 and out2.count("\n") == text.count("\n") + 1
+    out = prices.update_config(SAMPLE, "c4d-standard-192", {"spot": 4.0293, "ondemand": 9.0716})
+    assert "c4d-standard-192: {spot: 4.0293, ondemand: 9.0716}" in out and "{spot: 3.40}" not in out
+    assert "# a comment that must survive" in out and "# and this one" in out and out.count("\n") == SAMPLE.count("\n")
+    out2 = prices.update_config(out, "c3d-standard-180", {"spot": 1.9732, "ondemand": 8.1718}, {"vcpus": 180, "mem_gib": 720})
     import yaml
-    cfg = yaml.safe_load(out2)["gke_meter"]["machine_prices"]
-    assert cfg["c4d-standard-192"] == {"spot": 2.65, "ondemand": 11.28} and cfg["n4-standard-80"]["spot"] == 1.0
+    meter = yaml.safe_load(out2)["gke_meter"]
+    assert meter["machine_prices"]["c3d-standard-180"] == {"spot": 1.9732, "ondemand": 8.1718}
+    assert meter["machine_shapes"] == {"c3d-standard-180": {"vcpus": 180, "mem_gib": 720}}
+    assert meter["machine_prices"]["c4d-standard-192"]["spot"] == 4.0293 and meter["disk_gb_month"] == 0.10
+
+
+def test_the_real_config_parses_and_every_enabled_pool_has_a_shape_and_a_price():
+    import yaml
+    cfg = yaml.safe_load((ROOT / "configs" / "gke.yaml").read_text())
+    meter = cfg["gke_meter"]
+    for p in cfg["gke"]["pools"]:
+        assert p["machine"] in meter["machine_shapes"] and p["machine"] in meter["machine_prices"], p["name"]
+        assert meter["machine_prices"][p["machine"]].get("spot" if p.get("spot", True) else "ondemand"), p["name"]
 
 
 def write_ledger(path: Path, records: list) -> Path:

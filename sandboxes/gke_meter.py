@@ -72,9 +72,14 @@ class MeterConfig:
     @classmethod
     def load(cls, path: Optional[os.PathLike] = None) -> "MeterConfig":
         p = Path(path or os.environ.get("SANDBOX_GKE_CONFIG") or DEFAULT_CONFIG)
-        raw = (yaml.safe_load(p.read_text()) or {}).get("gke_meter", {}) if p.exists() else {}
+        whole = (yaml.safe_load(p.read_text()) or {}) if p.exists() else {}
+        raw = whole.get("gke_meter") or {}
         known = set(cls.__dataclass_fields__)
-        return cls(**{k: v for k, v in raw.items() if k in known})
+        c = cls(**{k: v for k, v in raw.items() if k in known})
+        for pool in (whole.get("gke") or {}).get("pools") or []:          # the catalog's boot disks, unless set here
+            if pool.get("name") and pool.get("disk_gb"):
+                c.pool_disk_gb.setdefault(pool["name"], float(pool["disk_gb"]))
+        return c
 
 
 @dataclass

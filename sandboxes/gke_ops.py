@@ -10,6 +10,10 @@ and a node outlives its pods until the autoscaler removes it.
     python -m sandboxes.gke_ops teardown [--run R]         # delete our pods (all, or one run's), then meter
     python -m sandboxes.gke_ops teardown --pools           # ... and resize the sandbox node pools to 0, metering until they are
     python -m sandboxes.gke_ops teardown --delete-cluster --yes
+    python -m sandboxes.gke_ops pools plan|apply [--replace] [--prune]   # make the cluster's sandbox pools match the catalog
+    python -m sandboxes.gke_ops down [--no-wait]           # nothing left running or stored (system pool, images, uploads too)
+    python -m sandboxes.gke_ops up                         # the system pool back; sandbox pools grow as sandboxes ask
+    python -m sandboxes.gke_ops residue                    # everything in the project that bills while idle, priced per month
 
 A pass (`housekeep`); a step that fails is reported and the others still run:
   1. meter the node bill (gke_meter), so the ledger is current before anything reads it
@@ -20,6 +24,9 @@ A pass (`housekeep`); a step that fails is reported and the others still run:
   4. close the ledger entries of pods that no longer exist
   5. resize the sandbox node pools to 0 once none of our pods has existed for `idle_scale_down_min` and nodes are still up
      (the autoscaler normally gets there first; this is for when something keeps it from scaling down)
+  6. delete images no pod runs that were unused for `gke.build.image_ttl_h`, and build uploads older than an hour (gke_build)
+  7. after `auto_down_min` with none of our pods: `down` (the system pool too, every image and upload). A sandbox start on a
+     cluster that is down brings it back up (`auto_up`).
 The janitor runs the same pass for GKE (RawSandbox.housekeep), so `python -m sandboxes.janitor --watch 300` covers it too.
 
 Configuration: configs/gke.yaml `gke:` (or the file in SANDBOX_GKE_CONFIG):
@@ -58,6 +65,8 @@ OVERDUE_SLACK_S = 600.0         # running this long past its deadline: the kubel
 ORPHAN_SLACK_S = 300.0          # Pending this long past its creator's wait: the creator is gone (it deletes its pod on giving up)
 STUCK_DELETING_S = 120.0        # still there this long after a delete: its node is gone; drop the object (grace 0 is a force delete)
 NODE_GONE_WAIT_S = 1200.0       # teardown --pools: how long to keep metering while the nodes drain
+ARTIFACT_PURGE_EVERY_S = 600.0  # unused images and stale build uploads are looked for this often
+HYPERDISK_ONLY = ("c4", "c4a", "c4d", "n4", "n4d", "x4", "h4d")
 
 
 @dataclass
@@ -65,9 +74,17 @@ class OpsConfig:
     project: str = ""
     location: str = ""
     cluster: str = ""
-    sandbox_pools: list = field(default_factory=lambda: ["sandbox-spot"])
+    sandbox_pools: list = field(default_factory=lambda: ["sandbox-spot"])   # names; from `pools` when there is a catalog
     idle_scale_down_min: float = 15.0
     orphan_pending_min: float = 30.0
+    pools: list = field(default_factory=list)          # the catalog (gke_place): name, machine, spot, disk_gb, max_nodes, enabled
+    zones: list = field(default_factory=list)          # where sandbox pools run (spot capacity differs by zone)
+    system_pool: str = "default-pool"                  # kube-system's pool: 1 node while up, 0 when down
+    system_max_nodes: int = 3
+    node_service_account: str = ""
+    max_pods_per_node: int = 256
+    auto_down_min: float = 60.0                        # idle this long (no pod of ours): `down` (0: never)
+    auto_up: bool = True                               # a sandbox start on a cluster that is down brings it up
 
     @classmethod
     def load(cls, path: Optional[os.PathLike] = None) -> "OpsConfig":
@@ -77,6 +94,9 @@ class OpsConfig:
         c.project = os.environ.get("GKE_PROJECT") or c.project
         c.location = os.environ.get("GKE_LOCATION") or c.location
         c.cluster = os.environ.get("GKE_CLUSTER") or c.cluster
+        if c.pools:
+            c.pools = [p for p in c.pools if p.get("enabled", True) is not False]
+            c.sandbox_pools = [p["name"] for p in c.pools]
         return c
 
     def cluster_args(self) -> list:
@@ -114,6 +134,7 @@ def _load_state() -> dict:
 
 def _save_state(state: dict) -> None:
     p = _state_path()
+    p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(".tmp")
     tmp.write_text(json.dumps(state, sort_keys=True))
     os.replace(tmp, p)
@@ -265,10 +286,38 @@ def housekeep(api, cfg: Optional[OpsConfig] = None, *, now: Optional[float] = No
             active = sum(1 for p in listed["pods"] if p.metadata.name not in deleted
                          and (getattr(p.status, "phase", None) or "Pending") not in FINISHED)
             rep["scaled_down"] = [] if dry_run else scale_down_idle(api, cfg, state, now or time.time(), active)
+            listed["active"] = active
         if "pods" in listed:                              # no listing, no idea whether pods are running: never resize
             step("scale down", scale)
-            if not dry_run:
-                _save_state(state)
+
+        def artifacts():
+            from . import gke_build
+            bcfg = gke_build.BuildConfig.load()
+            if not bcfg.registry or now_t - float(state.get("last_artifact_purge", 0)) < ARTIFACT_PURGE_EVERY_S:
+                return
+            in_use = {c.image for p in listed["pods"] for c in (getattr(p.spec, "containers", None) or [])
+                      if (getattr(p.status, "phase", None) or "Pending") not in FINISHED}
+            r = gke_build.purge(bcfg, in_use=in_use, now=now_t)
+            rep["images_deleted"] = r["deleted"] + r["gone"]
+            if bcfg.bucket:
+                rep["uploads_deleted"] = gke_build.purge_staging(bcfg, older_than_s=3600, now=now_t)
+            state["last_artifact_purge"] = now_t
+        now_t = now or time.time()
+        if "pods" in listed and not dry_run:              # in-use images come from the listing: none, no purge
+            step("artifacts", artifacts)
+
+        def auto_down():
+            if listed.get("active"):
+                state.pop("down_at", None)
+                return
+            if (cfg.auto_down_min and not state.get("down_at") and cfg.cluster
+                    and now_t - float(state.get("last_busy", now_t)) >= cfg.auto_down_min * 60):
+                rep["auto_down"] = down(api, cfg, wait=False)
+                state["down_at"] = now_t
+        if "active" in listed and not dry_run:
+            step("auto down", auto_down)
+        if "pods" in listed and not dry_run:
+            _save_state(state)
         return rep
 
 
@@ -284,6 +333,12 @@ def format_report(rep: dict) -> str:
         parts.append(f"closed {rep['reconciled']} ledger entries")
     if rep["scaled_down"]:
         parts.append(f"resized to 0: {','.join(rep['scaled_down'])}")
+    if rep.get("images_deleted"):
+        parts.append(f"deleted {len(rep['images_deleted'])} unused image(s)")
+    if rep.get("uploads_deleted"):
+        parts.append(f"deleted {rep['uploads_deleted']} build upload(s)")
+    if rep.get("auto_down"):
+        parts.append("idle: cluster brought DOWN")
     lines = [f"{time.strftime('%FT%TZ', time.gmtime())} gke_ops: " + ", ".join(parts)]
     lines += [f"    deleted {n}: {why}" for n, why in rep["deleted"][:20]]
     lines += [f"    ERROR {e}" for e in rep["errors"]]
@@ -372,6 +427,270 @@ def teardown(api, cfg: Optional[OpsConfig] = None, *, run: Optional[str] = None,
     return rep
 
 
+# -- the catalog's node pools ------------------------------------------------------------------------------------------------
+def cluster_pools(cfg: OpsConfig) -> dict:
+    """The cluster's node pools: name -> {"machine", "spot", "max_nodes" (all zones), "disk_gb", "disk_type", "zones", "ours"}."""
+    out = {}
+    for n in json.loads(gcloud("container", "node-pools", "list", "--cluster", cfg.cluster, "--location", cfg.location,
+                               "--project", cfg.project, "--format=json") or "[]"):
+        c, a = n.get("config") or {}, n.get("autoscaling") or {}
+        zones = n.get("locations") or []
+        total = a.get("totalMaxNodeCount")
+        out[n["name"]] = {"machine": c.get("machineType"), "spot": bool(c.get("spot")),
+                          "max_nodes": int(total) if total is not None else int(a.get("maxNodeCount") or 0) * max(1, len(zones)),
+                          "disk_gb": int(c.get("diskSizeGb") or 0), "disk_type": c.get("diskType"), "zones": n.get("locations") or [],
+                          "ours": "sandboxes.pool" in (c.get("labels") or {})}
+    return out
+
+
+def disk_type_for(machine: str) -> str:
+    return "hyperdisk-balanced" if machine.split("-")[0].lower() in HYPERDISK_ONLY else "pd-balanced"
+
+
+def plan_pools(cfg: OpsConfig, current: dict) -> list:
+    """What makes the cluster's sandbox pools match the catalog: [(action, name, detail)] with action create | update | replace |
+    delete | ok. A pool's machine, spot-ness and disk cannot change in place: those are `replace` (delete + create, empty only)."""
+    actions = []
+    from .gke_place import max_nodes_of
+    zones = max(1, len(cfg.zones))
+    for p in cfg.pools:
+        cur = current.get(p["name"])
+        want_disk, want_max = int(p.get("disk_gb", 1000)), max_nodes_of(p, zones)
+        if cur is None:
+            actions.append(("create", p["name"], f"{p['machine']} {'spot' if p.get('spot', True) else 'on demand'} 0..{want_max} nodes"))
+        elif (cur["machine"], cur["spot"], cur["disk_gb"]) != (p["machine"], bool(p.get("spot", True)), want_disk):
+            actions.append(("replace", p["name"], f"{cur['machine']}/{'spot' if cur['spot'] else 'od'}/{cur['disk_gb']}GB -> "
+                                                  f"{p['machine']}/{'spot' if p.get('spot', True) else 'od'}/{want_disk}GB"))
+        elif cur["max_nodes"] != want_max:
+            actions.append(("update", p["name"], f"max {cur['max_nodes']} -> {want_max} nodes"))
+        else:
+            actions.append(("ok", p["name"], ""))
+    names = {p["name"] for p in cfg.pools}
+    for name, cur in current.items():
+        if cur["ours"] and name not in names:
+            actions.append(("delete", name, "a sandbox pool no longer in the catalog"))
+    return actions
+
+
+def create_pool_args(cfg: OpsConfig, p: dict) -> list:
+    from .gke_place import max_nodes_of
+    machine = p["machine"]
+    args = ["container", "node-pools", "create", p["name"], "--cluster", cfg.cluster, "--location", cfg.location,
+            "--project", cfg.project, "--machine-type", machine, "--num-nodes", "0", "--enable-autoscaling", "--total-min-nodes", "0",
+            "--total-max-nodes", str(max_nodes_of(p, max(1, len(cfg.zones)))), "--location-policy", "ANY",
+            "--max-pods-per-node", str(cfg.max_pods_per_node), "--disk-type", p.get("disk_type") or disk_type_for(machine),
+            "--disk-size", str(int(p.get("disk_gb", 1000))), "--node-labels", f"sandboxes.pool={p['name']}",
+            "--node-taints", f"sandboxes.pool={p['name']}:NoSchedule", "--workload-metadata", "GKE_METADATA",
+            "--enable-image-streaming"]
+    if cfg.zones:
+        args += ["--node-locations", ",".join(cfg.zones)]
+    if p.get("spot", True):
+        args.append("--spot")
+    if cfg.node_service_account:
+        args += ["--service-account", cfg.node_service_account]
+    return args
+
+
+def pool_has_nodes(api, name: str) -> bool:
+    return any((n.metadata.labels or {}).get("cloud.google.com/gke-nodepool") == name for n in api.list_node().items or [])
+
+
+def apply_pools(api, cfg: OpsConfig, actions: list, *, replace: bool = False, prune: bool = False) -> list:
+    """Carry out plan_pools' actions. A replace or delete happens only with its flag and only on a pool with no node."""
+    from .gke_place import max_nodes_of
+    done = []
+    by_name = {p["name"]: p for p in cfg.pools}
+    for action, name, detail in actions:
+        if action == "create":
+            gcloud(*create_pool_args(cfg, by_name[name]), "--quiet", timeout=3600)
+        elif action == "update":
+            gcloud("container", "clusters", "update", *cfg.cluster_args(), "--node-pool", name, "--enable-autoscaling",
+                   "--total-min-nodes", "0", "--total-max-nodes", str(max_nodes_of(by_name[name], max(1, len(cfg.zones)))), "--quiet")
+        elif action in ("replace", "delete"):
+            if not (replace if action == "replace" else prune):
+                continue
+            if pool_has_nodes(api, name):
+                print(f"[sandboxes] gke_ops: not deleting pool {name}: it has nodes", file=sys.stderr, flush=True)
+                continue
+            gcloud("container", "node-pools", "delete", name, "--cluster", cfg.cluster, "--location", cfg.location,
+                   "--project", cfg.project, "--quiet", timeout=3600)
+            if action == "replace":
+                gcloud(*create_pool_args(cfg, by_name[name]), "--quiet", timeout=3600)
+        else:
+            continue
+        done.append((action, name))
+    return done
+
+
+# -- up and down -------------------------------------------------------------------------------------------------------------
+def nodes_by_pool(api) -> dict:
+    out: dict = {}
+    for n in api.list_node().items or []:
+        pool = (n.metadata.labels or {}).get("cloud.google.com/gke-nodepool", "")
+        ready = any(c.type == "Ready" and c.status == "True" for c in (getattr(n.status, "conditions", None) or []))
+        out.setdefault(pool, []).append(ready)
+    return out
+
+
+def is_up(api, cfg: OpsConfig) -> bool:
+    """The cluster can run sandboxes: a Ready node in the system pool (kube-dns, the metadata server's controllers)."""
+    return any(nodes_by_pool(api).get(cfg.system_pool, []))
+
+
+def up(api, cfg: OpsConfig, *, wait: bool = True, poll_s: float = 10.0, timeout_s: float = 900.0) -> dict:
+    """Bring the system pool back (1 node, autoscaled to system_max_nodes). Sandbox pools grow from 0 as sandboxes ask."""
+    gcloud("container", "clusters", "update", *cfg.cluster_args(), "--node-pool", cfg.system_pool, "--enable-autoscaling",
+           "--min-nodes", "1", "--max-nodes", str(cfg.system_max_nodes), "--quiet")
+    resize_pool(cfg, cfg.system_pool, 1, wait=False)
+    t0 = time.time()
+    while wait and not is_up(api, cfg):
+        if time.time() - t0 > timeout_s:
+            raise RuntimeError(f"gke: the system pool has no ready node after {timeout_s:.0f}s")
+        time.sleep(poll_s)
+    state = _load_state()
+    state.pop("down_at", None)
+    state["last_busy"] = time.time()
+    _save_state(state)
+    return {"up": True, "ready": is_up(api, cfg)}
+
+
+def down(api, cfg: OpsConfig, *, wait: bool = True, poll_s: float = 30.0) -> dict:
+    """Nothing left running or stored: every pod of ours deleted, every pool (system pool too) resized to 0, every image and
+    build upload deleted, the meter run until the nodes are gone, then the residue audit. The control plane stays (GKE's free
+    tier covers one zonal cluster's fee); `teardown --delete-cluster` removes that too."""
+    from . import gke_build
+    rep = teardown(api, cfg, pools=True, wait=False)
+    gcloud("container", "clusters", "update", *cfg.cluster_args(), "--node-pool", cfg.system_pool, "--no-enable-autoscaling",
+           "--quiet")
+    resize_pool(cfg, cfg.system_pool, 0, wait=False)
+    rep["resized"].append(cfg.system_pool)
+    bcfg = gke_build.BuildConfig.load()
+    if bcfg.registry:
+        rep["images"] = gke_build.purge(bcfg, all_images=True)
+    if bcfg.bucket:
+        rep["uploads_deleted"] = gke_build.purge_staging(bcfg, older_than_s=0)
+    t0 = time.time()
+    while wait and time.time() - t0 < NODE_GONE_WAIT_S:
+        if not api.list_node().items:
+            break
+        time.sleep(poll_s)
+        rep["metered_usd"] += gke_meter.meter_once(api)
+    rep["metered_usd"] += gke_meter.meter_once(api, force=True)
+    if wait:
+        rep["residue"] = residue(cfg)
+    return rep
+
+
+def ensure_up(api, cfg: Optional[OpsConfig] = None) -> None:
+    """Before a sandbox starts: a cluster that is down is brought up (auto_up) or the start fails with what to run. One process
+    brings it up at a time; the others wait for it. Clusters without coordinates in the config are not managed here."""
+    cfg = cfg or OpsConfig.load()
+    if not cfg.cluster or is_up(api, cfg):
+        return
+    if not cfg.auto_up:
+        raise RuntimeError("gke: the cluster is down (no ready node in the system pool): python -m sandboxes.gke_ops up")
+    cache_dir().mkdir(parents=True, exist_ok=True)
+    with open(cache_dir() / "gke_up.lock", "a+") as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if not is_up(api, cfg):
+            print("[sandboxes] gke: the cluster is down; bringing it up (gke_ops up)", file=sys.stderr, flush=True)
+            up(api, cfg)
+
+
+# -- what still costs money --------------------------------------------------------------------------------------------------
+DISK_GB_MONTH = {"pd-standard": 0.04, "pd-balanced": 0.10, "pd-ssd": 0.17, "pd-extreme": 0.125, "hyperdisk-balanced": 0.08,
+                 "hyperdisk-throughput": 0.05, "hyperdisk-extreme": 0.125}
+
+
+def _gjson(*args) -> list:
+    out = gcloud(*args, "--format=json")
+    return json.loads(out or "[]")
+
+
+def residue(cfg: OpsConfig, mcfg: Optional[gke_meter.MeterConfig] = None) -> dict:
+    """Everything in the project that bills while nothing runs, ours or not, priced per month; and what could not be listed.
+    {"items": [{"what", "detail", "usd_month"}], "usd_month", "unlisted": [...]}."""
+    mcfg = mcfg or gke_meter.MeterConfig.load()
+    P = ["--project", cfg.project]
+    items, unlisted = [], []
+
+    def section(name, fn):
+        try:
+            fn()
+        except Exception as e:  # noqa: BLE001 — an API that is off or forbidden is reported, not fatal
+            unlisted.append(f"{name}: {str(e)[:160]}")
+
+    def clusters():
+        for c in _gjson("container", "clusters", "list", *P):
+            items.append({"what": "GKE cluster", "detail": f"{c['name']} ({c.get('location')}; free tier credits one zonal cluster)",
+                          "usd_month": 0.10 * 730})
+
+    def instances():
+        for i in _gjson("compute", "instances", "list", *P):
+            if i.get("status") not in ("RUNNING", "PROVISIONING", "STAGING"):
+                continue
+            mt = i.get("machineType", "").rsplit("/", 1)[-1]
+            spot = (i.get("scheduling") or {}).get("provisioningModel") == "SPOT"
+            price = (mcfg.machine_prices.get(mt) or {}).get("spot" if spot else "ondemand")
+            items.append({"what": "VM", "detail": f"{i['name']} {mt}{' spot' if spot else ''}",
+                          "usd_month": (price or 0.0) * 730, **({} if price else {"unpriced": True})})
+
+    def disks():
+        for d in _gjson("compute", "disks", "list", *P):
+            typ = d.get("type", "").rsplit("/", 1)[-1]
+            gb = float(d.get("sizeGb") or 0)
+            attached = bool(d.get("users"))
+            items.append({"what": "disk" if attached else "ORPHANED disk", "detail": f"{d['name']} {gb:.0f} GB {typ}",
+                          "usd_month": gb * DISK_GB_MONTH.get(typ, 0.17)})
+
+    def snapshots():
+        for s_ in _gjson("compute", "snapshots", "list", *P):
+            gb = float(s_.get("storageBytes") or 0) / 1e9
+            items.append({"what": "snapshot", "detail": f"{s_['name']} {gb:.1f} GB", "usd_month": gb * 0.05})
+
+    def images():
+        for im in _gjson("compute", "images", "list", "--no-standard-images", *P):
+            gb = float(im.get("archiveSizeBytes") or 0) / 1e9
+            items.append({"what": "VM image", "detail": f"{im['name']} {gb:.1f} GB", "usd_month": gb * 0.05})
+
+    def addresses():
+        for a in _gjson("compute", "addresses", "list", *P):
+            idle = a.get("status") == "RESERVED"
+            items.append({"what": "IP address" + (" (unused)" if idle else ""), "detail": a["name"], "usd_month": (0.01 if idle else 0.005) * 730})
+
+    def forwarding():
+        for f in _gjson("compute", "forwarding-rules", "list", *P):
+            items.append({"what": "load balancer rule", "detail": f["name"], "usd_month": 0.025 * 730})
+
+    def registries():
+        for r in _gjson("artifacts", "repositories", "list", *P):
+            gb = float(r.get("sizeBytes") or 0) / 2 ** 30
+            if gb > 0:
+                items.append({"what": "registry storage", "detail": f"{r['name'].rsplit('/', 1)[-1]} {gb:.2f} GiB",
+                              "usd_month": max(0.0, gb - 0.5) * 0.10})
+
+    def buckets():
+        for b in _gjson("storage", "buckets", "list", *P):
+            url = b.get("storage_url") or f"gs://{b['name']}/"
+            out = gcloud("storage", "du", "--summarize", url)
+            size = float((out.split() or ["0"])[0])
+            if size > 0:
+                items.append({"what": "bucket storage", "detail": f"{url} {size / 1e9:.2f} GB", "usd_month": size / 1e9 * 0.02})
+
+    for name, fn in (("clusters", clusters), ("VMs", instances), ("disks", disks), ("snapshots", snapshots), ("VM images", images),
+                     ("addresses", addresses), ("load balancers", forwarding), ("registries", registries), ("buckets", buckets)):
+        section(name, fn)
+    return {"items": items, "usd_month": sum(i["usd_month"] for i in items), "unlisted": unlisted}
+
+
+def format_residue(r: dict) -> str:
+    lines = [f"  {i['what']:<20} {i['detail']:<70} ${i['usd_month']:>8.2f}/month" + ("  (unpriced machine)" if i.get("unpriced") else "")
+             for i in sorted(r["items"], key=lambda i: -i["usd_month"])]
+    lines.append(f"  {'TOTAL':<20} {'':<70} ${r['usd_month']:>8.2f}/month while idle")
+    lines += [f"  could not list {u}" for u in r["unlisted"]]
+    return "\n".join(lines) if r["items"] or r["unlisted"] else "  nothing in the project bills while idle"
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -382,11 +701,38 @@ def main(argv=None) -> int:
     t.add_argument("--run", default=None); t.add_argument("--pools", action="store_true")
     t.add_argument("--delete-cluster", action="store_true"); t.add_argument("--yes", action="store_true")
     t.add_argument("--no-wait", action="store_true")
+    pl = sub.add_parser("pools")
+    pl.add_argument("action", choices=["plan", "apply"]); pl.add_argument("--replace", action="store_true")
+    pl.add_argument("--prune", action="store_true")
+    sub.add_parser("up")
+    d = sub.add_parser("down"); d.add_argument("--no-wait", action="store_true")
+    sub.add_parser("residue")
     a = ap.parse_args(argv)
+    if a.cmd == "residue":
+        r = residue(OpsConfig.load())
+        print(format_residue(r))
+        return 1 if r["items"] else 0
     from .backends.gke_raw import _core
     api = _core()
     if a.cmd == "status":
         print(format_status(status(api)))
+        return 0
+    if a.cmd == "pools":
+        cfg = OpsConfig.load()
+        actions = plan_pools(cfg, cluster_pools(cfg))
+        for action, name, detail in actions:
+            print(f"  {action:<8} {name:<24} {detail}")
+        if a.action == "apply":
+            print("applied:", apply_pools(api, cfg, actions, replace=a.replace, prune=a.prune))
+        return 0
+    if a.cmd == "up":
+        print(json.dumps(up(api, OpsConfig.load())))
+        return 0
+    if a.cmd == "down":
+        rep = down(api, OpsConfig.load(), wait=not a.no_wait)
+        print(json.dumps({k: v for k, v in rep.items() if k != "residue"}, indent=1, default=str))
+        if "residue" in rep:
+            print("left in the project:\n" + format_residue(rep["residue"]))
         return 0
     if a.cmd == "sweep":
         rep = housekeep(api, dry_run=a.dry_run)

@@ -247,7 +247,7 @@ def test_a_pod_reaped_by_someone_else_mid_start_is_an_error_not_a_leak(k8s):
 
 
 def test_a_sandbox_without_an_image_is_refused_before_anything_is_created(k8s):
-    with pytest.raises(ImageBuildError, match="registry image"):
+    with pytest.raises(ImageBuildError, match="an image or a Dockerfile"):
         run(GKERaw(spec(image="")).start())
     assert k8s.created == []
 

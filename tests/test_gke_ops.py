@@ -42,6 +42,7 @@ def ops(k8s, tmp_path, monkeypatch):
             k8s.nodes = []
         return ""
     monkeypatch.setattr(gke_ops, "gcloud", fake_gcloud)
+    monkeypatch.setattr(gke_raw, "_UP", {"t": float("inf")})     # the cluster counts as up here (auto-up: test_gke_lifecycle)
     k8s.gcloud_calls = calls
     return k8s
 
