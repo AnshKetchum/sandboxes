@@ -99,6 +99,28 @@ async def check_one(sb, task: Path, idx: int) -> dict:
     return out
 
 
+def pod_timeline(api, pod_name: str, ns: str) -> dict:
+    """Seconds from the pod's creation to each step of its start, from its events: scheduled (a node had room: the wait for a
+    node scale-up ends here), image pulled, container started."""
+    from sandboxes.backends.gke_raw import epoch
+    try:
+        pod = api.read_namespaced_pod(pod_name, ns)
+        evs = api.list_namespaced_event(ns, field_selector=f"involvedObject.name={pod_name}").items or []
+    except Exception as e:  # noqa: BLE001
+        return {"error": repr(e)[:200]}
+    t0 = epoch(pod.metadata.creation_timestamp)
+    out = {}
+    for ev in evs:
+        t = epoch(getattr(ev, "event_time", None)) or epoch(ev.last_timestamp) or epoch(ev.first_timestamp)
+        key = {"Scheduled": "scheduled", "TriggeredScaleUp": "scale_up_triggered", "Pulling": "pull_start", "Pulled": "pulled",
+               "Started": "started"}.get(ev.reason)
+        if key and t and t0:
+            out[key] = round(t - t0, 1)
+            if ev.reason == "Pulled":
+                out["pull_message"] = (ev.message or "")[:160]
+    return out
+
+
 def vm_facts(node: str, zone_hint: str) -> dict:
     """What GCE says the node is: machine type, provisioning model, boot disk type and size."""
     for z in [zone_hint] + [f"us-central1-{s}" for s in "abcf"]:
@@ -174,6 +196,19 @@ async def main_async(a) -> dict:
     report["start_s"] = [round(s, 1) if isinstance(s, float) else repr(s)[:300] for s in starts]
     live = [sb for sb, s in zip(sbs, starts) if isinstance(s, float)]
     print(f"started {len(live)}/{a.count} in {time.time() - t0:.0f}s: {report['start_s']}", flush=True)
+    report["timelines"] = {sb.sandbox_id: pod_timeline(api, sb.sandbox_id, gke_raw.namespace()) for sb in live}
+    print(f"timelines (s after pod creation): {report['timelines']}", flush=True)
+    if live:                                                         # a warm start: same task, a node already up
+        warm = GKERaw(spec())
+        t = time.time()
+        try:
+            await warm.start()
+            report["warm_start_s"] = round(time.time() - t, 1)
+            report["warm_timeline"] = pod_timeline(api, warm.sandbox_id, gke_raw.namespace())
+            live.append(warm)
+        except Exception as e:  # noqa: BLE001
+            report["warm_start_s"] = repr(e)[:300]
+        print(f"warm start: {report['warm_start_s']}s {report.get('warm_timeline')}", flush=True)
     try:
         report["sandboxes"] = await asyncio.gather(*(check_one(sb, task, i) for i, sb in enumerate(live)), return_exceptions=True)
         report["sandboxes"] = [s if isinstance(s, dict) else {"error": repr(s)[:400]} for s in report["sandboxes"]]
@@ -221,6 +256,11 @@ def summarize(r: dict) -> None:
               f"reward={s['verifier_reward']} {'ALL CHECKS OK' if not bad and s['verifier_reward'] == '1' else 'FAILED: ' + str(bad)}")
     for node, v in r.get("vms", {}).items():
         print(f"  node {node}: {v}")
+    print(f"  start (s): cold {r.get('start_s')}  warm {r.get('warm_start_s')}")
+    for sid, tl in (r.get("timelines") or {}).items():
+        print(f"    {sid}: {tl}")
+    if r.get("warm_timeline"):
+        print(f"    warm: {r['warm_timeline']}")
     for b in r.get("builds", []):
         print(f"  build {b['id']}: {b['status']} {b['minutes']} min -> ${b['usd']:.4f}")
     e, l = r["expected"], r["ledger"]
