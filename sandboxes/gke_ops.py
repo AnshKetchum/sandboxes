@@ -625,18 +625,15 @@ def _meter_quietly(api) -> None:
         print(f"[sandboxes] gke_ops: meter pass failed: {e!r}", file=sys.stderr, flush=True)
 
 
-def drain_system_pool(api, cfg: OpsConfig, *, tries: int = 4, settle_s: float = 60.0, poll_s: float = 30.0,
-                      drain_s: float = NODE_GONE_WAIT_S) -> int:
+def drain_system_pool(api, cfg: OpsConfig, *, tries: int = 4, settle_s: float = 60.0, poll_s: float = 30.0) -> int:
     """Resize the system pool to 0 and make it stay there. Seen live: right after autoscaling is turned off, the autoscaler can
     still hold the old minimum and replace the node the resize removed, so the resize is repeated until the pool shows no
     node for `settle_s`. Returns how many resizes it took; RuntimeError if the pool will not stay empty."""
     for attempt in range(1, tries + 1):
-        resize_pool(cfg, cfg.system_pool, 0, wait=False)
-        for _ in range(max(1, math.ceil(drain_s / poll_s))):               # metered while the nodes drain (they bill until gone)
-            if not nodes_by_pool(api).get(cfg.system_pool):
-                break
-            time.sleep(poll_s)
-            _meter_quietly(api)
+        # synchronous: GKE's first resize after the autoscaling change surge-replaces the node and "succeeds" with one left
+        # (found live), so waiting for an empty pool after an async resize waited out the whole drain timeout. Gone nodes are
+        # charged to their deletion events, so nothing is lost by not metering during the operation.
+        resize_pool(cfg, cfg.system_pool, 0, wait=True)
         for _ in range(max(1, math.ceil(settle_s / poll_s))):
             if nodes_by_pool(api).get(cfg.system_pool):
                 break

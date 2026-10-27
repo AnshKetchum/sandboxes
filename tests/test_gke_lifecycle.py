@@ -256,7 +256,7 @@ def test_down_repeats_the_system_pool_resize_when_a_node_comes_back(g, k8s, monk
         return out
     monkeypatch.setattr(gke_ops, "gcloud", flaky)
     k8s.nodes = [fk.make_node("gke-c-default-pool-1", time.time(), pool="default-pool", spot=False)]
-    assert gke_ops.drain_system_pool(k8s, cfg(), settle_s=0.01, poll_s=0.001, drain_s=0.01) == 2
+    assert gke_ops.drain_system_pool(k8s, cfg(), settle_s=0.01, poll_s=0.001) == 2
     assert not k8s.nodes and len(resizes) == 2
 
 
@@ -270,7 +270,7 @@ def test_a_system_pool_that_will_not_stay_empty_is_an_error_not_a_silent_bill(g,
         return out
     monkeypatch.setattr(gke_ops, "gcloud", stubborn)
     with pytest.raises(RuntimeError, match="keeps a node"):
-        gke_ops.drain_system_pool(k8s, cfg(), tries=3, settle_s=0.01, poll_s=0.001, drain_s=0.01)
+        gke_ops.drain_system_pool(k8s, cfg(), tries=3, settle_s=0.01, poll_s=0.001)
 
 
 def test_a_cluster_operation_waits_for_the_one_already_running(g, monkeypatch):
