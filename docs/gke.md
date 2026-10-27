@@ -90,8 +90,12 @@ image cache, not in the sandbox's disk. A failed build raises ImageBuildError wi
 - `python -m sandboxes.gke_ops residue` lists everything in the project that bills while idle (clusters, VMs, disks and
   orphaned disks, snapshots, VM images, addresses, load balancers, registry and bucket storage), priced per month, and what it
   could not list. `down` ends with it.
-- the control plane: GKE's free tier credits one zonal cluster's fee per billing account; `teardown --delete-cluster --yes`
-  removes it if that credit is used elsewhere
+- the control plane: GKE's free tier ($74.40/month per billing account, zonal and Autopilot clusters) covers one zonal cluster's
+  $0.10/h fee, so it costs no money while `sandboxes` is the only such cluster on the billing account; the ledger then charges
+  it at 0 (`cluster_fee_hour`). A second zonal/Autopilot cluster on the account shares the credit: set the fee back to 0.10, or
+  `teardown --delete-cluster --yes`
+- promotional credits (startup programs, trials) pay for nodes, disks, builds and storage after the free tier: that spends
+  credit, not cash, until they run out. The budget alert counts spend before promotional credits for that reason
 
 ## Setup
 

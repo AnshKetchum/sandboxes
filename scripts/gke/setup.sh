@@ -18,7 +18,8 @@
 #     egress to the internet and DNS only: no metadata server, no VPC or cluster addresses). DNS must be allowed to
 #     node-local-dns as well as kube-dns: GKE enables NodeLocal DNSCache, and under Dataplane V2 a pod's DNS goes to the
 #     node-local-dns pod on its node (found live: with kube-dns alone every lookup in a sandbox failed)
-#   - optionally a billing budget alert (BILLING_ACCOUNT=...)
+#   - optionally a billing budget alert (BILLING_ACCOUNT=...): it subtracts the free tier and automatic discounts but NOT
+#     promotional credits, so spend that drains credits alerts too (with all credits included it would read ~$0 and stay quiet)
 set -euo pipefail
 
 APPLY=0
@@ -175,6 +176,8 @@ fi
 if [[ -n $BILLING_ACCOUNT ]]; then
   run gcloud billing budgets create --billing-account "$BILLING_ACCOUNT" --display-name "sandboxes GKE ($PROJECT)" \
     --budget-amount "${BUDGET_USD}USD" --filter-projects "projects/$PROJECT" \
+    --credit-types-treatment include-specified-credits \
+    --filter-credit-types FREE_TIER,SUSTAINED_USAGE_DISCOUNT,COMMITTED_USAGE_DISCOUNT,COMMITTED_USAGE_DISCOUNT_DOLLAR_BASE,DISCOUNT \
     --threshold-rule percent=0.5 --threshold-rule percent=0.9 --threshold-rule percent=1.0
 fi
 

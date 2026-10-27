@@ -88,4 +88,7 @@ gke_meter:
   disk_gb_month: 0.10                     # Hyperdisk Balanced capacity (C4D boots only from Hyperdisk); verify in billing
   pool_disk_gb: {default-pool: 50}       # sandbox pools: their catalog disk_gb
   default_disk_gb: 100
-  cluster_fee_hour: 0.10                  # GKE Standard management fee (the free tier credit covers one zonal cluster)
+  cluster_fee_hour: 0.0                   # GKE's $0.10/h management fee is covered by the free tier ($74.40/month per billing account,
+                                          # zonal and Autopilot clusters): `sandboxes` is the only cluster on billing account
+                                          # 012312-A42283-3BD145 (checked 2026-10-27). Set 0.10 again if another zonal/Autopilot
+                                          # cluster joins that account, or for a regional cluster (not covered)
