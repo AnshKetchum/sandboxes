@@ -240,3 +240,34 @@ def test_a_disabled_catalog_pool_is_neither_created_nor_placed_on(g, tmp_path, m
     monkeypatch.setenv("SANDBOX_GKE_CONFIG", str(tmp_path / "gke.yaml"))
     assert [p.name for p in gke_place.load_catalog()[0]] == ["c4d-192-spot"]
     assert [n for a, n, _ in gke_ops.plan_pools(OpsConfig.load(), {})] == ["c4d-192-spot"]
+
+
+def test_down_repeats_the_system_pool_resize_when_a_node_comes_back(g, k8s, monkeypatch):
+    """Seen live: the first resize to 0 right after turning autoscaling off was undone by the autoscaler (a new node in 5 s)."""
+    resizes = []
+    real = g.__call__
+
+    def flaky(*args, timeout=0):
+        out = real(*args, timeout=timeout)
+        if args[:3] == ("container", "clusters", "resize") and "default-pool" in args:
+            resizes.append(1)
+            if len(resizes) == 1:                                            # the autoscaler puts a node back
+                k8s.nodes.append(fk.make_node("gke-c-default-pool-new", time.time(), pool="default-pool", spot=False))
+        return out
+    monkeypatch.setattr(gke_ops, "gcloud", flaky)
+    k8s.nodes = [fk.make_node("gke-c-default-pool-1", time.time(), pool="default-pool", spot=False)]
+    assert gke_ops.drain_system_pool(k8s, cfg(), settle_s=0.01, poll_s=0.001) == 2
+    assert not k8s.nodes and len(resizes) == 2
+
+
+def test_a_system_pool_that_will_not_stay_empty_is_an_error_not_a_silent_bill(g, k8s, monkeypatch):
+    real = g.__call__
+
+    def stubborn(*args, timeout=0):
+        out = real(*args, timeout=timeout)
+        if args[:3] == ("container", "clusters", "resize") and "default-pool" in args:
+            k8s.nodes.append(fk.make_node(f"gke-c-default-pool-{len(k8s.nodes)}", time.time(), pool="default-pool", spot=False))
+        return out
+    monkeypatch.setattr(gke_ops, "gcloud", stubborn)
+    with pytest.raises(RuntimeError, match="keeps a node"):
+        gke_ops.drain_system_pool(k8s, cfg(), tries=3, settle_s=0.01, poll_s=0.001)
