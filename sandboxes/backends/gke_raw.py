@@ -242,6 +242,41 @@ def live_state(pod) -> str:
 
 
 # -- exec seam (the one place that talks to the exec websocket; tests replace it) ----------------------------------------------
+ERROR_CHANNEL = 3
+
+
+def exit_code(resp) -> Optional[int]:
+    """The exit status from a finished exec stream's error channel: 0, the command's code, or None (still running, or the
+    stream ended without a status). Parsed here: the client's own `returncode` raises on a status without an exit code."""
+    if resp.is_open():
+        return None
+    raw = resp.read_channel(ERROR_CHANNEL)
+    if not raw:
+        return None
+    try:
+        st = json.loads(raw)
+    except ValueError:
+        return None
+    if st.get("status") == "Success":
+        return 0
+    for c in (st.get("details") or {}).get("causes") or []:
+        if c.get("reason") == "ExitCode":
+            try:
+                return int(c.get("message"))
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def collect_exec(resp, stdout_only: bool) -> tuple[Optional[int], bytes]:
+    """(exit code, output) of a finished exec stream. The exit status is read FIRST: the client's read_all() empties every
+    channel, the status channel included (found live: every exit code came back None, so every command looked dropped)."""
+    rc = exit_code(resp)
+    out = resp.read_stdout() if stdout_only else resp.read_all()
+    out = out if isinstance(out, (bytes, bytearray)) else (out or "").encode()
+    return rc, bytes(out)
+
+
 def _stream_exec(api, name: str, namespace: str, argv: list, *, stdin: Optional[bytes], timeout: float,
                  stdout_only: bool) -> tuple[Optional[int], bytes]:
     """Run argv in the pod; returns (exit code, or None if the stream ended without one; output bytes)."""
@@ -253,13 +288,7 @@ def _stream_exec(api, name: str, namespace: str, argv: list, *, stdin: Optional[
             for i in range(0, len(stdin), STDIN_CHUNK):
                 resp.write_stdin(stdin[i:i + STDIN_CHUNK])
         resp.run_forever(timeout=timeout)
-        out = resp.read_stdout() if stdout_only else resp.read_all()
-        out = out if isinstance(out, (bytes, bytearray)) else (out or "").encode()
-        try:
-            rc = resp.returncode
-        except Exception:  # noqa: BLE001 — no status frame: the stream ended before the process did
-            rc = None
-        return rc, bytes(out)
+        return collect_exec(resp, stdout_only)
     finally:
         try:
             resp.close()

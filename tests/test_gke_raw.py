@@ -431,3 +431,32 @@ def test_the_node_bill_counts_against_the_spend_cap_and_a_capped_start_creates_n
     assert len(k8s.created) == 1 and list(k8s.pods) == [sb.sandbox_id]
     run(sb.stop())
     assert not k8s.pods
+
+
+# -- the real kubernetes client's exec stream ---------------------------------------------------------------------------------
+def finished_stream(stdout: bytes, stderr: bytes, status: dict):
+    """A kubernetes.stream WSClient (the real class and its methods) holding what a finished exec left in its channels."""
+    import io
+    from kubernetes.stream.ws_client import WSClient
+    ws = WSClient.__new__(WSClient)
+    ws._connected, ws._returncode, ws.binary, ws._closed_channels = False, None, True, set()
+    ws._channels = {1: stdout, 2: stderr, 3: json.dumps(status).encode()}
+    ws._all = io.BytesIO(stdout + stderr)
+    return ws
+
+
+@pytest.mark.parametrize("status,rc", [({"status": "Success"}, 0),
+                                       ({"status": "Failure", "reason": "NonZeroExitCode",
+                                         "details": {"causes": [{"reason": "ExitCode", "message": "3"}]}}, 3),
+                                       ({"status": "Failure", "message": "executable file not found"}, None)])
+def test_exit_codes_survive_the_clients_read_all(status, rc):
+    got, out = gke_raw.collect_exec(finished_stream(b"hi\n", b"warn\n", status), stdout_only=False)
+    assert (got, out) == (rc, b"hi\nwarn\n")
+    got, out = gke_raw.collect_exec(finished_stream(b"hi\n", b"warn\n", status), stdout_only=True)
+    assert (got, out) == (rc, b"hi\n")
+
+
+def test_a_stream_still_open_has_no_exit_code():
+    ws = finished_stream(b"", b"", {"status": "Success"})
+    ws._connected = True
+    assert gke_raw.exit_code(ws) is None
