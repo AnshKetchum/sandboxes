@@ -4,6 +4,8 @@ that needs them replaces them with fakes (monkeypatch), which overrides this."""
 
 from __future__ import annotations
 
+import os
+
 import pytest
 
 
@@ -19,7 +21,11 @@ def _refuse(what):
 
 @pytest.fixture(autouse=True)
 def no_real_cloud(tmp_path_factory, monkeypatch):
-    monkeypatch.setenv("SANDBOX_GKE_CONFIG", str(tmp_path_factory.getbasetemp() / "no-gke-config.yaml"))
+    base = tmp_path_factory.getbasetemp()
+    monkeypatch.setenv("SANDBOX_GKE_CONFIG", str(base / "no-gke-config.yaml"))
+    for k, d in (("SANDBOX_RATELIMIT_DIR", "ratelimit"), ("SANDBOX_HEALTH_DIR", "health")):     # never the machine's own state
+        if not os.environ.get(k, "").startswith(str(base)):
+            monkeypatch.setenv(k, str(base / d))
     for k in ("GKE_PROJECT", "GKE_LOCATION", "GKE_CLUSTER", "GKE_REGISTRY"):
         monkeypatch.delenv(k, raising=False)
     from sandboxes import gke_build, gke_ops
