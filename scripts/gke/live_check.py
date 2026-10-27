@@ -111,7 +111,9 @@ def vm_facts(node: str, zone_hint: str) -> dict:
     return {}
 
 
-def expected_bill(observed: dict, since: float, until: float, mcfg, fee_h: float, builds: list) -> dict:
+def expected_bill(observed: dict, since: float, until: float, mcfg, fee_h: float, builds: list, fee_from: float = None) -> dict:
+    """What the cluster cost over what the ledger covers: each observed node from max(since, its creation) to its last
+    sighting, the fee from `fee_from` (the cluster's creation when the meter had never run, else `since`)."""
     from sandboxes.gke_meter import Node, node_price_hour
     nodes, total = {}, 0.0
     for name, o in observed.items():
@@ -121,9 +123,10 @@ def expected_bill(observed: dict, since: float, until: float, mcfg, fee_h: float
         usd = max(0.0, end - start) * price / 3600
         nodes[name] = {"pool": o["pool"], "hours": round((end - start) / 3600, 4), "price_h": round(price, 5), "usd": round(usd, 5)}
         total += usd
-    fee = (until - since) * fee_h / 3600
+    fee = (until - (fee_from or since)) * fee_h / 3600
     build_usd = sum(b["usd"] for b in builds)
-    return {"nodes": nodes, "nodes_usd": total, "cluster_fee_usd": fee, "builds_usd": build_usd, "total": total + fee + build_usd}
+    return {"nodes": nodes, "nodes_usd": total, "cluster_fee_usd": fee, "builds_usd": build_usd, "cluster_usd": total + fee,
+            "total": total + fee + build_usd}
 
 
 def cloud_builds(since: float, rate_min: float) -> list:
@@ -150,6 +153,8 @@ async def main_async(a) -> dict:
     task = Path(a.task).resolve()
     env = task / "environment"
     report: dict = {"run": a.run, "count": a.count, "task": str(task), "since": time.time()}
+    fresh = not gke_meter.load_state().get("last_pass")             # the meter's first pass backfills from the cluster's creation
+    report["meter_baseline"] = gke_meter.cluster_created_from_api(api) if fresh else report["since"]
     obs = NodeObserver(api)
     obs.start()
     gke_meter.meter_once(api, force=True)
@@ -195,7 +200,8 @@ async def main_async(a) -> dict:
     until = time.time()
     report["until"] = until
     report["builds"] = cloud_builds(report["since"], bcfg.usd_per_minute)
-    report["expected"] = expected_bill(obs.nodes, report["since"], until, mcfg, mcfg.cluster_fee_hour, report["builds"])
+    base = report["meter_baseline"]
+    report["expected"] = expected_bill(obs.nodes, base, until, mcfg, mcfg.cluster_fee_hour, report["builds"], fee_from=base)
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     from verify_costs_gke import ledger_side
     report["ledger"] = ledger_side(report["since"] - 1, until + 1)
@@ -222,7 +228,10 @@ def summarize(r: dict) -> None:
     for n, v in e["nodes"].items():
         print(f"    {n}: {v}")
     print(f"  ledger: pods ${l['pods']:.4f} + nodes ${l['nodes']:.4f} + fee ${l['cluster_fee']:.4f} = ${l['total']:.4f}"
-          f"   (gaps {l['gap_max_usd']:.4f}, open {l['still_open']})")
+          f"   builds ${l['builds']:.4f}  image storage ${l['image_storage']:.6f}   (gaps {l['gap_max_usd']:.4f}, open {l['still_open']})")
+    cl, ex = l["total"], e["cluster_usd"]
+    print(f"  cluster: ledger ${cl:.4f} vs observed ${ex:.4f} -> {cl / ex:.3f}x" if ex else "  cluster: nothing observed")
+    print(f"  builds:  ledger ${l['builds']:.4f} vs Cloud Build ${e['builds_usd']:.4f}")
     if "residue" in r:
         from sandboxes.gke_ops import format_residue
         print("  left in the project after down:\n" + format_residue(r["residue"]))

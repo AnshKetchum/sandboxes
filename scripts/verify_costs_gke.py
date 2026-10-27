@@ -55,7 +55,8 @@ def iso(t: float) -> str:
 
 def ledger_side(since: float, until: float, paths=None) -> dict:
     """USD the ledgers put on gke with t in [since, until): pods, nodes, cluster fee; meter_gap upper bounds; pods still open."""
-    out = {"pods": 0.0, "nodes": 0.0, "cluster_fee": 0.0, "gap_max_usd": 0.0, "gaps_unbounded": 0, "still_open": 0}
+    out = {"pods": 0.0, "nodes": 0.0, "cluster_fee": 0.0, "builds": 0.0, "image_storage": 0.0, "gap_max_usd": 0.0,
+           "gaps_unbounded": 0, "still_open": 0}
     opened, closed = set(), set()
     for p in paths if paths is not None else all_ledger_paths():
         try:
@@ -79,13 +80,18 @@ def ledger_side(since: float, until: float, paths=None) -> dict:
                 out["nodes"] += float(r.get("usd") or 0)
             elif ev == "storage" and kind == "cluster_fee":
                 out["cluster_fee"] += float(r.get("usd") or 0)
+            elif ev == "storage" and kind == "image_build":
+                out["builds"] += float(r.get("usd") or 0)
+            elif ev == "storage" and kind == "image_storage":
+                out["image_storage"] += float(r.get("usd") or 0)
             elif ev == "storage" and kind == "meter_gap":
                 if r.get("max_usd") is None:
                     out["gaps_unbounded"] += 1
                 else:
                     out["gap_max_usd"] += float(r["max_usd"])
     out["still_open"] = len(opened - closed)
-    out["total"] = out["pods"] + out["nodes"] + out["cluster_fee"]
+    out["total"] = out["pods"] + out["nodes"] + out["cluster_fee"]          # what the billing export's cluster query covers
+    out["all"] = out["total"] + out["builds"] + out["image_storage"]          # + Cloud Build and Artifact Registry
     return out
 
 
