@@ -22,6 +22,38 @@ $0.238 per sandbox-hour at 1 vCPU / 4 GiB: $238/h for the same fleet.
 (2026-10-27). The catalog's C3D/C4D pools are `enabled: false` until those are raised (~1,100 C3D vCPUs, and CPUS / CPUS for all
 regions to match, for 1,000 sandboxes); today two n2d-standard-96 spot nodes, ~180 sandboxes, is the ceiling.
 
+## Live verification (2026-10-27, agentic-rollouts, us-central1)
+
+`scripts/gke/live_check.py` against the real cluster: each sandbox built from a harbor task's Dockerfile, every exec / file /
+network check, the task's verifier on its reference solution, then the bill compared with observed node lives, then `down` and
+an independent gcloud listing of everything billable.
+
+| run | sandboxes | checks | reward | cold start | warm start | ledger vs observed | left after down |
+|---|---|---|---|---|---|---|---|
+| gke-live-1d | 1 (+1 warm) | all pass | 1 | 255 s | 6.0 s | 1.08x (over) | control plane only |
+| gke-live-8 | 8 concurrent (+1 warm) | all pass | 1 | 268 s | 6.2 s | 1.13x (over) | control plane only |
+
+Cold start, from the pod's creation: node scale-up ~48 s, image pull ~8 s (one pull shared by all 8 pods), container start at
+~62 s; the rest of the 255-270 s is the cluster coming back up from `down` (~2 min) and the Cloud Build (~40 s). Warm (node up,
+image on the node): 6 s, all of it our own create path. The VM was what the catalog said: n2d-standard-96, provisioning model
+SPOT, 1,250 GB pd-balanced. Builds: ledger = Cloud Build's own duration x rate, to the cent. The ledger's excess over observed
+node lives is measurement edges (the observer polls every 10 s, the meter charges to the deletion event; the cluster fee
+between runs), always over, never under.
+
+Found only on the real cluster, fixed, each with a test that would have caught it:
+- BuildKit rejects `--network=cloudbuild`
+- NodeLocal DNSCache (on by default) put DNS outside the network policy: sandboxes had no DNS
+- the Kubernetes client's `read_all()` empties the exit-status channel: every exit code came back None
+- `kubernetes.stream` swaps `request` on the shared client: concurrent API calls failed, overlapping execs could break it for good
+- GKE runs one cluster operation at a time (a second pool resize failed); its first system-pool resize after an autoscaling
+  change surge-replaces the node instead of removing it
+- deleting an image leaves its layers billed in Artifact Registry
+- a deleted node was charged until the next meter pass instead of its deletion event
+- pods saw the node's 96 CPUs (`nproc`): sandboxes are now whole-CPU Guaranteed pods on static-CPU-manager pools (`nproc` = 1)
+
+Still visible inside a sandbox: the node's total memory and disk (`free`, `df`); limits are enforced (OOM at 4 GiB, eviction
+past 10 GB) but not reflected there.
+
 ## Placement (sandboxes/gke_place.py)
 
 A sandbox's cost on a pool = the node's price (machine + boot disk) / how many sandboxes of its size fit a node: GKE's
