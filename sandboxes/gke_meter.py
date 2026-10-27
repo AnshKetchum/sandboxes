@@ -48,11 +48,13 @@ STATE_FILE = "gke_meter_state.json"
 LOCK_FILE = "gke_meter.lock"
 MIN_INTERVAL_S = 30.0          # a pass sooner than this after the previous one is skipped
 STATE_VERSION = 1
-REREGISTER_MARGIN_S = 5.0        # a node's registration event can trail its creation timestamp; earlier than this is another life
+REREGISTER_MARGIN_S = 0.0        # a registration before the node's creation is an earlier life (both are API-server times, and
+                                 # registration follows creation; a 5 s margin hid a life re-registered within it: an under-charge)
 STALE_GAP_S = 300.0            # passes further apart than this mean the meter was down
 GONE_MEMORY_S = 3 * 3600.0     # how long a charged-as-gone node is remembered: longer than Kubernetes keeps its events (1 h)
 REGISTERED_REASONS = ("RegisteredNode",)
 REMOVED_REASONS = ("RemovingNode", "DeletingNode", "NodeNotReady")
+DELETED_REASONS = ("RemovingNode", "DeletingNode")   # emitted once the VM is gone: a safe end for a node's charge
 HOURS_PER_MONTH = 730.0
 DEFAULT_CONFIG = Path(__file__).resolve().parent.parent / "configs" / "gke.yaml"
 SPOT_LABELS = ("cloud.google.com/gke-spot", "cloud.google.com/gke-preemptible")
@@ -193,12 +195,15 @@ def compute_charges(now: float, state: dict, nodes: list, pods: list, cfg: Meter
     alive = {n.name for n in nodes}
     gap = (now - last_pass) if last_pass else None
     died_at = {e["name"]: float(e["died"]) for e in ephemeral if e.get("died")}
+    removed_at = {e["name"]: float(e["removed"]) for e in ephemeral if e.get("removed")}
     for name, s in prev_nodes.items():
         if name in alive:
             continue
         until = float(s.get("until", now))
         price = float(s.get("price_h", 0.0))
-        if gap is not None and gap <= STALE_GAP_S:
+        if removed_at.get(name, 0.0) >= until:                        # its deletion event says when it stopped billing (found
+            seconds = max(0.0, min(removed_at[name], now) - until)    # live: "up to now" charged a deleted node 5 more minutes)
+        elif gap is not None and gap <= STALE_GAP_S:
             seconds = max(0.0, now - until)
         elif died_at.get(name, 0.0) >= until:                         # the meter was down, but the node's removal event says when
             seconds = max(0.0, min(died_at[name], now) - until)
@@ -343,7 +348,7 @@ def ephemeral_from_api(api, known_pools=()) -> list:
         print(f"[sandboxes] gke_meter: cannot read node events ({e!r}); nodes living less than one pass may be missed",
               file=sys.stderr, flush=True)
         return []
-    born, reborn, died = {}, {}, {}
+    born, reborn, died, removed = {}, {}, {}, {}
     for ev in events:
         name = getattr(getattr(ev, "involved_object", None), "name", None)
         if not name:
@@ -358,8 +363,10 @@ def ephemeral_from_api(api, known_pools=()) -> list:
             reborn[name] = max(reborn.get(name, t_last), t_last)
         elif ev.reason in REMOVED_REASONS:
             died[name] = max(died.get(name, t_last), t_last)
-    return [{"name": n, "born": born.get(n), "reborn": reborn.get(n), "died": died.get(n), "pool": pool_of(n, known_pools)}
-            for n in {*born, *died}]
+            if ev.reason in DELETED_REASONS:
+                removed[name] = max(removed.get(name, t_last), t_last)
+    return [{"name": n, "born": born.get(n), "reborn": reborn.get(n), "died": died.get(n), "removed": removed.get(n),
+             "pool": pool_of(n, known_pools)} for n in {*born, *died}]
 
 
 def cluster_created_from_api(api) -> Optional[float]:

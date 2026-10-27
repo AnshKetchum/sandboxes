@@ -121,8 +121,10 @@ def folded_events(lives: dict, flaps: dict, t: float) -> list:
                 born = prev
         if rems and t - rems[-1] <= 3600:
             died = rems[-1]
+        deaths = sorted(d for _, d in ls if d <= t)                   # RemovingNode/DeletingNode: only real deletions
+        removed = deaths[-1] if deaths and t - deaths[-1] <= 3600 else None
         if born is not None or died is not None:
-            out.append({"name": name, "born": born, "reborn": reborn, "died": died, "pool": "sandbox-spot"})
+            out.append({"name": name, "born": born, "reborn": reborn, "died": died, "removed": removed, "pool": "sandbox-spot"})
     return out
 
 
@@ -515,3 +517,28 @@ def test_pods_and_meter_add_up_to_the_node_bill_through_random_churn(tmp_path, m
         total = sum(r.get("usd", 0.0) for r in recs if r["ev"] in ("close", "storage"))
         unseen = sum(rate * (c - o) / 3600 for o, c, rate in opened.values() if not any(o <= p < c for p in passes))
         assert total == pytest.approx(PRICE * H / 3600 + unseen, abs=1e-5 * (1 + len(recs))), trial
+
+
+def test_a_node_deleted_between_close_passes_is_charged_to_its_deletion_event_not_to_now():
+    """Found live: passes 291 s apart charged a node deleted right after the first one for the whole gap."""
+    st = {"version": 1, "last_pass": T0, "nodes": {"n1": {"until": T0, "price_h": PRICE, "pool": "sandbox-spot"}}}
+    ev = [{"name": "n1", "born": None, "reborn": None, "died": T0 + 20, "removed": T0 + 20, "pool": "sandbox-spot"}]
+    charges, _ = compute_charges(T0 + 290, st, [], [], CFG, MODEL, ephemeral=ev)
+    assert sum(c["usd"] for c in charges if c["label"] == "n1") == pytest.approx(PRICE * 20 / 3600)
+
+
+def test_a_not_ready_event_alone_does_not_end_a_nodes_charge():
+    st = {"version": 1, "last_pass": T0, "nodes": {"n1": {"until": T0, "price_h": PRICE, "pool": "sandbox-spot"}}}
+    ev = [{"name": "n1", "born": None, "reborn": None, "died": T0 + 20, "removed": None, "pool": "sandbox-spot"}]
+    charges, _ = compute_charges(T0 + 290, st, [], [], CFG, MODEL, ephemeral=ev)       # the VM may bill after NotReady
+    assert sum(c["usd"] for c in charges if c["label"] == "n1") == pytest.approx(PRICE * 290 / 3600)
+
+
+def test_deletion_events_are_read_separately_from_not_ready(env):
+    api, led_path = env
+    api.events = [fk.node_event("n9", "NodeNotReady", T0 + 100), fk.node_event("n9", "RemovingNode", T0 + 160)]
+    e = {x["name"]: x for x in gke_meter.ephemeral_from_api(api, ["sandbox-spot"])}["n9"]
+    assert e["died"] == pytest.approx(T0 + 160) and e["removed"] == pytest.approx(T0 + 160)
+    api.events = [fk.node_event("n9", "NodeNotReady", T0 + 100)]
+    e = {x["name"]: x for x in gke_meter.ephemeral_from_api(api, ["sandbox-spot"])}["n9"]
+    assert e["removed"] is None
