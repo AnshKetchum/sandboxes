@@ -59,6 +59,17 @@ run() {
   if [[ $APPLY == 1 ]]; then "$@"; fi
 }
 exists() { "$@" >/dev/null 2>&1; }
+retry() {  # retry <cmd...>: IAM takes a while to see a service account it just created
+  local i
+  for i in 1 2 3 4 5 6 7 8; do
+    if [[ $APPLY != 1 ]]; then printf '+ %s\n' "$*"; return 0; fi
+    printf '+ %s\n' "$*"
+    if "$@"; then return 0; fi
+    echo "  (attempt $i failed; retrying in $((i * 5)) s)" >&2
+    sleep $((i * 5))
+  done
+  return 1
+}
 tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 
@@ -76,10 +87,10 @@ for sa in "$NODE_SA" "$BUILD_SA"; do
   fi
 done
 for role in roles/container.defaultNodeServiceAccount roles/artifactregistry.reader; do
-  run gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:$NODE_SA" --role "$role" --condition None --quiet
+  retry gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:$NODE_SA" --role "$role" --condition None --quiet >/dev/null
 done
 for role in roles/artifactregistry.writer roles/logging.logWriter; do
-  run gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:$BUILD_SA" --role "$role" --condition None --quiet
+  retry gcloud projects add-iam-policy-binding "$PROJECT" --member "serviceAccount:$BUILD_SA" --role "$role" --condition None --quiet >/dev/null
 done
 
 echo '{"rule": [{"action": {"type": "Delete"}, "condition": {"age": 1}}]}' >"$tmp/lifecycle.json"
@@ -89,7 +100,7 @@ if ! exists gcloud storage buckets describe "gs://$BUCKET" --project "$PROJECT";
 else
   run gcloud storage buckets update "gs://$BUCKET" --lifecycle-file "$tmp/lifecycle.json"
 fi
-run gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member "serviceAccount:$BUILD_SA" --role roles/storage.objectViewer
+retry gcloud storage buckets add-iam-policy-binding "gs://$BUCKET" --member "serviceAccount:$BUILD_SA" --role roles/storage.objectViewer >/dev/null
 
 if ! exists gcloud artifacts repositories describe "$AR_REPO" --location "$REGION" --project "$PROJECT"; then
   run gcloud artifacts repositories create "$AR_REPO" --repository-format docker --location "$REGION" --project "$PROJECT" \
