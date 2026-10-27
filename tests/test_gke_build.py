@@ -153,6 +153,7 @@ def test_the_build_uses_buildkit_cloud_logging_only_and_the_tasks_own_dockerfile
     conf = cloud.builds["b1"]["conf"]
     step = conf["steps"][0]
     assert "DOCKER_BUILDKIT=1" in step["env"] and step["args"][step["args"].index("-f") + 1] == "docker/Dockerfile.gpu"
+    assert not any(a.startswith("--network") for a in step["args"])          # BuildKit rejects --network=cloudbuild (seen live)
     assert conf["options"]["logging"] == "CLOUD_LOGGING_ONLY" and conf["images"] == [step["args"][step["args"].index("-t") + 1]]
 
 

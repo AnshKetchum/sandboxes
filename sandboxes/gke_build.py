@@ -168,7 +168,7 @@ def image_exists(ref: str) -> bool:
 
 def build_config_yaml(cfg: BuildConfig, ref: str, dockerfile_rel: str) -> str:
     conf = {"steps": [{"name": "gcr.io/cloud-builders/docker", "env": ["DOCKER_BUILDKIT=1"],
-                       "args": ["build", "--network=cloudbuild", "-t", ref, "-f", dockerfile_rel, "."]}],
+                       "args": ["build", "-t", ref, "-f", dockerfile_rel, "."]}],     # BuildKit refuses --network=cloudbuild
             "images": [ref], "timeout": f"{int(cfg.timeout_s)}s",
             "options": {"machineType": cfg.machine_type, "logging": "CLOUD_LOGGING_ONLY"}}
     if cfg.service_account:
