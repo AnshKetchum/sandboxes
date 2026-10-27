@@ -29,7 +29,8 @@ class FakeCloud:
     """Cloud Build + the staging bucket + Artifact Registry, as gcloud and the registry API show them."""
 
     def __init__(self):
-        self.calls, self.builds, self.objects, self.images = [], {}, {}, {}
+        self.calls, self.builds, self.objects, self.images, self.files = [], {}, {}, {}, {}
+        self.unreadable = set()
         self.fail_build = False
         self.never_finish = False
         self.build_minutes = 3.2
@@ -58,7 +59,7 @@ class FakeCloud:
                 b.update(status="FAILURE" if self.fail_build else "SUCCESS", startTime=iso(t1 - self.build_minutes * 60),
                          finishTime=iso(t1))
                 if not self.fail_build:
-                    self.images[b["conf"]["images"][0]] = {"bytes": self.layer_bytes, "created": t1}
+                    self.push(b["conf"]["images"][0], t1)
             else:
                 b["status"] = "WORKING"
             return json.dumps({k: v for k, v in b.items() if k != "conf"})
@@ -78,6 +79,14 @@ class FakeCloud:
         if a[:4] == ["artifacts", "docker", "images", "list"]:
             return json.dumps([{"package": f"{REG}/ctx", "tags": [ref.rsplit(":", 1)[1]], "createTime": iso(i["created"]),
                                 "metadata": {"imageSizeBytes": str(i["bytes"])}} for ref, i in self.images.items()])
+        if a[:3] == ["artifacts", "files", "list"]:
+            return json.dumps([{"name": f"projects/p/locations/us-central1/repositories/envs/files/{d}", "sizeBytes": str(f["bytes"]),
+                                "createTime": iso(f["created"])} for d, f in self.files.items()])
+        if a[:3] == ["artifacts", "files", "delete"]:
+            if a[3] not in self.files:
+                raise RuntimeError("NOT_FOUND: file")
+            del self.files[a[3]]
+            return ""
         if a[:4] == ["artifacts", "docker", "images", "delete"]:
             if a[4] not in self.images:
                 raise RuntimeError("NOT_FOUND: Requested entity was not found.")
@@ -85,12 +94,27 @@ class FakeCloud:
             return ""
         raise AssertionError(f"unexpected gcloud {a}")
 
+    def push(self, ref, t, layer_bytes=None):
+        """An image and its blobs: a config, a base layer every image shares, and a layer of its own."""
+        n = ref.rsplit(":", 1)[1]
+        size = layer_bytes or self.layer_bytes
+        blobs = {f"sha256:cfg-{n}": 1000, "sha256:base": size // 2, f"sha256:own-{n}": size - size // 2 - 1000}
+        for d, b in blobs.items():
+            self.files.setdefault(d, {"bytes": b, "created": t})
+        self.images[ref] = {"bytes": size, "created": t, "blobs": list(blobs)}
+
     def registry(self, url, method="GET"):
         tag = url.rsplit("/manifests/", 1)[1]
         ref = next((r for r in self.images if r.endswith(":" + tag)), None)
         if ref is None:
             return 404, b""
-        body = json.dumps({"config": {"size": 1000}, "layers": [{"size": self.images[ref]["bytes"] - 1000}]}).encode()
+        if ref in self.unreadable:
+            return 500, b""
+        blobs = self.images[ref].get("blobs") or []
+        sizes = {d: self.files.get(d, {}).get("bytes", 0) for d in blobs}
+        body = json.dumps({"config": {"digest": blobs[0], "size": 1000} if blobs else {"size": 1000},
+                           "layers": [{"digest": d, "size": sizes[d]} for d in blobs[1:]] or
+                                     [{"size": self.images[ref]["bytes"] - 1000}]}).encode()
         return 200, (body if method == "GET" else b"")
 
 
@@ -177,7 +201,7 @@ def test_many_sandboxes_of_one_task_at_once_trigger_one_build(cloud, tmp_path):
 
 def test_an_image_already_in_the_registry_is_not_rebuilt_or_charged(cloud, tmp_path):
     env = task(tmp_path)
-    cloud.images[f"{REG}/ctx:{gke_build.context_digest(env)}"] = {"bytes": GiB, "created": time.time()}
+    cloud.push(f"{REG}/ctx:{gke_build.context_digest(env)}", time.time(), GiB)
     gke_build.BUILDER.ensure(CFG, env)
     assert not any(c[:2] == ["builds", "submit"] for c in cloud.calls) and charges(cloud, "image_build") == []
 
@@ -239,7 +263,8 @@ def test_down_deletes_every_image_and_a_second_purge_charges_nothing_more(cloud,
     rep = purge(CFG, all_images=True)
     assert len(rep["deleted"]) == 3 and cloud.images == {}
     n_storage = len(charges(cloud, "image_storage"))
-    assert purge(CFG, all_images=True) == {"deleted": [], "failed": [], "gone": []}
+    again = purge(CFG, all_images=True)
+    assert (again["deleted"], again["failed"], again["gone"], again["files"]["deleted"]) == ([], [], [], 0)
     assert len(charges(cloud, "image_storage")) == n_storage == 3
 
 
@@ -254,7 +279,7 @@ def test_an_image_the_cleanup_policy_deleted_is_charged_up_to_when_it_was_found_
 
 
 def test_an_image_we_did_not_record_is_still_deleted_by_down(cloud):
-    cloud.images[f"{REG}/ctx:feedfacecafebeef"] = {"bytes": 2 * GiB, "created": time.time() - 86400}
+    cloud.push(f"{REG}/ctx:feedfacecafebeef", time.time() - 86400, 2 * GiB)
     rep = purge(CFG, all_images=True)
     assert rep["deleted"] == [f"{REG}/ctx:feedfacecafebeef"] and cloud.images == {}
     assert charges(cloud, "image_storage")[0]["usd"] == pytest.approx(2 * 0.10 * 24 / 730, rel=0.01)
@@ -265,3 +290,39 @@ def test_leftover_build_uploads_are_deleted(cloud):
     assert purge_staging(CFG, older_than_s=3600) == 1 and set(cloud.objects) == {"source/new.tgz"}
     assert purge_staging(CFG, older_than_s=0) == 1 and cloud.objects == {}
     assert purge_staging(CFG, older_than_s=0) == 0
+
+
+# -- layers outlive images (found live) ------------------------------------------------------------------------------------------
+def test_down_leaves_no_blob_behind(cloud, tmp_path):
+    for n in ("a", "b"):
+        gke_build.BUILDER.ensure(CFG, task(tmp_path, n))
+    assert len(cloud.files) == 5                                            # 2 configs, 2 own layers, 1 shared base
+    rep = purge(CFG, all_images=True)
+    assert cloud.images == {} and cloud.files == {} and rep["files"]["deleted"] == 5
+
+
+def test_a_partial_purge_keeps_the_blobs_remaining_images_use(cloud, tmp_path, monkeypatch):
+    old_t = time.time() - 8 * 3600
+    keep, drop = f"{REG}/ctx:keepkeepkeepkeep", f"{REG}/ctx:dropdropdropdrop"
+    cloud.push(keep, old_t); cloud.push(drop, old_t)
+    gke_build.record("used", keep, run="r")                                 # used just now: kept
+    rep = purge(CFG, now=time.time())
+    assert rep["deleted"] == [drop] and set(cloud.images) == {keep}
+    assert set(cloud.files) == {"sha256:cfg-keepkeepkeepkeep", "sha256:own-keepkeepkeepkeep", "sha256:base"}
+
+
+def test_a_blob_from_a_push_in_progress_is_not_deleted(cloud):
+    cloud.files["sha256:uploading"] = {"bytes": 10 ** 8, "created": time.time() - 60}        # no tag points at it yet
+    cloud.files["sha256:abandoned"] = {"bytes": 10 ** 8, "created": time.time() - 7200}
+    rep = gke_build.purge_files(CFG, ())
+    assert set(cloud.files) == {"sha256:uploading"} and rep["deleted"] == 1
+
+
+def test_an_unreadable_manifest_deletes_no_blob(cloud):
+    keep = f"{REG}/ctx:keepkeepkeepkeep"
+    cloud.push(keep, time.time() - 7200)
+    cloud.files["sha256:orphan"] = {"bytes": 1, "created": time.time() - 7200}
+    cloud.unreadable.add(keep)
+    with pytest.raises(ImageBuildError, match="not deleting blobs blind"):
+        gke_build.purge_files(CFG, [keep])
+    assert "sha256:orphan" in cloud.files and "sha256:base" in cloud.files

@@ -353,6 +353,70 @@ def delete_image(ref: str, cfg: BuildConfig, ledger=None, info: Optional[dict] =
     return True
 
 
+def repo_coordinates(cfg: BuildConfig) -> list:
+    """["--repository", repo, "--location", region, "--project", project] for the registry's repository."""
+    host, project, repo = cfg.registry.split("/")[:3]
+    return ["--repository", repo, "--location", host.split("-docker.pkg.dev")[0], "--project", project]
+
+
+def list_files(cfg: BuildConfig) -> list:
+    """The repository's blobs (layers, configs): [{"name": "sha256:...", "bytes", "created"}]. They outlive the images that
+    used them: deleting an image leaves its layers billed (found live), so they are deleted here too."""
+    out = []
+    for f in json.loads(gcloud("artifacts", "files", "list", *repo_coordinates(cfg), "--format=json", timeout=600) or "[]"):
+        out.append({"name": f["name"].rsplit("/", 1)[-1], "bytes": int(f.get("sizeBytes") or 0), "created": _epoch(f.get("createTime"))})
+    return out
+
+
+def referenced_blobs(refs) -> set:
+    """Every blob the images `refs` need: config and layers, through an index's manifests."""
+    out: set = set()
+
+    def walk(url: str, depth: int = 0):
+        status, body = registry_request(url)
+        if status != 200 or not body:
+            raise ImageBuildError(f"gke: cannot read the manifest {url} ({status}): not deleting blobs blind")
+        m = json.loads(body)
+        if m.get("manifests") and depth == 0:
+            base = url.rsplit("/", 1)[0]
+            for d in m["manifests"]:
+                out.add(d["digest"])
+                walk(f"{base}/{d['digest']}", 1)
+            return
+        if (m.get("config") or {}).get("digest"):
+            out.add(m["config"]["digest"])
+        out.update(l["digest"] for l in m.get("layers") or [] if l.get("digest"))
+    for ref in refs:
+        walk(manifest_url(ref))
+    return out
+
+
+def purge_files(cfg: BuildConfig, keep_refs=(), *, older_than_s: float = 3600.0, now: Optional[float] = None) -> dict:
+    """Delete the repository's blobs no kept image needs, older than `older_than_s` (a push in progress uploads its blobs before
+    its tag exists; 0 when nothing can be pushing, as in `down`). Returns {"deleted", "bytes", "failed"}."""
+    from concurrent.futures import ThreadPoolExecutor
+    now = now or time.time()
+    keep = referenced_blobs(keep_refs) if keep_refs else set()
+    doomed = [f for f in list_files(cfg) if f["name"] not in keep and now - (f["created"] or now) >= older_than_s]
+    rep = {"deleted": 0, "bytes": 0, "failed": []}
+
+    def rm(f):
+        try:
+            gcloud("artifacts", "files", "delete", f["name"], *repo_coordinates(cfg), "--quiet", timeout=300)
+            return f, None
+        except RuntimeError as e:
+            gone = "NOT_FOUND" in str(e) or "not found" in str(e).lower()     # already deleted: fine
+            return f, None if gone else str(e)[:200]
+    with ThreadPoolExecutor(8) as pool:
+        for f, err in pool.map(rm, doomed):
+            if err:
+                rep["failed"].append(f["name"])
+            else:
+                rep["deleted"] += 1
+                rep["bytes"] += f["bytes"]
+    return rep
+
+
 def purge(cfg: BuildConfig, *, in_use=frozenset(), all_images: bool = False, now: Optional[float] = None, ledger=None) -> dict:
     """Delete our images: all of them (`all_images`), else those no pod runs and unused for image_ttl_h. Images recorded but
     found gone (the repository's cleanup policy) are charged up to now and marked deleted. Returns {"deleted", "failed", "gone"}."""
@@ -374,6 +438,8 @@ def purge(cfg: BuildConfig, *, in_use=frozenset(), all_images: bool = False, now
         last = max(float(info.get("last_used") or 0.0), float(info.get("built") or img.get("created") or 0.0))
         if all_images or now - last >= cfg.image_ttl_h * 3600:
             (rep["deleted"] if delete_image(ref, cfg, ledger, info) else rep["failed"]).append(ref)
+    kept = [r for r in present if r not in rep["deleted"]]
+    rep["files"] = purge_files(cfg, kept, older_than_s=0.0 if all_images and not kept else 3600.0, now=now)
     return rep
 
 
