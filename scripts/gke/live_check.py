@@ -181,10 +181,15 @@ async def main_async(a) -> dict:
     obs.start()
     gke_meter.meter_once(api, force=True)
 
+    from sandboxes.config import load_provider_entries
+    from sandboxes.gke_meter import DEFAULT_CONFIG
+    entry = next(e for e in load_provider_entries(os.environ.get("SANDBOX_GKE_CONFIG") or DEFAULT_CONFIG)["providers"]
+                 if e.get("name") == "gke")                          # the provider's own settings, as production uses them
+
     def spec():
-        return SandboxSpec(image="", cpu=1, mem_gb=4, disk_gb=10, lifetime_s=3600, create_tries=1,
-                           labels={"sandboxes.run": a.run},
-                           extra={"dockerfile": str(env / "Dockerfile"), "context_dir": str(env), "cpu_request": 0.95})
+        return SandboxSpec(image="", cpu=int(entry.get("cpu", 1)), mem_gb=int(entry.get("memory_mb", 4096)) // 1024,
+                           disk_gb=int(entry.get("disk_gb", 10)), lifetime_s=3600, create_tries=1, labels={"sandboxes.run": a.run},
+                           extra={**(entry.get("extra") or {}), "dockerfile": str(env / "Dockerfile"), "context_dir": str(env)})
     sbs = [GKERaw(spec()) for _ in range(a.count)]
     t0 = time.time()
 

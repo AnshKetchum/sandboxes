@@ -469,10 +469,8 @@ def check_pod_rate(nodes: list, pods: list, cfg: MeterConfig, model=None) -> lis
     model = model or cost_model_for(PROVIDER)
     per_vcpu = {}                                                  # what pod entries on each node are charged per vCPU-hour
     for p in pods:
-        if p.usd_per_hour is not None and p.cpu:
-            per_vcpu.setdefault(p.node, p.usd_per_hour / p.cpu)
-        else:
-            per_vcpu.setdefault(p.node, model.vcpu_hour)
+        if p.usd_per_hour is None:                                  # a recorded rate is a placement share of its node, priced
+            per_vcpu.setdefault(p.node, model.vcpu_hour)            # from the same catalog: nothing to compare per vCPU
     off = []
     for n in nodes:
         if n.name not in per_vcpu or not n.vcpus:

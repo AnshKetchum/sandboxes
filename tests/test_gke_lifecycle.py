@@ -291,3 +291,18 @@ def test_a_cluster_operation_waits_for_the_one_already_running(g, monkeypatch):
     monkeypatch.setattr(gke_ops, "gcloud", denied)
     with pytest.raises(RuntimeError, match="PERMISSION_DENIED"):
         gke_ops.resize_pool(cfg(), "c3d-180-spot", 0)                       # other errors are not retried
+
+
+def test_sandbox_pools_get_the_kubelet_config_and_drift_is_corrected(g, k8s):
+    import yaml
+    c = cfg(kubelet_config={"cpuManagerPolicy": "static"})
+    args = gke_ops.create_pool_args(c, CATALOG[0])
+    conf = yaml.safe_load(open(args[args.index("--system-config-from-file") + 1]))
+    assert conf == {"kubeletConfig": {"cpuManagerPolicy": "static"}}
+    g.pools = {p["name"]: pool_json(p["name"], p["machine"], p["spot"], p["disk_gb"], p["max_nodes"]) for p in CATALOG}
+    g.pools["c3d-180-spot"]["config"]["kubeletConfig"] = {"cpuManagerPolicy": "static"}
+    plan = {n: a for a, n, _ in gke_ops.plan_pools(c, gke_ops.cluster_pools(c))}
+    assert plan == {"c3d-180-spot": "ok", "c4d-192-spot": "kubelet", "c3d-180-od": "kubelet"}
+    gke_ops.apply_pools(k8s, c, [("kubelet", "c4d-192-spot", "")])
+    upd = next(x for x in g.calls if x[:4] == ["container", "node-pools", "update", "c4d-192-spot"])
+    assert "--system-config-from-file" in upd

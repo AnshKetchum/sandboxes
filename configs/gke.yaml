@@ -11,7 +11,7 @@ sandbox_providers:
     spend_cap_usd: 50                     # raise deliberately after the first live verification
     auto_delete_minutes: 240              # activeDeadlineSeconds: the kubelet kills the pod here even if every process of ours died
     extra:
-      cpu_request: 0.95                   # so N one-vCPU pods fit an N-vCPU node's allocatable (system pods take the rest)
+      cpu_request: 1.0                    # whole CPUs, request == limit: pinned to its own core (static CPU manager), nproc = 1
       spot: prefer                        # prefer | only | never; on-demand pools are the fallback when no spot pool can grow
       ready_timeout_s: 1200
 
@@ -23,6 +23,7 @@ gke:
   system_pool: default-pool               # kube-system: 1 node while up, 0 after `down`
   node_service_account: gke-sandbox-nodes@agentic-rollouts.iam.gserviceaccount.com
   max_pods_per_node: 256
+  kubelet_config: {cpuManagerPolicy: static}   # sandbox pools: Guaranteed pods get exclusive cores (nproc = their vCPUs)
   idle_scale_down_min: 15                 # a sandbox pool with no pod of ours this long: resized to 0
   auto_down_min: 60                       # no pod of ours this long: `down` (system pool, images, uploads). 0: never
   auto_up: true                           # a sandbox start on a cluster that is down brings it up (about 2 min)

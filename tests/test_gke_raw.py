@@ -108,7 +108,7 @@ def test_manifest_has_a_hard_lifetime_no_token_no_restarts_and_exact_labels():
     exact = json.loads(m["metadata"]["annotations"]["sandboxes/labels"])
     assert exact["sandboxes.run"].startswith("lhg ab3/weird*run")              # the annotation keeps the value as given
     res = ps["containers"][0]["resources"]
-    assert res["requests"]["cpu"] == "0.95" and res["limits"]["cpu"] == "1.0" and res["limits"]["memory"] == "4Gi"
+    assert res["requests"]["cpu"] == "0.95" and res["limits"]["cpu"] == "1" and res["limits"]["memory"] == "4Gi"
     assert res["limits"]["ephemeral-storage"] == "10Gi"
 
 
@@ -490,3 +490,10 @@ def test_exec_streams_never_touch_the_shared_api_client(monkeypatch):
     clients = {id(c) for _, c in seen}
     assert len(seen) == 6 and id(shared.api_client) not in clients
     assert len(clients) == 3                                                # one per thread, reused within it
+
+
+def test_whole_cpu_sandboxes_are_guaranteed_with_integer_cpus():
+    r = pod_manifest("sbx-1", spec(cpu=1, mem_gb=4, extra={"cpu_request": 1.0}), "ns")["spec"]["containers"][0]["resources"]
+    assert r["requests"]["cpu"] == r["limits"]["cpu"] == "1" and r["requests"]["memory"] == r["limits"]["memory"] == "4Gi"
+    r = pod_manifest("sbx-1", spec(cpu=2, extra={"cpu_request": 0.95}), "ns")["spec"]["containers"][0]["resources"]
+    assert (r["requests"]["cpu"], r["limits"]["cpu"]) == ("1.9", "2")

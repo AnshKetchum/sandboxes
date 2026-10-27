@@ -133,8 +133,10 @@ def pod_manifest(name: str, spec, namespace: str) -> dict:
     labels["sandboxes.managed"] = "true"
     cpu_request = round(float(spec.cpu) * float(x.get("cpu_request", 0.95)), 3)
     disk_request = min(float(x.get("ephemeral_request_gb", spec.disk_gb)), float(spec.disk_gb))
-    resources = {"requests": {"cpu": str(cpu_request), "memory": f"{int(spec.mem_gb)}Gi", "ephemeral-storage": f"{disk_request:g}Gi"},
-                 "limits": {"cpu": str(float(spec.cpu)), "memory": f"{int(spec.mem_gb)}Gi", "ephemeral-storage": f"{int(spec.disk_gb)}Gi"}}
+    # cpu_request 1.0 makes requests == limits in whole CPUs: a Guaranteed pod, which a node with the static CPU manager pins to
+    # its own cores, so `nproc` says 1, not the node's 96 (found live: make -j / pytest -n auto would size to the whole node)
+    resources = {"requests": {"cpu": f"{cpu_request:g}", "memory": f"{int(spec.mem_gb)}Gi", "ephemeral-storage": f"{disk_request:g}Gi"},
+                 "limits": {"cpu": f"{float(spec.cpu):g}", "memory": f"{int(spec.mem_gb)}Gi", "ephemeral-storage": f"{int(spec.disk_gb)}Gi"}}
     pod_spec = {
         "restartPolicy": "Never",
         "activeDeadlineSeconds": int(spec.lifetime_s),

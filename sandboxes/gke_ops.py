@@ -86,6 +86,7 @@ class OpsConfig:
     max_pods_per_node: int = 256
     auto_down_min: float = 60.0                        # idle this long (no pod of ours): `down` (0: never)
     auto_up: bool = True                               # a sandbox start on a cluster that is down brings it up
+    kubelet_config: dict = field(default_factory=dict)  # every sandbox pool's kubelet (e.g. {cpuManagerPolicy: static})
 
     @classmethod
     def load(cls, path: Optional[os.PathLike] = None) -> "OpsConfig":
@@ -458,6 +459,7 @@ def cluster_pools(cfg: OpsConfig) -> dict:
         out[n["name"]] = {"machine": c.get("machineType"), "spot": bool(c.get("spot")),
                           "max_nodes": int(total) if total is not None else int(a.get("maxNodeCount") or 0) * max(1, len(zones)),
                           "disk_gb": int(c.get("diskSizeGb") or 0), "disk_type": c.get("diskType"), "zones": n.get("locations") or [],
+                          "kubelet": {k: v for k, v in (c.get("kubeletConfig") or {}).items() if k in ("cpuManagerPolicy",)},
                           "ours": "sandboxes.pool" in (c.get("labels") or {})}
     return out
 
@@ -482,6 +484,8 @@ def plan_pools(cfg: OpsConfig, current: dict) -> list:
                                                   f"{p['machine']}/{'spot' if p.get('spot', True) else 'od'}/{want_disk}GB"))
         elif cur["max_nodes"] != want_max:
             actions.append(("update", p["name"], f"max {cur['max_nodes']} -> {want_max} nodes"))
+        elif any(cur.get("kubelet", {}).get(k) != v for k, v in cfg.kubelet_config.items()):
+            actions.append(("kubelet", p["name"], f"{cur.get('kubelet')} -> {cfg.kubelet_config}"))
         else:
             actions.append(("ok", p["name"], ""))
     names = {p["name"] for p in cfg.pools}
@@ -507,7 +511,18 @@ def create_pool_args(cfg: OpsConfig, p: dict) -> list:
         args.append("--spot")
     if cfg.node_service_account:
         args += ["--service-account", cfg.node_service_account]
+    if cfg.kubelet_config:
+        args += ["--system-config-from-file", system_config_file(cfg)]
     return args
+
+
+def system_config_file(cfg: OpsConfig) -> str:
+    """A node system config (kubelet settings) for gcloud's --system-config-from-file."""
+    import tempfile
+    f = tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False, prefix="gke-system-config-")
+    f.write(yaml.safe_dump({"kubeletConfig": dict(cfg.kubelet_config)}))
+    f.close()
+    return f.name
 
 
 def pool_has_nodes(api, name: str) -> bool:
@@ -525,6 +540,9 @@ def apply_pools(api, cfg: OpsConfig, actions: list, *, replace: bool = False, pr
         elif action == "update":
             cluster_op("container", "clusters", "update", *cfg.cluster_args(), "--node-pool", name, "--enable-autoscaling",
                    "--total-min-nodes", "0", "--total-max-nodes", str(max_nodes_of(by_name[name], max(1, len(cfg.zones)))), "--quiet")
+        elif action == "kubelet":
+            cluster_op("container", "node-pools", "update", name, "--cluster", cfg.cluster, "--location", cfg.location,
+                       "--project", cfg.project, "--system-config-from-file", system_config_file(cfg), "--quiet", timeout=3600)
         elif action in ("replace", "delete"):
             if not (replace if action == "replace" else prune):
                 continue
