@@ -11,7 +11,8 @@ prices the boot-disk variants; `gke_place pools` the catalog):
 | pools | sandboxes | $/h | needs |
 |---|---|---|---|
 | 6 x c3d-standard-180-lssd | 1,026 | ~14.5 | C3D quota ~1,100 (granted: 150) |
-| today's catalog (`configs/gke.yaml`): C3D-lssd, N2D, C2D-lssd, E2, N4D, N4, N2-lssd | ~991 | ~28 | the quotas below, all of them |
+| today's catalog without N2D/E2 (`bench.py ramp`, measured) | 1,000 | 31.87 | C3D, C2D, N4D, N4, N2, C4N quotas |
+| today's catalog with every spot pool (`configs/gke.yaml`, nothing else running) | 1,159 | 34.42 | the quotas below; CPUS_ALL_REGIONS binds |
 | 2 x n2d-standard-96 (before 2026-10-30) | ~180 | ~4.3 | N2D 200 |
 
 Plus a small system node (~$0.07/h; the control plane fee is covered by GKE's free tier) and image builds once per distinct
@@ -20,9 +21,10 @@ task (~$0.06 each). Modal measured $0.238 per sandbox-hour at 1 vCPU / 4 GiB: $2
 **Quota decides what runs.** The ~180 ceiling was the N2D vCPU quota (200: two n2d-standard-96 nodes), not the backend. The
 regional `CPUS` quota (200) counts only N1/E2; every other family has its own (us-central1, 2026-10-30: C3D 150, N2D 200,
 N2 200, C2D 100, N4D 200, N4 200, E2 72, C3/C4/C4D/T2D 24) and all of them sit under `CPUS_ALL_REGIONS` 1,300. So 1,000
-guaranteed vCPUs fit today only spread over seven families (`gke.quotas` + the catalog's pools: placement fills the
+guaranteed vCPUs fit today only spread over six to eight families (measured: 1,000 of 1,000 at once, below) (`gke.quotas` + the catalog's pools: placement fills the
 cheapest first and skips a family whose next node would pass its quota). The cheaper single-family fleet needs the C3D quota
-raised: a request for 1,100 on 2026-10-27 was granted 150; ask again (`gcloud beta quotas preferences create
+raised (it halves the fleet's cost, and the C3D pools were ready first in every ramp): a request for 1,100 on 2026-10-27
+was granted 150; ask again (`gcloud beta quotas preferences create
 --service=compute.googleapis.com --quota-id=CPUS-PER-VM-FAMILY-per-project-region --dimensions=region=us-central1,vm_family=C3D
 --preferred-value=1100 --project=agentic-rollouts --preference-id=c3d-cpus-us-central1-2`), then enable `c3d-180-lssd-spot`. Do
 not request `PREEMPTIBLE_CPUS`: once a project has it, spot VMs of every family draw from it alone, and a partial grant would
@@ -66,7 +68,13 @@ channels as it reads: 40 concurrent 16 MiB reads 27 s -> 6.5 s each, none short.
 |---|---|---|---|---|---|---|
 | gke-bench-ramp100 | 100 / 100 | c3d-60-lssd, c3d-90-lssd | 106 s (99), 318 s (1: model over-packed, fixed) | 1.1 s | 0.54 s | 1.97 |
 | gke-bench-ramp800 | 800 / 800 | 8 pools, 13 nodes | 64-119 s on 6 pools; N4 ~400 s, N2 ~840 s (spot stockouts) | 4.4 s | 0.64 s | 23.63 |
-RAMP1000_ROW
+| gke-bench-ramp1000 | 576 / 1,000 (stopped) | 8 pools | placer bug: each snapshot refresh forgot pods waiting for a node, so 372 went to a 2-node N2 pool (spot N2 out in all zones) and none to C4N; fixed | | | |
+| gke-bench-ramp1000b | **1,000 / 1,000** | 8 pools, 15 nodes (C3D, C2D, N4D, N4, N2, C4N; all spot) | **196 s** (open p50 113 s, p90 180 s) | 5.0 s (p50 2.2 s) | 0.56 s | **31.87** |
+
+The 1,000 run used its own namespace (`GKE_NAMESPACE=sandboxes-scale`, quota 1,100 pods) beside live greenhouse runs, kept
+off their N2D and E2 pools and under 1,106 of the project's 1,300 vCPUs (`quotas.ALL`), so their own scale-ups had room.
+$31.87/h is the sum of the 1,000 pods' recorded shares of their nodes (~$0.032 per sandbox-hour); C4N, the last family in,
+costs $0.047 a sandbox-hour against C3D's $0.014.
 
 Spot stockouts (`RESOURCE_POOL_EXHAUSTED`: n2-standard-96 in three zones, n4d-standard-96 in one) are what slowed the large
 ramps: the autoscaler retries other zones, and placement moves a pod after `capacity_wait_s` (300 s). Pools of smaller machines
