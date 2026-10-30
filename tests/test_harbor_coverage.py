@@ -38,6 +38,7 @@ def test_the_declaration_matches_what_the_provider_harbor_path_can_do():
 
 
 def test_dockerfile_workdir_is_the_last_absolute_one(tmp_path):
+    pytest.importorskip("harbor")                       # harbor_raw imports harbor (the `daytona` extra)
     from sandboxes.harbor_raw import dockerfile_workdir
     (tmp_path / "Dockerfile").write_text("FROM x\nWORKDIR /a\nRUN true\nworkdir /workspace\nWORKDIR rel\n")
     assert dockerfile_workdir(tmp_path) == "/workspace"
