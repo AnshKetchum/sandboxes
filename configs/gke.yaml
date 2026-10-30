@@ -28,7 +28,8 @@ gke:
   auto_down_min: 60                       # no pod of ours this long: `down` (system pool, images, uploads). 0: never
   auto_up: true                           # a sandbox start on a cluster that is down brings it up (about 2 min)
   orphan_pending_min: 30
-  node_overhead: {cpu: 0.5, mem_gib: 1.5, pods: 12, image_cache_gib: 200}   # DaemonSets and task images, per node
+  node_overhead: {cpu: 1.7, mem_gib: 1.6, pods: 12, image_cache_gib: 200}   # DaemonSets (live: 1.25 vCPU, 1.07 GiB) + kubelet
+                                                                             # slack, and task images, per node
   # The pool catalog. Placement picks, per sandbox size, the pool cheapest per sandbox that can still grow (room on a running
   # node first; a family's pools share its vCPU quota, `quotas:`); pools sit at 0 nodes, free, until a sandbox needs one.
   # `gke_ops pools plan|apply [--only NAME...]` makes the cluster match. max_nodes is over all zones.

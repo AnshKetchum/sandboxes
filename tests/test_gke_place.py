@@ -40,9 +40,9 @@ def test_memory_reservation_follows_gkes_table(mem, reserved):
 
 
 def test_packing_is_set_by_the_tightest_resource():
-    assert per_node(C3D180, UNIT) == 174                                   # memory: (720 - 21.26 - 1.5) / 4
-    assert per_node(C3DHC, UNIT) == 84                                     # half the memory of the same CPUs
-    assert per_node(C3D180, Shape(1, 2, 10)) == 188                        # 2 GiB: the CPUs bind (178.98 / 0.95)
+    assert per_node(C3D180, UNIT) == 171                                   # memory: (720 x 0.983 - 21.0 - 1.6) / 4
+    assert per_node(C3DHC, UNIT) == 83                                     # half the memory of the same CPUs
+    assert per_node(C3D180, Shape(1, 2, 10)) == 187                        # 2 GiB: the CPUs bind (177.78 / 0.95)
     assert per_node(E2_32, Shape(1, 4, 10), disk_gib=100) == 0             # 100 GB boot disk: no room after the image cache
     assert per_node(Machine("tiny", 400, 4000, 1, 1), Shape(1, 1, 1)) == 256 - Overhead().pods   # the pod limit binds
 
@@ -52,13 +52,13 @@ def test_1000_units_of_1_vcpu_4_gib_10_gb_cost_well_under_75_an_hour():
     opts = plan(UNIT, 1000, ALL)
     best = opts[0]
     assert (best.machine, best.spot, best.nodes) == ("c3d-standard-180", True, 6)
-    assert best.total_h < 15 and best.disk_gib >= 174 * 10                 # guaranteed 10 GB each, disks included
+    assert best.total_h < 15 and best.disk_gib >= 171 * 10                 # guaranteed 10 GB each, disks included
     assert all(o.total_h < 75 for o in opts if o.spot)
     assert all(o.per_node * o.nodes >= 1000 for o in opts)
 
 
 def test_the_shape_picks_the_machine():
-    assert plan(Shape(1, 7, 10), 100, ALL, spot=True)[0].machine == "n2d-highmem-96"   # memory heavy: cheapest GiB
+    assert plan(Shape(1, 7, 10), 98, ALL, spot=True)[0].machine == "n2d-highmem-96"    # memory heavy: cheapest GiB (98: one node)
     assert plan(Shape(1, 1, 10), 1000, ALL, spot=True)[0].machine == "c3d-highcpu-180"  # CPU heavy: cheapest vCPU
 
 
@@ -70,8 +70,8 @@ def pools(**ceil):
 
 def test_a_new_node_goes_to_the_pool_cheapest_per_sandbox():
     pl = place(UNIT, pools(), Snapshot())
-    assert pl.pool == "c3d-180-spot" and pl.per_node == 174
-    assert pl.rate_h == pytest.approx((1.9732 + 2200 * 0.10 / 730 + gp.NODE_IP_HOUR["spot"]) / 174)     # machine + boot disk + IP
+    assert pl.pool == "c3d-180-spot" and pl.per_node == 171
+    assert pl.rate_h == pytest.approx((1.9732 + 2200 * 0.10 / 730 + gp.NODE_IP_HOUR["spot"]) / 171)     # machine + boot disk + IP
 
 
 def test_room_on_a_running_node_wins_over_a_cheaper_new_node():
@@ -108,7 +108,7 @@ def test_a_fleet_placed_one_by_one_fills_nodes_and_spills_at_ceilings():
         pl = place(UNIT, ps, snap)
         reserve(snap, pl.pool, UNIT, pl.per_node)
         counts[pl.pool] = counts.get(pl.pool, 0) + 1
-    assert snap.nodes["c3d-180-spot"] == 2 and counts["c3d-180-spot"] == 348
+    assert snap.nodes["c3d-180-spot"] == 2 and counts["c3d-180-spot"] == 342
     assert snap.nodes["n2d-96-spot"] == 2 and counts["n2d-96-spot"] == 2 * per_node(N2D96, UNIT, 1250)
     assert sum(counts.values()) == 1000 and snap.nodes["c3d-180-od"] == 3                # the other 470, on demand
     cost = sum(snap.nodes[p.name] * p.node_h for p in ps)
@@ -154,7 +154,7 @@ def test_a_sandbox_lands_on_its_pool_and_its_entry_carries_its_share_of_the_node
     assert pod.spec.node_selector == {"sandboxes.pool": "c3d-180-spot"} and sb.pool == "c3d-180-spot"
     assert {"key": "sandboxes.pool", "operator": "Exists", "effect": "NoSchedule"} in pod.spec.tolerations
     opened = [e for e in ledger_events(catalog) if e["ev"] == "open"][0]
-    assert opened["usd_per_hour"] == pytest.approx((1.9732 + 2200 * 0.10 / 730 + gp.NODE_IP_HOUR["spot"]) / 174, rel=1e-6)
+    assert opened["usd_per_hour"] == pytest.approx((1.9732 + 2200 * 0.10 / 730 + gp.NODE_IP_HOUR["spot"]) / 171, rel=1e-6)
     run(sb.stop())
 
 
@@ -218,7 +218,7 @@ def test_a_local_ssd_pool_keeps_pod_storage_on_its_ssds_and_charges_them():
     assert gp.allocatable_local_ssd_gib(8) == pytest.approx(3000 * 0.9 - 100)
     pool = Pool("c3d-90-lssd-spot", c3d90l, True, 100, 2, local_ssd=8)
     assert per_node(C3D90, UNIT, disk_gib=100) == 0                       # pods on a 100 GB boot disk: no room
-    assert pool.per_node(UNIT) == per_node(C3D90, UNIT) == 86             # on the SSDs: memory binds, the boot disk does not
+    assert pool.per_node(UNIT) == per_node(C3D90, UNIT) == 84             # on the SSDs: memory binds, the boot disk does not
     assert pool.node_h == pytest.approx(0.9866 + 100 * 0.10 / 730 + 8 * 375 * 0.0478 / 730 + 0.0025)
     od = Pool("c3d-90-lssd-od", c3d90l, False, 100, 2, local_ssd=8)
     assert od.node_h == pytest.approx(4.0859 + 100 * 0.10 / 730 + 8 * 375 * 0.08 / 730 + 0.005)
@@ -288,3 +288,10 @@ def test_the_catalog_reads_family_quotas(tmp_path):
                       "machine_prices": {"n2d-standard-96": {"spot": 1.9567}, "c3d-standard-90": {"spot": 0.9866}}}}))
     pools = {x.name: x for x in gp.load_catalog(p)[0]}
     assert pools["a"].family_quota == 200 and pools["b"].family_quota is None
+
+
+def test_the_model_packs_what_live_nodes_really_hold():
+    """Live 2026-10-30: a c3d-standard-60-lssd node held 55 one-vCPU / 4 GiB pods (allocatable 223.99 GiB, DaemonSets 1.07 GiB),
+    a c3d-standard-90-lssd 84 (339.61 GiB): the model said 56 and 86 before it counted the kernel's memory and the DaemonSets."""
+    assert per_node(Machine("c3d-standard-60-lssd", 60, 240), UNIT) == int((223.99 - 1.07) // 4) == 55
+    assert per_node(Machine("c3d-standard-90-lssd", 90, 360), UNIT) == int((339.61 - 1.07) // 4) == 84

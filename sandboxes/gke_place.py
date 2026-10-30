@@ -34,6 +34,8 @@ HOURS_PER_MONTH = 730.0
 HYPERDISK_ONLY = ("c4", "c4a", "c4d", "n4", "n4d", "x4", "h4d")      # families that boot only from Hyperdisk
 COOLDOWN_S = 600.0                     # a pool that could not get a node is skipped this long
 EPS = 1e-6                             # room is counted in floats: 0.95 subtracted 90 times must still leave the 91st slot
+MEM_VISIBLE = 0.983                    # the kernel keeps ~1.7% of a VM's memory before GKE reserves its share (live 2026-10-30:
+                                       # c3d-60 235.9 of 240 GiB, c3d-90 354.1 of 360, n2d-96 377.9 of 384)
 LOCAL_SSD_GIB = 375.0                  # one local NVMe SSD (a pool's `local_ssd` counts these)
 LOCAL_SSD_GIB_MONTH = {"spot": 0.0478, "ondemand": 0.08}   # us-central1 catalog, 2026-10-30 (gke_meter.local_ssd_gib_month)
 NODE_IP_HOUR = {"spot": 0.0025, "ondemand": 0.005}         # a node's external IPv4 (gke_meter.node_ip_hour)
@@ -111,9 +113,11 @@ class Shape:
 
 @dataclass
 class Overhead:
-    """What every node runs besides sandboxes (DaemonSets: networking, logging, metadata server, CSI, image streaming)."""
-    cpu: float = 0.5
-    mem_gib: float = 1.5
+    """What every node runs besides sandboxes (DaemonSets: networking, logging, metadata server, CSI, image streaming), plus
+    what the kubelet keeps beyond GKE's published table. Live 2026-10-30 (c3d-60/90-lssd, n2d-96): DaemonSets request 1.25
+    vCPU (fluentbit's 256-pod variant alone 850m) and 1.07 GiB, and allocatable CPU is 0.4 under the table."""
+    cpu: float = 1.7
+    mem_gib: float = 1.6
     pods: int = 12
     image_cache_gib: float = 200.0             # task images on the node's disk (image streaming keeps only what is read)
 
@@ -139,7 +143,8 @@ def per_node(m: Machine, shape: Shape, disk_gib: Optional[float] = None, max_pod
     """How many sandboxes of `shape` fit one node of `m` (with a boot disk of `disk_gib`; None: the disk is sized to fit; with
     `local_ssd` disks, pods' storage is on those instead of the boot disk)."""
     cpu = m.vcpus - reserved_cpu(m.vcpus) - oh.cpu
-    mem = m.mem_gib - reserved_mem_gib(m.mem_gib) - oh.mem_gib
+    visible = m.mem_gib * MEM_VISIBLE
+    mem = visible - reserved_mem_gib(visible) - oh.mem_gib
     fits = [int(cpu // shape.cpu_req) if shape.cpu_req else 10 ** 6, int(mem // shape.mem_gib) if shape.mem_gib else 10 ** 6,
             max_pods - oh.pods]
     if shape.disk_req and (local_ssd or disk_gib is not None):
