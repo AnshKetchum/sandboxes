@@ -88,6 +88,12 @@ The ledger charges each sandbox its share of its node and the meter charges the 
 - A process killed mid-run leaves its pods until the watchdog or their lifetime (`auto_delete_minutes`, default 240) ends them:
   run `python -m sandboxes.gke_ops watch` beside workloads, or `sandboxes stop --run R` after a crash.
 
+**Several jobs at once.** Runs share the cluster and its pools; each sandbox carries its caller's labels, so any one job can be
+stopped without touching the others: a run (`sandboxes stop --run R`), or one unit of a run (`sandboxes stop --label
+greenhouse.run=R --label greenhouse.task=T`). `sandboxes hold` with the same labels first keeps the caller from opening
+replacements (its next open raises `SandboxHeld`); `sandboxes release` undoes it. A job that needs its own pod quota or must not
+share nodes can run in its own namespace (`GKE_NAMESPACE`; the 1,000 benchmark did) or with `extra.pool` / `extra.exclude_pools`.
+
 **After a run.** `python -m sandboxes.gke_ops down` leaves nothing billing but the free control plane (pods, nodes, running
 builds, images, uploads; it ends with the residue audit). `python -m sandboxes.gke_ops destroy --yes` also removes the
 cluster, the image repository and the build bucket.
@@ -322,6 +328,8 @@ longer closes an entry opened after the listing it reconciles against (a race th
     python -m sandboxes.gke_ops teardown --pools          # all pods, pools to 0, metered until the nodes are gone
     python -m sandboxes.gke_ops teardown --delete-cluster --yes    # and the cluster; the meter charges up to the end of it
     python -m sandboxes.gke_ops destroy --yes             # everything setup.sh made that can bill, then the residue audit
+    sandboxes ls|stop --label greenhouse.run=R --label greenhouse.task=T   # one unit of a run (any provider)
+    sandboxes hold|release --label ...; sandboxes holds                    # refuse / allow that unit's new sandboxes
     python -m sandboxes.gke_ops pools plan|apply [--only NAME...] [--replace] [--prune]
 
     python scripts/gke/bench.py probe --pool A B [--count N --load]     # what a sandbox gets on each pool (disk, CPU, exec)

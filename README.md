@@ -116,11 +116,20 @@ set their identity once (`sandboxes.set_context(owner="euphoria")`, optionally `
 (`SandboxRouter`, `harbor_adapter.make_env` for harbor tasks), and use the same commands as everyone else:
 
 ```
-sandboxes ls    [--owner X] [--run R] [--older-than H]     what is alive, on every provider and local docker
-sandboxes stop  --owner X | --run R | --older-than H | --all [--dry-run] [--batch N --pause S]
-sandboxes reap  [--owner X]                                 delete broken sandboxes (error state, stuck creating)
+sandboxes ls    [--owner X] [--run R] [--label k=v ...] [--older-than H]   what is alive, on every provider and local docker
+sandboxes stop  --owner X | --run R | --label k=v ... | --older-than H | --all [--dry-run] [--batch N --pause S]
+sandboxes reap  [--owner X] [--label k=v ...]               delete broken sandboxes (error state, stuck creating)
+sandboxes hold  --label k=v ... [--reason T]                 no new sandbox with these labels opens, any provider
+sandboxes release --label k=v ... | sandboxes holds          lift a hold | list them
 sandboxes cost | guard | janitor | providers | audit
 ```
+
+One job of a run, not the whole run: a caller's own labels scope every command (`--label` keys AND together). Greenhouse labels
+each sandbox `greenhouse.run` and `greenhouse.task`, so one unit of a run is
+`--label greenhouse.run=R --label greenhouse.task=T`. `stop` ends that unit's open sandboxes and nothing else of the run; `hold`
+makes the library refuse that unit's next sandbox (`SandboxHeld`, on every provider, checked in `RawSandbox.start`), so the
+caller cannot just open new ones; `release` lets it open sandboxes again. Holds are per machine (`<cache dir>/holds.json`), like
+the spend caps. Pausing a unit and resuming it where it was needs the caller to keep its state: a hold only stops new sandboxes.
 
 A project's own stop/clean command is a one-line wrapper (`sandboxes.cli.stop_for("greenhouse", run=...)`): `euphoria stop`,
 `greenhouse clean`, `pr_task_synthesis/stop_lane.py` are all `sandboxes stop --owner <project>`. Every sandbox carries

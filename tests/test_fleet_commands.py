@@ -182,3 +182,55 @@ def test_stop_closes_ledger_entries_even_when_the_provider_is_slow_to_stop_listi
     monkeypatch.setattr(FakeFy, "list_live", classmethod(still_listed))
     run(fleet.stop(owner="euphoria", run="r1", providers=["fy"]))
     assert summary(tmp_path / "led.jsonl")["providers"]["fy"]["running"] == 0
+
+
+# -- one unit of a run: label-scoped ls/stop, and holds -----------------------------------------------------------------------
+def _unit(i, run, task):
+    return LiveSandbox("fy", i, time.time() - 600, "started", {"sandboxes.owner": "greenhouse", "sandboxes.managed": "true",
+                                                                "sandboxes.run": run, "greenhouse.run": run, "greenhouse.task": task})
+
+
+def test_stop_by_labels_ends_one_unit_and_leaves_the_rest_of_its_run(fy):
+    FakeFy.alive += [_unit("u1", "r9", "t-0070"), _unit("u2", "r9", "t-0070"), _unit("u3", "r9", "t-0035"), _unit("u4", "r8", "t-0070")]
+    unit = {"greenhouse.run": "r9", "greenhouse.task": "t-0070"}
+    assert {sb.id for sb in asyncio.run(fleet.ls(labels=unit))} == {"u1", "u2"}
+    done = asyncio.run(fleet.stop(labels=unit))
+    assert {sb.id for sb in done} == {"u1", "u2"} and set(FakeFy.killed) == {"u1", "u2"}     # t-0035 and run r8 untouched
+
+
+def test_the_cli_takes_labels_for_ls_stop_and_reap(fy, capsys):
+    from sandboxes import cli
+    FakeFy.alive += [_unit("u1", "r9", "t-0070"), _unit("u3", "r9", "t-0035")]
+    assert cli.main(["stop", "--label", "greenhouse.run=r9", "--label", "greenhouse.task=t-0070", "--providers", "fy"]) == 0
+    assert FakeFy.killed == ["u1"]
+    with pytest.raises(ValueError):
+        cli.main(["ls", "--label", "nokey", "--providers", "fy"])
+
+
+def test_a_held_unit_opens_no_sandbox_on_any_provider_until_released(fy, tmp_path, monkeypatch):
+    from sandboxes import SandboxHeld, holds
+    from sandboxes.raw import SandboxSpec
+    monkeypatch.setenv("SANDBOX_CACHE_DIR", str(tmp_path / "cache"))
+    unit = {"greenhouse.run": "r9", "greenhouse.task": "t-0070"}
+    holds.hold(unit, reason="tail unit")
+    held = FakeFy(SandboxSpec(image="x", labels=dict(unit)))
+    with pytest.raises(SandboxHeld, match="tail unit"):
+        asyncio.run(held.start())
+    assert held.sandbox_id == ""                                              # nothing was created
+    other = FakeFy(SandboxSpec(image="x", labels={"greenhouse.run": "r9", "greenhouse.task": "t-0035"}))
+    asyncio.run(other.start()); asyncio.run(other.stop())                     # the run's other units go on
+    assert holds.release(unit) == 1 and holds.load() == []
+    again = FakeFy(SandboxSpec(image="x", labels=dict(unit)))
+    asyncio.run(again.start()); asyncio.run(again.stop())
+
+
+def test_hold_and_release_from_the_command_line(tmp_path, monkeypatch, capsys):
+    from sandboxes import cli, holds
+    monkeypatch.setenv("SANDBOX_CACHE_DIR", str(tmp_path / "cache"))
+    assert cli.main(["hold", "--label", "greenhouse.task=t-0070", "--reason", "slow tail"]) == 0
+    assert cli.main(["holds"]) == 0 and "greenhouse.task=t-0070  (slow tail)" in capsys.readouterr().out
+    assert holds.held_by({"greenhouse.task": "t-0070", "sandboxes.run": "r9"})["reason"] == "slow tail"
+    assert holds.held_by({"greenhouse.task": "t-0035"}) is None
+    assert cli.main(["hold"]) == 2                                            # a hold needs a label
+    assert cli.main(["release", "--label", "greenhouse.task=t-0070"]) == 0 and holds.load() == []
+    assert cli.main(["release", "--label", "greenhouse.task=t-0070"]) == 1

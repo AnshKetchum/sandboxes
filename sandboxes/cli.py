@@ -1,7 +1,11 @@
 """`sandboxes`: the one command set for every project (euphoria, petunia, greenhouse, pr_task_synthesis, ...).
 
-    sandboxes ls    [--owner X] [--run R] [--older-than H] [--providers a,b]    what is alive now
-    sandboxes stop  --owner X | --run R | --older-than H | --all [--dry-run]    end sandboxes (any provider, local docker too)
+    sandboxes ls    [--owner X] [--run R] [--label k=v ...] [--older-than H] [--providers a,b]   what is alive now
+    sandboxes stop  --owner X | --run R | --label k=v ... | --older-than H | --all [--dry-run]    end sandboxes (any provider,
+                    local docker too); --label narrows to one unit of a run, e.g. --label greenhouse.task=t-0070
+    sandboxes hold    --label k=v ... [--reason TEXT]    no new sandbox with these labels opens (any provider) until released
+    sandboxes release --label k=v ...                    lift that hold
+    sandboxes holds                                      what is held
     sandboxes cost  [--run R] [--watch N] [--cap USD]                            spend from the uniform cost ledger
     sandboxes guard [--watch N] [--kill]                                         caps, burn rate, kill when a cap trips
     sandboxes janitor [--max-age-hours H] [--dry-run]                            delete anything past a maximum age
@@ -31,7 +35,8 @@ def _fmt_sandbox(sb) -> str:
 
 def cmd_ls(a) -> int:
     from . import fleet
-    found = asyncio.run(fleet.ls(a.owner, a.run, a.older_than, a.providers.split(",") if a.providers else None))
+    found = asyncio.run(fleet.ls(a.owner, a.run, a.older_than, a.providers.split(",") if a.providers else None,
+                                 _labels(a)))
     for sb in found:
         print(_fmt_sandbox(sb))
     print(f"{len(found)} sandbox(es)")
@@ -55,13 +60,15 @@ def _stop_summary(done: list, failed: list, dry_run: bool) -> str:
             + (f"; {len(failed)} FAILED (still alive; run stop again)" if failed else ""))
 
 
-def stop_for(owner: str, run: str | None = None, dry_run: bool = False, quiet: bool = False, providers=None) -> int:
-    """What a project's own stop/clean command calls: stop everything `owner` started (optionally one run, optionally only on
-    `providers`). Prints one line per sandbox unless `quiet`. Returns how many were deleted (or would be)."""
+def stop_for(owner: str, run: str | None = None, dry_run: bool = False, quiet: bool = False, providers=None,
+             labels: dict | None = None) -> int:
+    """What a project's own stop/clean command calls: stop everything `owner` started (optionally one run, optionally only the
+    sandboxes carrying `labels`, e.g. one unit's, optionally only on `providers`). Prints one line per sandbox unless `quiet`.
+    Returns how many were deleted (or would be)."""
     from . import fleet
     failed: list = []
     done = asyncio.run(fleet.stop(owner=owner, run=run, providers=providers, dry_run=dry_run,
-                                  on_result=None if quiet else _reporter(dry_run, failed)))
+                                  on_result=None if quiet else _reporter(dry_run, failed), labels=labels))
     if not quiet:
         print(f"{owner}: {_stop_summary(done, failed, dry_run)}" + (f" of run {run}" if run else ""))
     return len(done)
@@ -69,23 +76,52 @@ def stop_for(owner: str, run: str | None = None, dry_run: bool = False, quiet: b
 
 def cmd_stop(a) -> int:
     from . import fleet
-    if not (a.owner or a.run or a.older_than is not None or a.all):
-        print("stop needs a scope: --owner X, --run R, --older-than H or --all", file=sys.stderr)
+    labels = _labels(a)
+    if not (a.owner or a.run or a.older_than is not None or labels or a.all):
+        print("stop needs a scope: --owner X, --run R, --label k=v, --older-than H or --all", file=sys.stderr)
         return 2
     failed: list = []
     done = asyncio.run(fleet.stop(a.owner, a.run, a.older_than, a.providers.split(",") if a.providers else None, a.all, a.dry_run,
-                                  a.batch, a.pause, on_result=_reporter(a.dry_run, failed)))
+                                  a.batch, a.pause, on_result=_reporter(a.dry_run, failed), labels=labels))
     print(_stop_summary(done, failed, a.dry_run))
     return 1 if failed else 0
 
 
 def cmd_reap(a) -> int:
     from . import fleet
-    out = asyncio.run(fleet.reap(a.owner, a.run, a.creating_older_than, a.providers.split(",") if a.providers else None, a.dry_run))
+    out = asyncio.run(fleet.reap(a.owner, a.run, a.creating_older_than, a.providers.split(",") if a.providers else None, a.dry_run,
+                                 _labels(a)))
     for sb, why in out:
         print(f"{sb.provider} {sb.id[:24]} {why}")
     print(f"{'would reap' if a.dry_run else 'reaped'} {len(out)} sandbox(es)")
     return 0
+
+
+def _labels(a) -> dict:
+    from .holds import parse_labels
+    return parse_labels(getattr(a, "label", None))
+
+
+def cmd_hold(a) -> int:
+    from . import holds
+    labels = _labels(a)
+    if a.cmd == "holds":
+        for h in holds.load():
+            print(f"  held since {time.strftime('%Y-%m-%d %H:%M', time.localtime(h.get('t', 0)))}  "
+                  + " ".join(f"{k}={v}" for k, v in h["labels"].items()) + (f"  ({h['reason']})" if h.get("reason") else ""))
+        print(f"{len(holds.load())} hold(s)")
+        return 0
+    if not labels:
+        print(f"{a.cmd} needs --label key=value (one or more)", file=sys.stderr)
+        return 2
+    if a.cmd == "hold":
+        holds.hold(labels, a.reason)
+        print("held: no new sandbox with " + " ".join(f"{k}={v}" for k, v in labels.items()) + " opens until released "
+              "(`sandboxes stop` with the same --label ends the open ones)")
+        return 0
+    n = holds.release(labels)
+    print("released" if n else "no hold with exactly these labels (`sandboxes holds` lists them)")
+    return 0 if n else 1
 
 
 def cmd_providers(a) -> int:
@@ -107,12 +143,20 @@ def main(argv=None) -> int:
     for name in ("ls", "stop"):
         p = sub.add_parser(name)
         p.add_argument("--owner"); p.add_argument("--run"); p.add_argument("--older-than", type=float, help="hours")
+        p.add_argument("--label", action="append", default=[], help="key=value the sandbox must carry (repeatable)")
         p.add_argument("--providers", default="", help="comma list (default: all available + local docker)")
         if name == "stop":
             p.add_argument("--all", action="store_true", help="every sandbox of ours, any owner"); p.add_argument("--dry-run", action="store_true")
             p.add_argument("--batch", type=int, default=0, help="delete N at a time ..."); p.add_argument("--pause", type=float, default=0, help="... then wait this many seconds")
     r = sub.add_parser("reap")
     r.add_argument("--owner"); r.add_argument("--run"); r.add_argument("--creating-older-than", type=float, default=8.0, help="minutes")
+    r.add_argument("--label", action="append", default=[], help="key=value the sandbox must carry (repeatable)")
+    for name in ("hold", "release", "holds"):
+        h = sub.add_parser(name)
+        if name != "holds":
+            h.add_argument("--label", action="append", default=[], help="key=value (repeatable)")
+        if name == "hold":
+            h.add_argument("--reason", default="")
     r.add_argument("--providers", default=""); r.add_argument("--dry-run", action="store_true")
     sub.add_parser("providers")
     for name in ("cost", "guard", "janitor", "audit", "sessions"):
@@ -126,6 +170,8 @@ def main(argv=None) -> int:
         return cmd_stop(a)
     if a.cmd == "reap":
         return cmd_reap(a)
+    if a.cmd in ("hold", "release", "holds"):
+        return cmd_hold(a)
     if a.cmd == "providers":
         return cmd_providers(a)
     if a.cmd == "cost":

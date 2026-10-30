@@ -244,8 +244,10 @@ def _dt_epoch(s: str):
     return dt.datetime.strptime(s[:19], "%Y-%m-%d %H:%M:%S").replace(tzinfo=dt.timezone.utc).timestamp() if s else None
 
 
-async def ls(owner=None, run=None, older_than_hours=None, providers=None) -> list:
-    """Sandboxes of ours alive now, optionally narrowed by owner, run and age. Includes local docker containers."""
+async def ls(owner=None, run=None, older_than_hours=None, providers=None, labels=None) -> list:
+    """Sandboxes of ours alive now, optionally narrowed by owner, run, age and `labels` (every key=value must match: e.g.
+    {"greenhouse.task": "t-0070"} for one unit of a run). Includes local docker containers."""
+    from .holds import matches
     now, out = time.time(), []
     live_by = await live([p for p in (providers or providers_available()) if p != "docker"])
     if (providers is None or "docker" in providers) and _docker_ok():
@@ -258,19 +260,21 @@ async def ls(owner=None, run=None, older_than_hours=None, providers=None) -> lis
                 continue
             if older_than_hours is not None and not (sb.created_at and (now - sb.created_at) / 3600.0 > older_than_hours):
                 continue
+            if labels and not matches(sb.labels, labels):
+                continue
             out.append(sb)
     return out
 
 
 async def stop(owner=None, run=None, older_than_hours=None, providers=None, all_ours: bool = False, dry_run: bool = False,
-               batch: int = 0, pause_s: float = 0.0, on_result=None) -> list:
-    """End sandboxes of ours: by owner (a project), by run, by age, or `all_ours`. A scope is required so nothing is stopped by
-    accident. Kills through each provider's own `kill`, then closes the cost-ledger entries of the ones that were deleted.
+               batch: int = 0, pause_s: float = 0.0, on_result=None, labels=None) -> list:
+    """End sandboxes of ours: by owner (a project), by run, by age, by `labels` (one unit of a run: {"greenhouse.task": ...}), or
+    `all_ours`. A scope is required so nothing is stopped by accident. Kills through each provider's own `kill`, then closes the cost-ledger entries of the ones that were deleted.
     Returns the sandboxes that were deleted (with `dry_run`: the ones that would be). A kill that fails is left alone (the next stop
     gets it), is not returned and is not closed in the ledger. `on_result(sandbox, error_or_None)` is called as each is handled."""
-    if not (owner or run or older_than_hours is not None or all_ours):
-        raise ValueError("stop needs a scope: owner=, run=, older_than_hours= or all_ours=True")
-    found = await ls(owner, run, older_than_hours, providers)
+    if not (owner or run or older_than_hours is not None or labels or all_ours):
+        raise ValueError("stop needs a scope: owner=, run=, older_than_hours=, labels= or all_ours=True")
+    found = await ls(owner, run, older_than_hours, providers, labels)
     if dry_run:
         for sb in found:
             if on_result:
@@ -308,11 +312,12 @@ def classify_state(state: str) -> str:
     return "running"
 
 
-async def reap(owner=None, run=None, creating_older_than_min: float = 8.0, providers=None, dry_run: bool = False) -> list:
+async def reap(owner=None, run=None, creating_older_than_min: float = 8.0, providers=None, dry_run: bool = False,
+               labels=None) -> list:
     """Delete our sandboxes that are broken: in an error state, or still `creating` after `creating_older_than_min` (the ghosts of
     timed-out create calls hold quota). Returns [(LiveSandbox, why)]."""
     now, out = time.time(), []
-    for sb in await ls(owner, run, None, providers):
+    for sb in await ls(owner, run, None, providers, labels):
         st = classify_state(sb.state)
         age_min = (now - sb.created_at) / 60.0 if sb.created_at else 0.0
         why = "error state" if st == "error" else (f"creating for {age_min:.0f} min" if st == "creating" and age_min > creating_older_than_min else None)
