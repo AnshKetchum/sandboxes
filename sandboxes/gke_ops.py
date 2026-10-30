@@ -221,6 +221,17 @@ def retry_pending_deletes(api) -> tuple[int, int]:
     return done, failed
 
 
+def our_pools(api, cfg: OpsConfig) -> list:
+    """Every sandbox pool that may hold nodes of ours: the catalog's, plus any pool whose nodes carry the sandbox pool label (one
+    made from another catalog or worktree, one disabled or dropped since): a node bills whichever config created it."""
+    names = list(cfg.sandbox_pools)
+    for n in api.list_node(label_selector="sandboxes.pool").items or []:
+        pool = (n.metadata.labels or {}).get("cloud.google.com/gke-nodepool")
+        if pool and pool not in names and pool != cfg.system_pool:
+            names.append(pool)
+    return names
+
+
 def scale_down_idle(api, cfg: OpsConfig, state: dict, now: float, active: int) -> list:
     """Resize the sandbox pools that still have nodes to 0 when none of our pods has existed for idle_scale_down_min. Returns
     the pools resized."""
@@ -231,7 +242,8 @@ def scale_down_idle(api, cfg: OpsConfig, state: dict, now: float, active: int) -
     idle_s = cfg.idle_scale_down_min * 60.0
     if now - float(state["last_busy"]) < idle_s or now - float(state.get("last_resize", 0)) < idle_s:
         return []
-    nodes = [n for n in gke_meter.nodes_from_api(api) if n.pool in cfg.sandbox_pools]
+    pools = our_pools(api, cfg)
+    nodes = [n for n in gke_meter.nodes_from_api(api) if n.pool in pools]
     if not nodes:
         return []
     blockers = foreign_pods_on(api, [n.name for n in nodes])
@@ -430,12 +442,13 @@ def teardown(api, cfg: Optional[OpsConfig] = None, *, run: Optional[str] = None,
             raise RuntimeError(f"gke: {len(others)} pod(s) of ours are still running ({others[:3]}...): not resizing the pools "
                                "under them. Tear down without --run first.")
     if pools and not delete_cluster:
-        for pool in cfg.sandbox_pools:
+        names = our_pools(api, cfg)
+        for pool in names:
             resize_pool(cfg, pool, 0)
             rep["resized"].append(pool)
         t0 = time.time()
         while wait and time.time() - t0 < NODE_GONE_WAIT_S:
-            if not [n for n in gke_meter.nodes_from_api(api) if n.pool in cfg.sandbox_pools]:
+            if not [n for n in gke_meter.nodes_from_api(api) if n.pool in names]:
                 break
             time.sleep(poll_s)
             rep["metered_usd"] += gke_meter.meter_once(api)
@@ -460,6 +473,7 @@ def cluster_pools(cfg: OpsConfig) -> dict:
                           "max_nodes": int(total) if total is not None else int(a.get("maxNodeCount") or 0) * max(1, len(zones)),
                           "disk_gb": int(c.get("diskSizeGb") or 0), "disk_type": c.get("diskType"), "zones": n.get("locations") or [],
                           "kubelet": {k: v for k, v in (c.get("kubeletConfig") or {}).items() if k in ("cpuManagerPolicy",)},
+                          "local_ssd": int((c.get("ephemeralStorageLocalSsdConfig") or {}).get("localSsdCount") or 0),
                           "ours": "sandboxes.pool" in (c.get("labels") or {})}
     return out
 
@@ -470,7 +484,8 @@ def disk_type_for(machine: str) -> str:
 
 def plan_pools(cfg: OpsConfig, current: dict) -> list:
     """What makes the cluster's sandbox pools match the catalog: [(action, name, detail)] with action create | update | replace |
-    delete | ok. A pool's machine, spot-ness and disk cannot change in place: those are `replace` (delete + create, empty only)."""
+    delete | ok. A pool's machine, spot-ness, disk and local SSDs cannot change in place: those are `replace` (delete + create,
+    empty only)."""
     actions = []
     from .gke_place import max_nodes_of
     zones = max(1, len(cfg.zones))
@@ -479,9 +494,11 @@ def plan_pools(cfg: OpsConfig, current: dict) -> list:
         want_disk, want_max = int(p.get("disk_gb", 1000)), max_nodes_of(p, zones)
         if cur is None:
             actions.append(("create", p["name"], f"{p['machine']} {'spot' if p.get('spot', True) else 'on demand'} 0..{want_max} nodes"))
-        elif (cur["machine"], cur["spot"], cur["disk_gb"]) != (p["machine"], bool(p.get("spot", True)), want_disk):
-            actions.append(("replace", p["name"], f"{cur['machine']}/{'spot' if cur['spot'] else 'od'}/{cur['disk_gb']}GB -> "
-                                                  f"{p['machine']}/{'spot' if p.get('spot', True) else 'od'}/{want_disk}GB"))
+        elif (cur["machine"], cur["spot"], cur["disk_gb"], cur.get("local_ssd", 0)) != \
+                (p["machine"], bool(p.get("spot", True)), want_disk, int(p.get("local_ssd", 0) or 0)):
+            actions.append(("replace", p["name"], f"{cur['machine']}/{'spot' if cur['spot'] else 'od'}/{cur['disk_gb']}GB"
+                                                  f"/{cur.get('local_ssd', 0)} SSD -> {p['machine']}/"
+                                                  f"{'spot' if p.get('spot', True) else 'od'}/{want_disk}GB/{p.get('local_ssd', 0)} SSD"))
         elif cur["max_nodes"] != want_max:
             actions.append(("update", p["name"], f"max {cur['max_nodes']} -> {want_max} nodes"))
         elif any(cur.get("kubelet", {}).get(k) != v for k, v in cfg.kubelet_config.items()):
@@ -509,6 +526,10 @@ def create_pool_args(cfg: OpsConfig, p: dict) -> list:
         args += ["--node-locations", ",".join(cfg.zones)]
     if p.get("spot", True):
         args.append("--spot")
+    if p.get("local_ssd"):
+        # pods' writable layers, emptyDirs and the image cache on local NVMe instead of the network boot disk (field notes
+        # 2026-10-30: the shared pd-balanced boot disk made solve/test runs ~2x slower than Modal)
+        args += ["--ephemeral-storage-local-ssd", f"count={int(p['local_ssd'])}"]
     if cfg.node_service_account:
         args += ["--service-account", cfg.node_service_account]
     if cfg.kubelet_config:
@@ -696,9 +717,18 @@ def residue(cfg: OpsConfig, mcfg: Optional[gke_meter.MeterConfig] = None) -> dic
                 continue
             mt = i.get("machineType", "").rsplit("/", 1)[-1]
             spot = (i.get("scheduling") or {}).get("provisioningModel") == "SPOT"
-            price = (mcfg.machine_prices.get(mt) or {}).get("spot" if spot else "ondemand")
-            items.append({"what": "VM", "detail": f"{i['name']} {mt}{' spot' if spot else ''}",
-                          "usd_month": (price or 0.0) * 730, **({} if price else {"unpriced": True})})
+            kind = "spot" if spot else "ondemand"
+            price = (mcfg.machine_prices.get(mt) or {}).get(kind)
+            # what bills with the VM besides the machine: local SSDs (SCRATCH disks, not in the disk listing) and external IPs
+            ssd_gib = sum(float(d.get("diskSizeGb") or 375) for d in i.get("disks") or [] if d.get("type") == "SCRATCH")
+            ips = sum(1 for nic in i.get("networkInterfaces") or [] for ac in nic.get("accessConfigs") or [] if ac.get("natIP"))
+            ssd_rate = (getattr(mcfg, "local_ssd_gib_month", None) or {"spot": 0.0478, "ondemand": 0.08})[kind]
+            ip_rate = (getattr(mcfg, "node_ip_hour", None) or {"spot": 0.0025, "ondemand": 0.005})[kind]
+            extra_h = ssd_gib * float(ssd_rate) / 730 + ips * float(ip_rate)
+            detail = f"{i['name']} {mt}{' spot' if spot else ''}" + (f" +{ssd_gib:.0f} GiB local SSD" if ssd_gib else "") \
+                + (f" +{ips} external IP" if ips else "")
+            items.append({"what": "VM", "detail": detail,
+                          "usd_month": ((price or 0.0) + extra_h) * 730, **({} if price else {"unpriced": True})})
 
     def disks():
         for d in _gjson("compute", "disks", "list", *P):
@@ -769,6 +799,7 @@ def main(argv=None) -> int:
     pl = sub.add_parser("pools")
     pl.add_argument("action", choices=["plan", "apply"]); pl.add_argument("--replace", action="store_true")
     pl.add_argument("--prune", action="store_true")
+    pl.add_argument("--only", nargs="+", default=None, help="act on these pools only (others may be in use)")
     sub.add_parser("up")
     d = sub.add_parser("down"); d.add_argument("--no-wait", action="store_true")
     sub.add_parser("residue")
@@ -784,7 +815,7 @@ def main(argv=None) -> int:
         return 0
     if a.cmd == "pools":
         cfg = OpsConfig.load()
-        actions = plan_pools(cfg, cluster_pools(cfg))
+        actions = [x for x in plan_pools(cfg, cluster_pools(cfg)) if not a.only or x[1] in a.only]
         for action, name, detail in actions:
             print(f"  {action:<8} {name:<24} {detail}")
         if a.action == "apply":

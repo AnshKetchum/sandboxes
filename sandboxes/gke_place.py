@@ -33,6 +33,9 @@ HOURS_PER_MONTH = 730.0
 HYPERDISK_ONLY = ("c4", "c4a", "c4d", "n4", "n4d", "x4", "h4d")      # families that boot only from Hyperdisk
 COOLDOWN_S = 600.0                     # a pool that could not get a node is skipped this long
 EPS = 1e-6                             # room is counted in floats: 0.95 subtracted 90 times must still leave the 91st slot
+LOCAL_SSD_GIB = 375.0                  # one local NVMe SSD (a pool's `local_ssd` counts these)
+LOCAL_SSD_GIB_MONTH = {"spot": 0.0478, "ondemand": 0.08}   # us-central1 catalog, 2026-10-30 (gke_meter.local_ssd_gib_month)
+NODE_IP_HOUR = {"spot": 0.0025, "ondemand": 0.005}         # a node's external IPv4 (gke_meter.node_ip_hour)
 
 
 def _fits(r, shape: "Shape") -> bool:
@@ -64,6 +67,19 @@ def reserved_mem_gib(mem_gib: float) -> float:
 def allocatable_disk_gib(disk_gib: float) -> float:
     """Boot disk left for pods: 10% eviction threshold, and the system's own reservation (35%, at most 6 GiB)."""
     return max(0.0, float(disk_gib) * 0.9 - min(0.35 * float(disk_gib), 6.0))
+
+
+def allocatable_local_ssd_gib(count: int) -> float:
+    """Ephemeral storage on `count` local SSDs (a pool made with --ephemeral-storage-local-ssd: pods' writable layers, emptyDirs
+    and the image cache all live there, not on the boot disk): 10% eviction threshold, and the system's reservation (50 GiB
+    for one SSD, 75 for two, 100 for three or more)."""
+    n = int(count)
+    return max(0.0, n * LOCAL_SSD_GIB * 0.9 - (50.0 if n == 1 else 75.0 if n == 2 else 100.0))
+
+
+def local_ssd_hour(count: int, spot: bool, gib_month: Optional[dict] = None) -> float:
+    rate = (gib_month or LOCAL_SSD_GIB_MONTH)["spot" if spot else "ondemand"]
+    return int(count) * LOCAL_SSD_GIB * float(rate) / HOURS_PER_MONTH
 
 
 @dataclass
@@ -109,14 +125,17 @@ class Machine:
         return self.spot_h if spot else self.ondemand_h
 
 
-def per_node(m: Machine, shape: Shape, disk_gib: Optional[float] = None, max_pods: int = 256, oh: Overhead = Overhead()) -> int:
-    """How many sandboxes of `shape` fit one node of `m` (with a boot disk of `disk_gib`; None: the disk is sized to fit)."""
+def per_node(m: Machine, shape: Shape, disk_gib: Optional[float] = None, max_pods: int = 256, oh: Overhead = Overhead(),
+             local_ssd: int = 0) -> int:
+    """How many sandboxes of `shape` fit one node of `m` (with a boot disk of `disk_gib`; None: the disk is sized to fit; with
+    `local_ssd` disks, pods' storage is on those instead of the boot disk)."""
     cpu = m.vcpus - reserved_cpu(m.vcpus) - oh.cpu
     mem = m.mem_gib - reserved_mem_gib(m.mem_gib) - oh.mem_gib
     fits = [int(cpu // shape.cpu_req) if shape.cpu_req else 10 ** 6, int(mem // shape.mem_gib) if shape.mem_gib else 10 ** 6,
             max_pods - oh.pods]
-    if disk_gib is not None and shape.disk_req:
-        fits.append(int(max(0.0, allocatable_disk_gib(disk_gib) - oh.image_cache_gib) // shape.disk_req))
+    if shape.disk_req and (local_ssd or disk_gib is not None):
+        eph = allocatable_local_ssd_gib(local_ssd) if local_ssd else allocatable_disk_gib(disk_gib)
+        fits.append(int(max(0.0, eph - oh.image_cache_gib) // shape.disk_req))
     return max(0, min(fits))
 
 
@@ -180,11 +199,19 @@ class Pool:
     disk_gib: int
     max_nodes: int                             # over all its zones
     disk_type: str = ""
+    local_ssd: int = 0                         # local NVMe SSDs holding the pods' storage (0: the boot disk holds it)
+    local_ssd_gib_month: Optional[dict] = None
 
     @property
     def node_h(self) -> Optional[float]:
         p = self.machine.price(self.spot)
-        return None if p is None else p + disk_hour(self.disk_gib)
+        if p is None:
+            return None
+        return (p + disk_hour(self.disk_gib) + local_ssd_hour(self.local_ssd, self.spot, self.local_ssd_gib_month)
+                + NODE_IP_HOUR["spot" if self.spot else "ondemand"])
+
+    def per_node(self, shape: Shape, max_pods: int = 256, oh: Overhead = Overhead()) -> int:
+        return per_node(self.machine, shape, self.disk_gib, max_pods, oh, self.local_ssd)
 
 
 @dataclass
@@ -230,7 +257,7 @@ def load_catalog(path: Optional[os.PathLike] = None) -> tuple:
         pr = prices.get(mt) or {}
         m = Machine(mt, float(shapes[mt]["vcpus"]), float(shapes[mt]["mem_gib"]), pr.get("spot"), pr.get("ondemand"))
         pools.append(Pool(e["name"], m, bool(e.get("spot", True)), int(e.get("disk_gb", 1000)), max_nodes_of(e, zones),
-                          e.get("disk_type", "")))
+                          e.get("disk_type", ""), int(e.get("local_ssd", 0) or 0), meter.get("local_ssd_gib_month")))
     oh = Overhead(**(g.get("node_overhead") or {}))
     return pools, oh, int(g.get("max_pods_per_node", 256))
 
@@ -248,7 +275,7 @@ def place(shape: Shape, pools: list, snap: Optional[Snapshot] = None, *, oh: Ove
             continue
         if (spot == "only" and not p.spot) or (spot == "never" and p.spot) or p.node_h is None:
             continue
-        n = per_node(p.machine, shape, p.disk_gib, max_pods, oh)
+        n = p.per_node(shape, max_pods, oh)
         if n <= 0:
             continue
         cands.append((p, n, p.node_h / n))
@@ -385,8 +412,8 @@ def main(argv=None) -> int:
             print(("  " if a.max_usd_h is None or o.total_h <= a.max_usd_h else "x ") + o.line())
         return 0 if opts and (a.max_usd_h is None or opts[0].total_h <= a.max_usd_h) else 1
     pools, oh, max_pods = load_catalog()
-    for p in sorted(pools, key=lambda p: (p.node_h or 1e9) / max(1, per_node(p.machine, shape, p.disk_gib, max_pods, oh))):
-        n = per_node(p.machine, shape, p.disk_gib, max_pods, oh)
+    for p in sorted(pools, key=lambda p: (p.node_h or 1e9) / max(1, p.per_node(shape, max_pods, oh))):
+        n = p.per_node(shape, max_pods, oh)
         rate = (p.node_h / n) if n and p.node_h else None
         print(f"{p.name:<24} {p.machine.name:<18} {'spot' if p.spot else 'on demand':<9} {n:>4}/node  up to {p.max_nodes} nodes  "
               + (f"${rate:.5f}/sandbox-h" if rate else "does not fit"))

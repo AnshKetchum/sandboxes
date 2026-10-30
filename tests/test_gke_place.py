@@ -71,7 +71,7 @@ def pools(**ceil):
 def test_a_new_node_goes_to_the_pool_cheapest_per_sandbox():
     pl = place(UNIT, pools(), Snapshot())
     assert pl.pool == "c3d-180-spot" and pl.per_node == 174
-    assert pl.rate_h == pytest.approx((1.9732 + 2200 * 0.10 / 730) / 174)
+    assert pl.rate_h == pytest.approx((1.9732 + 2200 * 0.10 / 730 + gp.NODE_IP_HOUR["spot"]) / 174)     # machine + boot disk + IP
 
 
 def test_room_on_a_running_node_wins_over_a_cheaper_new_node():
@@ -154,7 +154,7 @@ def test_a_sandbox_lands_on_its_pool_and_its_entry_carries_its_share_of_the_node
     assert pod.spec.node_selector == {"sandboxes.pool": "c3d-180-spot"} and sb.pool == "c3d-180-spot"
     assert {"key": "sandboxes.pool", "operator": "Exists", "effect": "NoSchedule"} in pod.spec.tolerations
     opened = [e for e in ledger_events(catalog) if e["ev"] == "open"][0]
-    assert opened["usd_per_hour"] == pytest.approx((1.9732 + 2200 * 0.10 / 730) / 174, rel=1e-6)
+    assert opened["usd_per_hour"] == pytest.approx((1.9732 + 2200 * 0.10 / 730 + gp.NODE_IP_HOUR["spot"]) / 174, rel=1e-6)
     run(sb.stop())
 
 
@@ -208,3 +208,32 @@ def test_when_every_pool_fails_the_provider_reports_capacity_for_the_router(cata
     with pytest.raises(CapacityError):
         run(GKERaw(spec(extra={"capacity_wait_s": 0.02})).start())
     assert len(catalog.created) == 2 and not catalog.pods                 # each pool tried once, nothing left behind
+
+
+# -- local SSD pools ---------------------------------------------------------------------------------------------------------
+def test_a_local_ssd_pool_keeps_pod_storage_on_its_ssds_and_charges_them():
+    c3d90l = Machine("c3d-standard-90-lssd", 90, 360, 0.9866, 4.0859)
+    assert gp.allocatable_local_ssd_gib(1) == pytest.approx(375 * 0.9 - 50)
+    assert gp.allocatable_local_ssd_gib(2) == pytest.approx(750 * 0.9 - 75)
+    assert gp.allocatable_local_ssd_gib(8) == pytest.approx(3000 * 0.9 - 100)
+    pool = Pool("c3d-90-lssd-spot", c3d90l, True, 100, 2, local_ssd=8)
+    assert per_node(C3D90, UNIT, disk_gib=100) == 0                       # pods on a 100 GB boot disk: no room
+    assert pool.per_node(UNIT) == per_node(C3D90, UNIT) == 86             # on the SSDs: memory binds, the boot disk does not
+    assert pool.node_h == pytest.approx(0.9866 + 100 * 0.10 / 730 + 8 * 375 * 0.0478 / 730 + 0.0025)
+    od = Pool("c3d-90-lssd-od", c3d90l, False, 100, 2, local_ssd=8)
+    assert od.node_h == pytest.approx(4.0859 + 100 * 0.10 / 730 + 8 * 375 * 0.08 / 730 + 0.005)
+
+
+def test_the_catalog_reads_local_ssds_and_the_meter_charges_them(tmp_path):
+    import yaml
+    from sandboxes.gke_meter import MeterConfig, Node, node_price_hour
+    p = tmp_path / "gke.yaml"
+    p.write_text(yaml.safe_dump({
+        "gke": {"pools": [{"name": "l", "machine": "c3d-standard-90-lssd", "spot": True, "disk_gb": 100, "local_ssd": 8, "max_nodes": 2}]},
+        "gke_meter": {"machine_shapes": {"c3d-standard-90-lssd": {"vcpus": 90, "mem_gib": 360}},
+                      "machine_prices": {"c3d-standard-90-lssd": {"spot": 0.9866, "ondemand": 4.0859}},
+                      "local_ssd_gib_month": {"spot": 0.0478, "ondemand": 0.08}}}))
+    pools, _, _ = gp.load_catalog(p)
+    assert pools[0].local_ssd == 8
+    node = Node("gke-c-l-1", 0.0, "c3d-standard-90-lssd", True, "l", 90)
+    assert node_price_hour(node, MeterConfig.load(p)) == pytest.approx(pools[0].node_h)   # placement and meter agree

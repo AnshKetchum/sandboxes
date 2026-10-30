@@ -40,6 +40,9 @@ gke:
     - {name: n2d-96-spot, machine: n2d-standard-96, spot: true, disk_gb: 1250, max_nodes: 2}     # 91 a node; what quota allows today
     - {name: n2d-96-od, machine: n2d-standard-96, spot: false, disk_gb: 1250, max_nodes: 2}
     - {name: e2-32-spot, machine: e2-standard-32, spot: true, disk_gb: 600, max_nodes: 2}
+    # disk A/B (scripts/gke/bench.py): the same C3D node with pods on local NVMe vs on the pd-balanced boot disk
+    - {name: c3d-30-lssd-spot, machine: c3d-standard-30-lssd, spot: true, disk_gb: 100, local_ssd: 2, max_nodes: 1}
+    - {name: c3d-30-spot, machine: c3d-standard-30, spot: true, disk_gb: 400, max_nodes: 1}
   registry: us-central1-docker.pkg.dev/agentic-rollouts/envs    # built task images (ctx:<context digest>)
   build:
     bucket: agentic-rollouts-sandbox-builds   # Cloud Build source uploads; lifecycle rule deletes anything older than a day
@@ -67,6 +70,8 @@ gke_meter:
     c4d-standard-192: {vcpus: 192, mem_gib: 744}
     c4d-highmem-96: {vcpus: 96, mem_gib: 756}
     c3d-standard-90: {vcpus: 90, mem_gib: 360}
+    c3d-standard-30: {vcpus: 30, mem_gib: 120}
+    c3d-standard-30-lssd: {vcpus: 30, mem_gib: 120}
     c3d-standard-180: {vcpus: 180, mem_gib: 720}
     c3d-highmem-180: {vcpus: 180, mem_gib: 1440}
     c3d-highcpu-180: {vcpus: 180, mem_gib: 354}
@@ -80,6 +85,8 @@ gke_meter:
     c4d-standard-96: {spot: 2.0146, ondemand: 4.5358}   # Cloud Billing Catalog (scripts/gke/prices.py)
     c4d-highmem-96: {spot: 2.6554, ondemand: 5.9771}   # Cloud Billing Catalog (scripts/gke/prices.py)
     c3d-standard-90: {spot: 0.9866, ondemand: 4.0859}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c3d-standard-30: {spot: 0.3289, ondemand: 1.362}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c3d-standard-30-lssd: {spot: 0.3289, ondemand: 1.362}   # machine only: its 2 local SSDs are the pool's local_ssd
     c3d-standard-180: {spot: 1.9732, ondemand: 8.1718}   # Cloud Billing Catalog (scripts/gke/prices.py)
     c3d-highmem-180: {spot: 2.6629, ondemand: 11.0223}   # Cloud Billing Catalog (scripts/gke/prices.py)
     c3d-highcpu-180: {spot: 1.6225, ondemand: 6.7228}   # Cloud Billing Catalog (scripts/gke/prices.py)
@@ -87,6 +94,7 @@ gke_meter:
   fallback_vcpu_hour: {spot: 0.02, ondemand: 0.05}   # an unknown machine type: a deliberately high per-vCPU price
   disk_gb_month: 0.10                     # Hyperdisk Balanced capacity (C4D boots only from Hyperdisk); verify in billing
   pool_disk_gb: {default-pool: 50}       # sandbox pools: their catalog disk_gb
+  local_ssd_gib_month: {spot: 0.0478, ondemand: 0.08}   # "SSD backed Local Storage [attached to Spot Preemptible VMs]", us-central1
   default_disk_gb: 100
   cluster_fee_hour: 0.0                   # GKE's $0.10/h management fee is covered by the free tier ($74.40/month per billing account,
                                           # zonal and Autopilot clusters): `sandboxes` is the only cluster on billing account

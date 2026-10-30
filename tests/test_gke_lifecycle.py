@@ -109,6 +109,19 @@ def test_applying_the_plan_creates_tainted_labelled_pools_and_never_deletes_one_
     assert any(c[:4] == ["container", "node-pools", "delete", "old-sandboxes"] for c in g.calls)
 
 
+def test_a_local_ssd_pool_puts_pod_storage_on_nvme_and_a_change_of_ssds_is_a_replace(g):
+    p = {"name": "c3d-90-lssd-spot", "machine": "c3d-standard-90-lssd", "spot": True, "disk_gb": 100, "local_ssd": 8, "max_nodes": 2}
+    args = gke_ops.create_pool_args(cfg(), p)
+    assert args[args.index("--ephemeral-storage-local-ssd") + 1] == "count=8" and args[args.index("--disk-size") + 1] == "100"
+    assert "--ephemeral-storage-local-ssd" not in gke_ops.create_pool_args(cfg(), CATALOG[0])
+    c = cfg()
+    c.pools, c.sandbox_pools = [p], [p["name"]]
+    g.pools = {p["name"]: pool_json(p["name"], p["machine"], True, 100, 2)}
+    assert [a for a, _, _ in gke_ops.plan_pools(c, gke_ops.cluster_pools(c))] == ["replace"]      # made without the SSDs
+    g.pools[p["name"]]["config"]["ephemeralStorageLocalSsdConfig"] = {"localSsdCount": 8}
+    assert [a for a, _, _ in gke_ops.plan_pools(c, gke_ops.cluster_pools(c))] == ["ok"]
+
+
 # -- down and up -------------------------------------------------------------------------------------------------------------
 def test_down_leaves_no_pod_no_node_no_image_and_no_upload(g, k8s, monkeypatch):
     purged = {}
@@ -129,6 +142,15 @@ def test_down_leaves_no_pod_no_node_no_image_and_no_upload(g, k8s, monkeypatch):
     assert off and off[0] < sys_resize[0]                                    # autoscaling off first, or it would bring a node back
     assert rep["residue"]["items"] == [] and not [e for e in ledger_events(k8s) if e["ev"] == "open"
                                                   and e["id"] not in {x["id"] for x in ledger_events(k8s) if x["ev"] == "close"}]
+
+
+def test_down_also_empties_a_pool_of_ours_that_the_catalog_does_not_name(g, k8s):
+    """A pool made from another catalog (a benchmark's, another worktree's) or disabled since: its nodes bill all the same."""
+    k8s.nodes = [fk.make_node("gke-c-bench-1", time.time(), pool="bench-lssd", sandbox_pool="bench-lssd"),
+                 fk.make_node("gke-c-default-pool-1", time.time(), pool="default-pool", spot=False)]
+    gke_ops.down(k8s, cfg())
+    resized = {c[c.index("--node-pool") + 1] for c in g.calls if c[:3] == ["container", "clusters", "resize"]}
+    assert "bench-lssd" in resized and not k8s.nodes
 
 
 def test_up_brings_the_system_pool_back_and_waits_for_a_ready_node(g, k8s):
@@ -204,6 +226,10 @@ def test_residue_prices_everything_that_bills_while_idle_and_says_what_it_could_
         "container clusters list": [{"name": "c", "location": "us-central1-a"}],
         "compute instances list": [{"name": "gke-c-x", "status": "RUNNING", "machineType": "zones/a/machineTypes/c3d-standard-180",
                                     "scheduling": {"provisioningModel": "SPOT"}},
+                                   {"name": "gke-c-lssd", "status": "RUNNING", "machineType": "x/c3d-standard-180",
+                                    "scheduling": {"provisioningModel": "SPOT"},
+                                    "disks": [{"type": "PERSISTENT", "diskSizeGb": "100"}] + [{"type": "SCRATCH", "diskSizeGb": "375"}] * 2,
+                                    "networkInterfaces": [{"accessConfigs": [{"natIP": "34.1.2.3"}]}]},
                                    {"name": "stopped", "status": "TERMINATED", "machineType": "x/e2-small"}],
         "compute disks list": [{"name": "gke-c-x", "sizeGb": "2200", "type": "x/pd-balanced", "users": ["vm"]},
                                {"name": "pvc-lost", "sizeGb": "100", "type": "x/pd-ssd"}],
@@ -215,7 +241,11 @@ def test_residue_prices_everything_that_bills_while_idle_and_says_what_it_could_
     mcfg = type("M", (), {"machine_prices": {"c3d-standard-180": {"spot": 1.9732}}})()
     r = gke_ops.residue(cfg(), mcfg)
     what = {i["what"]: i for i in r["items"]}
-    assert what["VM"]["usd_month"] == pytest.approx(1.9732 * 730) and "stopped" not in json.dumps(r["items"])
+    vms = {i["detail"].split()[0]: i for i in r["items"] if i["what"] == "VM"}
+    assert vms["gke-c-x"]["usd_month"] == pytest.approx(1.9732 * 730) and "stopped" not in json.dumps(r["items"])
+    # local SSDs and an external IP bill with the VM, and are not in the disk listing
+    assert vms["gke-c-lssd"]["usd_month"] == pytest.approx(1.9732 * 730 + 750 * 0.0478 + 0.0025 * 730)
+    assert "750 GiB local SSD" in vms["gke-c-lssd"]["detail"] and "1 external IP" in vms["gke-c-lssd"]["detail"]
     assert what["ORPHANED disk"]["usd_month"] == pytest.approx(17.0) and what["disk"]["usd_month"] == pytest.approx(220.0)
     assert what["registry storage"]["usd_month"] == pytest.approx(0.95) and what["bucket storage"]["usd_month"] == pytest.approx(0.04)
     assert what["GKE cluster"]["usd_month"] == pytest.approx(73.0)
