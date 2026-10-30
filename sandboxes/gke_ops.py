@@ -67,7 +67,7 @@ ORPHAN_SLACK_S = 300.0          # Pending this long past its creator's wait: the
 STUCK_DELETING_S = 120.0        # still there this long after a delete: its node is gone; drop the object (grace 0 is a force delete)
 NODE_GONE_WAIT_S = 1200.0       # teardown --pools: how long to keep metering while the nodes drain
 ARTIFACT_PURGE_EVERY_S = 600.0  # unused images and stale build uploads are looked for this often
-HYPERDISK_ONLY = ("c4", "c4a", "c4d", "n4", "n4d", "x4", "h4d")
+HYPERDISK_ONLY = ("c4", "c4a", "c4d", "c4n", "n4", "n4d", "x4", "h4d")
 
 
 @dataclass
@@ -522,8 +522,9 @@ def create_pool_args(cfg: OpsConfig, p: dict) -> list:
             "--disk-size", str(int(p.get("disk_gb", 1000))), "--node-labels", f"sandboxes.pool={p['name']}",
             "--node-taints", f"sandboxes.pool={p['name']}:NoSchedule", "--workload-metadata", "GKE_METADATA",
             "--enable-image-streaming"]
-    if cfg.zones:
-        args += ["--node-locations", ",".join(cfg.zones)]
+    zones = p.get("zones") or cfg.zones                  # a pool's own zones: where its machine type is offered
+    if zones:
+        args += ["--node-locations", ",".join(zones)]
     if p.get("spot", True):
         args.append("--spot")
     if p.get("boot_iops"):

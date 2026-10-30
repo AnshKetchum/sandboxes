@@ -120,6 +120,8 @@ def test_a_local_ssd_pool_puts_pod_storage_on_nvme_and_a_change_of_ssds_is_a_rep
     hd = gke_ops.create_pool_args(cfg(), {"name": "n4d", "machine": "n4d-standard-96", "boot_iops": 30000, "boot_mbps": 1000})
     assert hd[hd.index("--disk-type") + 1] == "hyperdisk-balanced" and hd[hd.index("--boot-disk-provisioned-iops") + 1] == "30000"
     assert hd[hd.index("--boot-disk-provisioned-throughput") + 1] == "1000"
+    c4n = gke_ops.create_pool_args(cfg(), {"name": "c4n", "machine": "c4n-standard-96", "zones": ["us-central1-a"]})
+    assert c4n[c4n.index("--disk-type") + 1] == "hyperdisk-balanced" and c4n[c4n.index("--node-locations") + 1] == "us-central1-a"
     c = cfg()
     c.pools, c.sandbox_pools = [p], [p["name"]]
     g.pools = {p["name"]: pool_json(p["name"], p["machine"], True, 100, 2)}

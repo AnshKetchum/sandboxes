@@ -39,7 +39,8 @@ gke:
   # `boot_mbps`; 3,000 / 140 are included, which ~90 pods would share).
   # 1 vCPU / 4 GiB / 10 GB sandboxes per node: c3d-90-lssd 86, c3d-60-lssd 56, c2d-56 53, c2d-32 29, n2-96 / n2d-96 / n4d-96 91-92,
   # n4-64 60, e2-32 29: with every pool full, ~1,010 sandboxes in ~1,060 vCPUs of quota (N2D's 2 nodes included).
-  quotas: {C3D: 150, N2D: 200, C2D: 100, N2: 200, N4D: 200, N4: 200, E2: 72}   # us-central1, 2026-10-30 (CPUS_ALL_REGIONS 1300)
+  # us-central1, 2026-10-30. ALL: CPUS_ALL_REGIONS (1,300) less the system node and headroom for other projects' VMs
+  quotas: {C3D: 150, N2D: 200, C2D: 100, N2: 200, N4D: 200, N4: 200, E2: 72, C4N: 384, ALL: 1290}
   pools:
     # cheapest per sandbox first (spot, 2026-10-30 catalog): C3D $0.011/vCPU-h, half of N2D/C2D/E2 ($0.020-0.021), N4D/N4 $0.025-0.027
     - {name: c3d-90-lssd-spot, machine: c3d-standard-90-lssd, spot: true, disk_gb: 100, local_ssd: 8, max_nodes: 1}
@@ -48,14 +49,17 @@ gke:
     # granted 150)
     - {name: c3d-180-lssd-spot, machine: c3d-standard-180-lssd, spot: true, disk_gb: 100, local_ssd: 16, max_nodes: 6, enabled: false}
     - {name: n2d-96-spot, machine: n2d-standard-96, spot: true, disk_gb: 1250, max_nodes: 2}     # pods on pd-balanced: replace
-    # with n2d-96-lssd-spot (`pools apply --replace` needs it empty) and drop this one
-    - {name: n2d-96-lssd-spot, machine: n2d-standard-96, spot: true, disk_gb: 100, local_ssd: 16, max_nodes: 2, enabled: false}
+    # with n2d-96-lssd-spot once empty (the two share N2D's quota: placement fills the local-SSD one when this one is full)
+    - {name: n2d-96-lssd-spot, machine: n2d-standard-96, spot: true, disk_gb: 100, local_ssd: 16, max_nodes: 2}
     - {name: c2d-56-lssd-spot, machine: c2d-standard-56, spot: true, disk_gb: 100, local_ssd: 4, max_nodes: 1}
     - {name: c2d-32-lssd-spot, machine: c2d-standard-32, spot: true, disk_gb: 100, local_ssd: 2, max_nodes: 1}
     - {name: e2-32-spot, machine: e2-standard-32, spot: true, disk_gb: 600, max_nodes: 2}        # E2 has no local SSD
     - {name: n4d-96-spot, machine: n4d-standard-96, spot: true, disk_gb: 1250, boot_iops: 30000, boot_mbps: 1000, max_nodes: 2}
     - {name: n4-64-spot, machine: n4-standard-64, spot: true, disk_gb: 1000, boot_iops: 25000, boot_mbps: 800, max_nodes: 3}
     - {name: n2-96-lssd-spot, machine: n2-standard-96, spot: true, disk_gb: 100, local_ssd: 16, max_nodes: 2}
+    # C4N: offered in us-central1-a/b/c only; boots from Hyperdisk only
+    - {name: c4n-96-spot, machine: c4n-standard-96, spot: true, disk_gb: 1250, boot_iops: 25000, boot_mbps: 800, max_nodes: 4,
+       zones: [us-central1-a, us-central1-b, us-central1-c]}
     - {name: n2d-96-od, machine: n2d-standard-96, spot: false, disk_gb: 1250, max_nodes: 2}       # on-demand fallback
   registry: us-central1-docker.pkg.dev/agentic-rollouts/envs    # built task images (ctx:<context digest>)
   build:
@@ -74,6 +78,7 @@ gke:
 # Last refreshed 2026-10-27.
 gke_meter:
   machine_shapes:
+    c4n-standard-96: {vcpus: 96, mem_gib: 360}
     t2d-standard-60: {vcpus: 60, mem_gib: 240}
     n4d-standard-96: {vcpus: 96, mem_gib: 384}
     n4-standard-80: {vcpus: 80, mem_gib: 320}
@@ -100,6 +105,7 @@ gke_meter:
     c3d-highmem-180: {vcpus: 180, mem_gib: 1440}
     c3d-highcpu-180: {vcpus: 180, mem_gib: 354}
   machine_prices:
+    c4n-standard-96: {spot: 2.8846, ondemand: 7.5906}   # Cloud Billing Catalog (scripts/gke/prices.py)
     t2d-standard-60: {spot: 1.5209, ondemand: 2.5348}   # Cloud Billing Catalog (scripts/gke/prices.py)
     n4d-standard-96: {spot: 2.4378, ondemand: 4.0656}   # Cloud Billing Catalog (scripts/gke/prices.py)
     n4-standard-80: {spot: 2.1461, ondemand: 3.628}   # Cloud Billing Catalog (scripts/gke/prices.py)

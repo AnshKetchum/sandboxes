@@ -31,7 +31,7 @@ import yaml
 POOL_LABEL = "sandboxes.pool"          # node label and taint key of every sandbox pool; pods select one and tolerate them all
 DELETING_TAINT = "ToBeDeletedByClusterAutoscaler"   # on a node the cluster autoscaler is removing
 HOURS_PER_MONTH = 730.0
-HYPERDISK_ONLY = ("c4", "c4a", "c4d", "n4", "n4d", "x4", "h4d")      # families that boot only from Hyperdisk
+HYPERDISK_ONLY = ("c4", "c4a", "c4d", "c4n", "n4", "n4d", "x4", "h4d")      # families that boot only from Hyperdisk
 COOLDOWN_S = 600.0                     # a pool that could not get a node is skipped this long
 EPS = 1e-6                             # room is counted in floats: 0.95 subtracted 90 times must still leave the 91st slot
 MEM_VISIBLE = 0.983                    # the kernel keeps ~1.7% of a VM's memory before GKE reserves its share (live 2026-10-30:
@@ -218,6 +218,8 @@ class Pool:
     boot_iops: int = 0                         # Hyperdisk Balanced boot disk: provisioned IOPS / MB/s (0: the included 3,000 / 140)
     boot_mbps: int = 0
     family_quota: Optional[float] = None       # the region's vCPU quota for its machine family (gke.quotas), shared by its pools
+    all_quota: Optional[float] = None          # vCPUs every sandbox pool together may hold (gke.quotas.ALL: CPUS_ALL_REGIONS,
+                                               # less what runs outside the sandbox pools)
 
     @property
     def node_h(self) -> Optional[float]:
@@ -279,6 +281,7 @@ def load_catalog(path: Optional[os.PathLike] = None) -> tuple:
     quotas = {str(k).upper(): float(v) for k, v in (g.get("quotas") or {}).items()}
     for pool in pools:
         pool.family_quota = quotas.get(pool.machine.family.upper())
+        pool.all_quota = quotas.get("ALL")
     oh = Overhead(**(g.get("node_overhead") or {}))
     return pools, oh, int(g.get("max_pods_per_node", 256))
 
@@ -310,10 +313,12 @@ def place(shape: Shape, pools: list, snap: Optional[Snapshot] = None, *, oh: Ove
     used: dict = {}                                  # vCPUs of each machine family's nodes, over every pool of the family
     for p in pools:
         used[p.machine.family] = used.get(p.machine.family, 0.0) + snap.nodes.get(p.name, 0) * p.machine.vcpus
+    used_all = sum(used.values())
 
     def can_grow(p):
         return snap.nodes.get(p.name, 0) < p.max_nodes and \
-            (p.family_quota is None or used[p.machine.family] + p.machine.vcpus <= p.family_quota + EPS)
+            (p.family_quota is None or used[p.machine.family] + p.machine.vcpus <= p.family_quota + EPS) and \
+            (p.all_quota is None or used_all + p.machine.vcpus <= p.all_quota + EPS)
     cold = [(p, n, rate) for p, n, rate in cands if can_grow(p) and now >= cooldown.get(p.name, 0.0)]
     if not cold:
         cold = [(p, n, rate) for p, n, rate in cands if can_grow(p)]                               # all cooling: try anyway

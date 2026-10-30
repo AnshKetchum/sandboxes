@@ -19,6 +19,7 @@ Environment (one value per machine: fleet operations such as the janitor see onl
   GKE_KUBE_CONTEXT   kubeconfig context (default: the current one)
 Configuration (the provider config's `extra:` mapping):
   node_selector     {...}              e.g. {"sandboxes.pool": "sandbox"}
+  pool / exclude_pools  a catalog pool to use only / pools never to use (e.g. ones another run's sandboxes fill)
   tolerations       [...]              e.g. the sandbox pool's taint and cloud.google.com/gke-spot
   runtime_class     "gvisor" or unset
   cpu_request       fraction of `cpu` requested (default 0.95, so N one-vCPU pods fit an N-vCPU node's allocatable)
@@ -681,7 +682,7 @@ class GKERaw(RawSandbox):
                          x.get("ephemeral_request_gb"))
         try:
             return gp.PLACER.choose(_core(), shape, pools, oh=oh, max_pods=max_pods, spot=x.get("spot", "prefer"),
-                                    only=x.get("pool"), exclude=exclude)
+                                    only=x.get("pool"), exclude=tuple(exclude) + tuple(x.get("exclude_pools") or ()))
         except LookupError as e:
             raise CapacityError("gke", str(e))
 

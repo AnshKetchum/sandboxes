@@ -202,6 +202,12 @@ def test_with_a_catalog_a_pool_gets_300_s_to_find_a_node_before_the_next_is_trie
     run(sb.stop())
 
 
+def test_excluded_pools_are_never_placed_on(catalog):
+    sb = GKERaw(spec(cpu=1, mem_gb=4, disk_gb=10, extra={"exclude_pools": ["c3d-180-spot"]})); run(sb.start())
+    assert sb.pool and sb.pool != "c3d-180-spot"
+    run(sb.stop())
+
+
 def test_when_every_pool_fails_the_provider_reports_capacity_for_the_router(catalog):
     from sandboxes.errors import CapacityError
     catalog.on_create = lambda pod: fk.set_unschedulable(pod)
@@ -295,3 +301,12 @@ def test_the_model_packs_what_live_nodes_really_hold():
     a c3d-standard-90-lssd 84 (339.61 GiB): the model said 56 and 86 before it counted the kernel's memory and the DaemonSets."""
     assert per_node(Machine("c3d-standard-60-lssd", 60, 240), UNIT) == int((223.99 - 1.07) // 4) == 55
     assert per_node(Machine("c3d-standard-90-lssd", 90, 360), UNIT) == int((339.61 - 1.07) // 4) == 84
+
+
+def test_every_pool_together_stays_under_the_projects_vcpu_quota():
+    """CPUS_ALL_REGIONS (1,300 here) caps all families together: the next node of any pool past it is not asked for."""
+    ps = [Pool("n2d-96-spot", N2D96, True, 1250, 4, family_quota=400, all_quota=300),
+          Pool("c3d-180-spot", C3D180, True, 2200, 4, all_quota=300)]
+    assert place(UNIT, ps, Snapshot(nodes={"c3d-180-spot": 1})).pool == "n2d-96-spot"      # 180 + 96 <= 300
+    with pytest.raises(LookupError, match="quota"):
+        place(UNIT, ps, Snapshot(nodes={"c3d-180-spot": 1, "n2d-96-spot": 1}))            # 276 + 96 > 300
