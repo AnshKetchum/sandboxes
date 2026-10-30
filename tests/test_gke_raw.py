@@ -54,6 +54,8 @@ def k8s(tmp_path, monkeypatch):
     monkeypatch.setattr(gke_raw, "_core", lambda: api)
     monkeypatch.setattr(gke_raw, "_stream_exec", fk.local_exec)
     monkeypatch.setattr(gke_raw, "POLL_S", 0.01)
+    from sandboxes import gke_meter                     # a start's meter pass runs inline here: a background one could outlive
+    monkeypatch.setattr(gke_raw, "_meter_in_background", lambda: gke_meter.meter_once(api))   # the test's ledger redirect
     import sandboxes.raw as raw_mod                    # RawSandbox.start backs off 10 s after a failed attempt: not here
     monkeypatch.setattr(raw_mod, "asyncio", FastAsyncio())
     from sandboxes import fleet as fleet_mod
@@ -498,3 +500,56 @@ def test_whole_cpu_sandboxes_are_guaranteed_with_integer_cpus():
     assert r["requests"]["cpu"] == r["limits"]["cpu"] == "1" and r["requests"]["memory"] == r["limits"]["memory"] == "4Gi"
     r = pod_manifest("sbx-1", spec(cpu=2, extra={"cpu_request": 0.95}), "ns")["spec"]["containers"][0]["resources"]
     assert (r["requests"]["cpu"], r["limits"]["cpu"]) == ("1.9", "2")
+
+
+def scripted_stream(batches: list, status: dict):
+    """A real WSClient whose update() delivers the next batch of (channel, bytes) frames the way the client does (channel
+    buffer `+=` and the combined buffer), then the exit status and the close."""
+    ws = finished_stream(b"", b"", status)
+    ws._connected, ws._channels = True, {}
+    left, seen = list(batches), {"max": 0}
+
+    def update(timeout=0):
+        if not left:
+            ws._channels[3] = json.dumps(status).encode()
+            ws._connected = False
+            return
+        for ch, data in left.pop(0):
+            ws._all.write(data)
+            ws._channels[ch] = ws._channels.get(ch, b"") + data
+        seen["max"] = max(seen["max"], len(ws._channels.get(1, b"")))
+    ws.update = update
+    return ws, seen
+
+
+def test_the_pump_reads_everything_in_order_without_letting_a_channel_buffer_grow():
+    batches = [[(1, b"o%d " % i), (2, b"e%d " % i)] for i in range(500)] + [[(1, b"x" * 100)] * 3]
+    ws, seen = scripted_stream(batches, {"status": "Success"})
+    rc, out = gke_raw.pump(ws, timeout=30, stdout_only=False)
+    want = b"".join(b"o%d e%d " % (i, i) for i in range(500)) + b"x" * 300
+    assert rc == 0 and out == want                                            # stdout and stderr interleaved as they came
+    assert seen["max"] <= 300                                                 # emptied after every update, never accumulated
+    ws, _ = scripted_stream(batches, {"status": "Failure", "details": {"causes": [{"reason": "ExitCode", "message": "2"}]}})
+    rc, out = gke_raw.pump(ws, timeout=30, stdout_only=True)
+    assert rc == 2 and out == b"".join(b"o%d " % i for i in range(500)) + b"x" * 300
+
+
+def test_the_pump_gives_up_at_its_timeout_without_an_exit_code():
+    ws, _ = scripted_stream([[(1, b"a")]] * 10 ** 6, {"status": "Success"})
+    rc, out = gke_raw.pump(ws, timeout=0.2, stdout_only=True)
+    assert rc is None and out.startswith(b"a")
+
+
+def test_exec_asks_for_the_v4_protocol(monkeypatch):
+    """v5 goes through the API server's stream translator, which dropped output tails under load (live)."""
+    import kubernetes.stream as ks
+    seen = {}
+
+    def fake_stream(fn, *a, **kw):
+        seen.update(kw)
+        ws, _ = scripted_stream([[(1, b"ok")]], {"status": "Success"})
+        return ws
+    monkeypatch.setattr(ks, "stream", fake_stream)
+    monkeypatch.setattr(gke_raw, "_exec_api", lambda: type("Api", (), {"connect_get_namespaced_pod_exec": None})())
+    assert gke_raw._stream_exec(None, "p", "ns", ["true"], stdin=None, timeout=10, stdout_only=False) == (0, b"ok")
+    assert seen["_headers"] == {"sec-websocket-protocol": "v4.channel.k8s.io"}

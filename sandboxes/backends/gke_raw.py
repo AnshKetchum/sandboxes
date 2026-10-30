@@ -379,7 +379,11 @@ def live_state(pod) -> str:
 
 
 # -- exec seam (the one place that talks to the exec websocket; tests replace it) ----------------------------------------------
-ERROR_CHANNEL = 3
+STDOUT_CHANNEL, STDERR_CHANNEL, ERROR_CHANNEL = 1, 2, 3
+# v4: the API server proxies the stream to the kubelet. v5 (the client's first choice) goes through the API server's
+# SPDY-to-websocket translator, which lost output tails under load (live, 40 concurrent 16 MiB reads: 3 short with exit
+# code 0) and was 2.6x slower. v4 cannot half-close stdin; nothing here relies on that (uploads end with `head -c N`).
+EXEC_PROTOCOL = os.environ.get("GKE_EXEC_PROTOCOL", "v4.channel.k8s.io")
 
 
 def exit_code(resp) -> Optional[int]:
@@ -403,6 +407,29 @@ def exit_code(resp) -> Optional[int]:
             except (TypeError, ValueError):
                 return None
     return None
+
+
+def pump(resp, timeout: float, stdout_only: bool) -> tuple[Optional[int], bytes]:
+    """Read a stream to its end (or `timeout`): (exit code, output). What resp.run_forever + collect_exec did, without the
+    client's quadratic buffering: it grows each channel's buffer with `bytes +=` per frame, so a 16 MiB output cost ~4 GB of
+    copying (40 concurrent 16 MiB reads: 27 s each, 6.5 s pumped). The channels are emptied after every update; stdout and
+    stderr together come from the client's own linear buffer of both, in the order they arrived."""
+    out = []
+    deadline = time.time() + timeout
+    while resp.is_open():
+        left = deadline - time.time()
+        if left <= 0:
+            break
+        resp.update(timeout=min(left, 5.0))
+        chunk = resp._channels.pop(STDOUT_CHANNEL, None)
+        resp._channels.pop(STDERR_CHANNEL, None)
+        if chunk and stdout_only:
+            out.append(chunk if isinstance(chunk, (bytes, bytearray)) else chunk.encode())
+    rc = exit_code(resp)
+    if stdout_only:
+        return rc, b"".join(out)
+    allbuf = resp._all.getvalue() if getattr(resp, "_all", None) is not None else b""
+    return rc, allbuf if isinstance(allbuf, (bytes, bytearray)) else allbuf.encode()
 
 
 def collect_exec(resp, stdout_only: bool) -> tuple[Optional[int], bytes]:
@@ -437,13 +464,13 @@ def _stream_exec(api, name: str, namespace: str, argv: list, *, stdin: Optional[
     from kubernetes.stream import stream
     api = _exec_api()
     resp = stream(api.connect_get_namespaced_pod_exec, name, namespace, command=argv, container=CONTAINER,
-                  stderr=True, stdin=stdin is not None, stdout=True, tty=False, _preload_content=False, binary=True)
+                  stderr=True, stdin=stdin is not None, stdout=True, tty=False, _preload_content=False, binary=True,
+                  _headers={"sec-websocket-protocol": EXEC_PROTOCOL})
     try:
         if stdin is not None:
             for i in range(0, len(stdin), STDIN_CHUNK):
                 resp.write_stdin(stdin[i:i + STDIN_CHUNK])
-        resp.run_forever(timeout=timeout)
-        return collect_exec(resp, stdout_only)
+        return pump(resp, timeout, stdout_only)
     finally:
         try:
             resp.close()
@@ -536,11 +563,16 @@ def _meter_in_background() -> None:
     that waited for it was that much slower. One in flight per process; meter_once itself skips passes < 30 s apart."""
     if not _METERING.acquire(blocking=False):
         return
+    try:
+        api = _core()
+    except Exception:  # noqa: BLE001
+        _METERING.release()
+        return
 
     def run():
         try:
             from .. import gke_meter
-            gke_meter.meter_once(_core())
+            gke_meter.meter_once(api)
         except Exception:  # noqa: BLE001 — metering must never block or fail a sandbox
             pass
         finally:
