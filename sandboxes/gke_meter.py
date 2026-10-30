@@ -286,21 +286,12 @@ def nodes_from_api(api) -> list:
 
 def ledger_entries(paths=None, closed_since: Optional[float] = None) -> tuple[dict, dict]:
     """(sid -> open entry, sid -> (entry, close time) for entries closed after `closed_since`) of this provider, every ledger."""
+    from .cost import _replay
     opens, closed = {}, {}
     for p in paths if paths is not None else all_ledger_paths():
-        try:
-            with open(p) as f:
-                for line in f:
-                    try:
-                        r = json.loads(line)
-                    except ValueError:
-                        continue
-                    if r.get("ev") == "open" and r.get("provider") == PROVIDER and r.get("sid"):
-                        opens[r["id"]] = r
-                    elif r.get("ev") == "close":
-                        closed[r["id"]] = float(r.get("t") or 0.0)
-        except OSError:
-            continue
+        o, c, _ = _replay(Path(p), None)                  # incremental: only lines appended since the last pass are parsed
+        opens.update({h: r for h, r in o.items() if r.get("provider") == PROVIDER and r.get("sid")})
+        closed.update({h: float(r.get("t") or 0.0) for h, r in c.items()})
     still = {r["sid"]: r for h, r in opens.items() if h not in closed}
     recent = {r["sid"]: (r, closed[h]) for h, r in opens.items()
               if h in closed and closed_since is not None and closed[h] > float(closed_since)}

@@ -171,6 +171,54 @@ def get_ledger() -> CostLedger:
 
 
 # -- reading ---------------------------------------------------------------------------------------------
+_REPLAY: dict = {}
+_REPLAY_LOCK = threading.Lock()
+_TAIL = 256
+
+
+def _replay(path: Path, run: Optional[str]) -> tuple[dict, dict, dict]:
+    """A ledger's opens, closes and storage charges (copies), read incrementally: a ledger only grows by appends, so a call parses
+    just the lines added since the previous one. Re-reading every ledger in full took ~3.5 s for the ~60 MB a busy machine holds,
+    on every spend check (each sandbox start, at most every 30 s), blocking the caller's event loop while it ran. A ledger
+    replaced (new inode), shortened, or rewritten in place (the bytes before the read position changed) is read again whole."""
+    key = (str(path), run)
+    with _REPLAY_LOCK:
+        try:
+            st = os.stat(path)
+        except OSError:
+            _REPLAY.pop(key, None)
+            return {}, {}, {}
+        c = _REPLAY.get(key)
+        with open(path, "rb") as f:
+            if c is not None and c["ino"] == st.st_ino and st.st_size >= c["off"]:
+                f.seek(max(0, c["off"] - _TAIL))
+                if f.read(min(_TAIL, c["off"])) != c["tail"]:
+                    c = None
+            if c is None or c["ino"] != st.st_ino or st.st_size < c["off"]:
+                c = _REPLAY[key] = {"ino": st.st_ino, "off": 0, "tail": b"", "opens": {}, "closes": {},
+                                    "storage": defaultdict(float)}
+            f.seek(c["off"])
+            data = f.read()
+        end = data.rfind(b"\n") + 1                     # a line still being written is read next time
+        for line in data[:end].splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if run is not None and r.get("run", "") != run:
+                continue
+            if r.get("ev") == "open":
+                c["opens"][r["id"]] = r
+            elif r.get("ev") == "close":
+                c["closes"][r["id"]] = r
+            elif r.get("ev") == "storage":
+                c["storage"][r["provider"]] += r.get("usd", 0.0)
+        if end:
+            c["off"] += end
+            c["tail"] = (c["tail"] + data[:end])[-_TAIL:]
+        return dict(c["opens"]), dict(c["closes"]), dict(c["storage"])
+
+
 def summary(path: Optional[os.PathLike] = None, *, run: Optional[str] = None, models: Optional[dict] = None,
             now: Optional[float] = None) -> dict:
     """Replay the ledger. Returns per-provider and overall totals in dollars:
@@ -182,24 +230,7 @@ def summary(path: Optional[os.PathLike] = None, *, run: Optional[str] = None, mo
     path = Path(path) if path else default_ledger_path()
     now = now or time.time()
     models = models or {}
-    opens: dict[str, dict] = {}
-    closes: dict[str, dict] = {}
-    storage = defaultdict(float)
-    if path.exists():
-        with open(path) as f:
-            for line in f:
-                try:
-                    r = json.loads(line)
-                except ValueError:
-                    continue
-                if run is not None and r.get("run", "") != run:
-                    continue
-                if r["ev"] == "open":
-                    opens[r["id"]] = r
-                elif r["ev"] == "close":
-                    closes[r["id"]] = r
-                elif r["ev"] == "storage":
-                    storage[r["provider"]] += r.get("usd", 0.0)
+    opens, closes, storage = _replay(path, run)
     out: dict[str, dict] = {}
 
     def row(p):
