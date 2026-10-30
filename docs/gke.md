@@ -38,7 +38,10 @@ What a run on this backend sees today (us-central1, measured 2026-10-30 with `sc
 
 **How many.** Up to ~1,150 sandboxes of 1 vCPU / 4 GiB / 10 GB at once, if nothing else runs on the project: the catalog's spot
 pools across seven machine families, capped by the project's 1,300 vCPUs. 1,000 at once was measured with other runs beside it.
-The namespace quota (1,000 pods / 1,000 requested vCPUs unless raised) and the machine-wide spend caps can stop a run first.
+The namespace quota (1,000 pods / 1,000 requested vCPUs unless raised) and the spend caps can stop a run first: the
+machine-wide caps (`~/.cache/sandboxes/caps.json`), and the provider entry's `spend_cap_usd` (configs/gke.yaml: $50), which
+the router checks against the run's own ledger (its session) and then stops choosing GKE: $50 is ~1.5 hours of a
+1,000-sandbox fleet, so raise it in the run's sandbox config for a large run.
 Past the ceiling, a start raises `CapacityError` (immediately when every pool is at its node or quota limit, after up to 300 s
 when a pool cannot get a node), and the router can send it to another provider. A sandbox asking for more than a node holds
 is refused at once.
