@@ -60,7 +60,12 @@ gke:
     # C4N: offered in us-central1-a/b/c only; boots from Hyperdisk only
     - {name: c4n-96-spot, machine: c4n-standard-96, spot: true, disk_gb: 1250, boot_iops: 25000, boot_mbps: 800, max_nodes: 4,
        zones: [us-central1-a, us-central1-b, us-central1-c]}
-    - {name: n2d-96-od, machine: n2d-standard-96, spot: false, disk_gb: 1250, max_nodes: 2}       # on-demand fallback
+    # on-demand fallbacks: placement takes them only when no spot pool can grow (or every one is cooling down after a spot
+    # stockout: n2-standard-96 spot was out in all four zones on 2026-10-30). Each shares its family's quota with the spot pool
+    - {name: n2d-96-od, machine: n2d-standard-96, spot: false, disk_gb: 1250, max_nodes: 2}
+    - {name: n2-96-lssd-od, machine: n2-standard-96, spot: false, disk_gb: 100, local_ssd: 16, max_nodes: 2}
+    - {name: c4n-96-od, machine: c4n-standard-96, spot: false, disk_gb: 1250, boot_iops: 25000, boot_mbps: 800, max_nodes: 4,
+       zones: [us-central1-a, us-central1-b, us-central1-c]}
   registry: us-central1-docker.pkg.dev/agentic-rollouts/envs    # built task images (ctx:<context digest>)
   build:
     bucket: agentic-rollouts-sandbox-builds   # Cloud Build source uploads; lifecycle rule deletes anything older than a day

@@ -262,7 +262,12 @@ async def run_ramp(args, api) -> list:
             print(f"  {progress['done']}/{args.count} settled at {time.time() - t0:.0f}s", flush=True)
         return b
 
-    boxes = await asyncio.gather(*(one(r) for r in recs))
+    tasks = [asyncio.ensure_future(one(r)) for r in recs]
+    try:
+        boxes = await asyncio.gather(*tasks)
+    except BaseException:                       # interrupted while opening: stop whatever did open
+        await stop_all([t.result() for t in tasks if t.done() and not t.cancelled() and t.exception() is None])
+        raise
     t_open = time.time() - t0
     try:
         live = [(b, r) for b, r in zip(boxes, recs) if b is not None]

@@ -310,3 +310,29 @@ def test_every_pool_together_stays_under_the_projects_vcpu_quota():
     assert place(UNIT, ps, Snapshot(nodes={"c3d-180-spot": 1})).pool == "n2d-96-spot"      # 180 + 96 <= 300
     with pytest.raises(LookupError, match="quota"):
         place(UNIT, ps, Snapshot(nodes={"c3d-180-spot": 1, "n2d-96-spot": 1}))            # 276 + 96 > 300
+
+
+def test_pods_waiting_for_a_node_hold_their_pools_room_across_a_refresh(k8s):
+    """Live, 1,000 at once: each 15 s refresh forgot placements whose node had not come up, and sent the next pods to the
+    same (cheapest) pool again: 372 pods for a 2-node pool of 180, none for the next pool."""
+    from types import SimpleNamespace
+    pools_ = pools(c3d=1, n2d=2)                                             # c3d-180-spot: 1 node of 171; then n2d-96-spot
+    for i in range(171):                                                     # placed on c3d, no node yet
+        k8s.pods[f"p{i}"] = SimpleNamespace(
+            metadata=SimpleNamespace(name=f"p{i}", deletion_timestamp=None),
+            spec=SimpleNamespace(node_name=None, node_selector={"sandboxes.pool": "c3d-180-spot"},
+                                 containers=[SimpleNamespace(resources=SimpleNamespace(
+                                     requests={"cpu": "1", "memory": "4Gi", "ephemeral-storage": "10Gi"}))]),
+            status=SimpleNamespace(phase="Pending"))
+    placer = gp.Placer(refresh_s=0.0)                                        # a refresh before every choice
+    got = placer.choose(k8s, UNIT, pools_, oh=Overhead())
+    assert got.pool == "n2d-96-spot"                                          # c3d's one node is spoken for
+
+
+def test_a_node_still_coming_up_offers_its_room(k8s):
+    node = fk.make_node("n-new", time.time(), sandbox_pool="n2d-96-spot", ready=False,
+                        allocatable={"cpu": "95290m", "memory": "362Gi", "ephemeral-storage": "1100Gi", "pods": "256"})
+    k8s.nodes = [node]
+    snap = gp.snapshot_from_api(k8s, {"n2d-96-spot"})
+    assert snap.nodes == {"n2d-96-spot": 1} and len(snap.room["n2d-96-spot"]) == 1
+    assert place(UNIT, pools(), snap).reason == "room on a running node"

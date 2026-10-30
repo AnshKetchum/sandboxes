@@ -237,7 +237,8 @@ class Pool:
 class Snapshot:
     """What the sandbox pools hold now: nodes per pool, and per node the room left (cpu, mem GiB, disk GiB, pods)."""
     nodes: dict = field(default_factory=dict)          # pool -> number of nodes (up or coming)
-    room: dict = field(default_factory=dict)           # pool -> [[cpu, mem, disk, pods], ...] per ready node
+    room: dict = field(default_factory=dict)           # pool -> [[cpu, mem, disk, pods], ...] per schedulable node
+    pending: dict = field(default_factory=dict)        # pool -> [(cpu, mem GiB, disk GiB), ...] of pods not yet on a node
     taken_at: float = 0.0
 
 
@@ -367,14 +368,24 @@ def snapshot_from_api(api, pool_names) -> Snapshot:
             continue                    # the autoscaler is removing it: no room, and not a node toward the pool's ceiling
         snap.nodes[pool] = snap.nodes.get(pool, 0) + 1
         a = getattr(n.status, "allocatable", None) or {}
-        ready = any(c.type == "Ready" and c.status == "True" for c in (getattr(n.status, "conditions", None) or []))
         unsched = bool(getattr(getattr(n, "spec", None), "unschedulable", False))
-        if ready and not unsched:
+        if not unsched:                 # Ready, or registered and coming up: either way its room is spoken for by what we place
             nodes[n.metadata.name] = [pool, [_qty(a.get("cpu"), "cpu"), _qty(a.get("memory"), "mem"),
                                              _qty(a.get("ephemeral-storage"), "disk"), int(a.get("pods", 0) or 0)]]
     for p in api.list_pod_for_all_namespaces().items or []:
         node = getattr(p.spec, "node_name", None)
-        if node not in nodes or getattr(p.status, "phase", None) in ("Succeeded", "Failed"):
+        if getattr(p.status, "phase", None) in ("Succeeded", "Failed"):
+            continue
+        if node is None:                # placed on a pool whose node is not there yet: it will take room there
+            pool = (getattr(p.spec, "node_selector", None) or {}).get(POOL_LABEL)
+            if pool in pool_names and getattr(p.metadata, "deletion_timestamp", None) is None:
+                cpu = mem = disk = 0.0
+                for c in getattr(p.spec, "containers", None) or []:
+                    req = (getattr(getattr(c, "resources", None), "requests", None) or {})
+                    cpu += _qty(req.get("cpu"), "cpu"); mem += _qty(req.get("memory"), "mem"); disk += _qty(req.get("ephemeral-storage"), "disk")
+                snap.pending.setdefault(pool, []).append((cpu, mem, disk))
+            continue
+        if node not in nodes:
             continue
         r = nodes[node][1]
         r[3] -= 1
@@ -404,6 +415,15 @@ class Placer:
                 except Exception as e:  # noqa: BLE001 — no snapshot: place by price alone
                     print(f"[sandboxes] gke_place: cannot read the cluster ({e!r}); placing by price only", file=sys.stderr, flush=True)
                     self.snap = Snapshot(taken_at=time.time())
+                # Pods placed but not on a node yet (waiting for a scale-up) hold their room: without this, a refresh during a
+                # burst forgot every placement whose node had not come up and sent the next ones to the same pool again
+                # (live, 1,000 at once: 372 pods sent to a 2-node pool of 180, and none to the next pool).
+                by_name = {p.name: p for p in pools}
+                for pool, reqs in self.snap.pending.items():
+                    for cpu, mem, disk in reqs:
+                        sh = Shape(cpu, mem, disk, 1.0)
+                        reserve(self.snap, pool, sh, max(1, by_name[pool].per_node(sh, kw.get("max_pods", 256),
+                                                                                   kw.get("oh", Overhead()))))
             pl = place(shape, pools, self.snap, cooldown=self.cooldown, **kw)
             reserve(self.snap, pl.pool, shape, pl.per_node)
             return pl

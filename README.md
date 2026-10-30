@@ -99,9 +99,11 @@ python -m sandboxes.cost --run scale-200 --watch 30 --cap 120       # live table
 | daytona | 0.166 | RAM quota ~120 at 4 GiB (tested to 5 here) | 1 s / - | flat | yes, 10 GB disk |
 | modal | 0.380 | 2000 of 2000 started (Team plan: 5,000) | 0.8 s / 1.1 s / 11 s (2000) | flat | yes with `runtime: vm` |
 
-GKE (`name: gke`, not benchmarked yet): one pod per sandbox on a spot node pool; Google bills nodes, so a node meter puts the
-node bill in the ledger and a watchdog deletes what dead processes leave and scales idle pools to zero. Setup, cost model,
-deletion layers and billing reconciliation: [docs/gke.md](docs/gke.md).
+GKE (`name: gke`): one pod per sandbox on our own cluster's spot node pools (pods' storage on local NVMe where the family has
+it); Google bills nodes, so a node meter puts the node bill in the ledger and a watchdog deletes what dead processes leave and
+scales idle pools to zero. 2026-10-30, `scripts/gke/bench.py`: 800 of 800 at once for $23.6/h (~$0.03 per sandbox-hour,
+seven machine families under today's quotas), warm start 0.54-0.64 s, exec ~0.2 s a call. Setup, quotas, cost model, deletion
+layers, teardown and billing reconciliation: [docs/gke.md](docs/gke.md).
 
 `python scripts/benchmark_concurrency.py --provider X --concurrencies 1 10 100` reproduces a row;
 `python scripts/verify_costs.py` checks the cost model and the ledger against the published rates and, where the provider has an API,
