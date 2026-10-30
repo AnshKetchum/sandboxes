@@ -1,3 +1,0 @@
-total_spend_cap_usd: 2500
-sandbox_providers:
-  - {name: modal, cpu: 2, memory_mb: 4096, disk_gb: 20, peak_concurrent_sandboxes: 95, spend_cap_usd: 2500, auto_delete_minutes: 120, extra: {runtime: vm}}

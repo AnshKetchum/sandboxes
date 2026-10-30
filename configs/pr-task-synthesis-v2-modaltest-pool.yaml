@@ -1,4 +1,0 @@
-# Small modal-only pool for the modal-client A/B test (6 tasks x 3 tries = 18 attempts per arm), same node shape as the main v2 pool.
-total_spend_cap_usd: 2000
-sandbox_providers:
-  - {name: modal, cpu: 2, memory_mb: 4096, disk_gb: 20, peak_concurrent_sandboxes: 18, spend_cap_usd: 2500, auto_delete_minutes: 180, extra: {runtime: vm}}
