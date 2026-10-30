@@ -96,12 +96,25 @@ def _pool() -> ThreadPoolExecutor:
         return _executor
 
 
+def _raise_fd_limit(want: int = 65536) -> None:
+    """Each exec stream is a socket: 1,000 concurrent ones need more than the common default soft limit of 1,024 descriptors."""
+    try:
+        import resource
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+        target = want if hard == resource.RLIM_INFINITY else min(want, hard)
+        if soft != resource.RLIM_INFINITY and soft < target:
+            resource.setrlimit(resource.RLIMIT_NOFILE, (target, hard))
+    except (ImportError, ValueError, OSError):
+        pass
+
+
 def _exec_pool() -> ThreadPoolExecutor:
     """Exec streams get their own threads: each holds one for the whole command (a test suite: minutes), so on the shared pool
     256 long commands would starve every create, poll and delete of the process (1,000 sandboxes in one process need ~1,000)."""
     global _exec_executor
     with _api_lock:
         if _exec_executor is None:
+            _raise_fd_limit()
             _exec_executor = ThreadPoolExecutor(max_workers=int(os.environ.get("GKE_EXEC_THREADS", "2048")),
                                                 thread_name_prefix="gke-exec")
         return _exec_executor
