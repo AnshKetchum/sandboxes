@@ -51,7 +51,9 @@ REGISTRY=$(cfg gke.registry)
 AR_REPO=${REGISTRY##*/}
 CLEANUP_DAYS=$(cfg gke.build.cleanup_days 2)
 NAMESPACE=${GKE_NAMESPACE:-sandboxes}
-MAX_PODS=${MAX_PODS:-1000}                             # ResourceQuota: pods beyond this are refused by the API server
+MAX_PODS=${MAX_PODS:-1500}                             # ResourceQuota: pods beyond this are refused by the API server
+MAX_CPU=${MAX_CPU:-2000}                               # ResourceQuota: requested vCPUs (1,000 one-vCPU sandboxes beside other runs'
+                                                       # 2-vCPU ones); the node pools' max_nodes is the burn ceiling
 BILLING_ACCOUNT=${BILLING_ACCOUNT:-}
 BUDGET_USD=${BUDGET_USD:-200}
 : "${PROJECT:?gke.project}" "${ZONE:?gke.location}" "${CLUSTER:?gke.cluster}" "${NODE_SA:?gke.node_service_account}"
@@ -140,7 +142,7 @@ apiVersion: v1
 kind: ResourceQuota
 metadata: {name: sandboxes-ceiling, namespace: $NAMESPACE}
 spec:
-  hard: {pods: "$MAX_PODS", requests.cpu: "$MAX_PODS"}
+  hard: {pods: "$MAX_PODS", requests.cpu: "$MAX_CPU"}
 ---
 apiVersion: v1
 kind: LimitRange

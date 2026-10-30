@@ -465,3 +465,18 @@ def purge_staging(cfg: BuildConfig, older_than_s: float = 3600.0, now: Optional[
     for i in range(0, len(old), 100):
         gcloud("storage", "rm", *old[i:i + 100])
     return len(old)
+
+
+def cancel_ongoing(cfg: BuildConfig) -> list:
+    """Cancel every build still queued or running in the project's build region: one that finished after `down` purged the
+    registry would push an image that bills until the cleanup policy removes it. Returns the cancelled build ids."""
+    if not (cfg.project and cfg.region):
+        return []
+    ids = [b["id"] for b in json.loads(gcloud("builds", "list", "--ongoing", "--format=json", "--project", cfg.project,
+                                              "--region", cfg.region) or "[]") if b.get("id")]
+    for bid in ids:
+        try:
+            gcloud("builds", "cancel", bid, "--project", cfg.project, "--region", cfg.region)
+        except RuntimeError as e:
+            print(f"[sandboxes] gke_build: could not cancel build {bid}: {str(e)[:200]}", file=sys.stderr, flush=True)
+    return ids

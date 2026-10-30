@@ -526,6 +526,10 @@ def create_pool_args(cfg: OpsConfig, p: dict) -> list:
         args += ["--node-locations", ",".join(cfg.zones)]
     if p.get("spot", True):
         args.append("--spot")
+    if p.get("boot_iops"):
+        args += ["--boot-disk-provisioned-iops", str(int(p["boot_iops"]))]
+    if p.get("boot_mbps"):
+        args += ["--boot-disk-provisioned-throughput", str(int(p["boot_mbps"]))]
     if p.get("local_ssd"):
         # pods' writable layers, emptyDirs and the image cache on local NVMe instead of the network boot disk (field notes
         # 2026-10-30: the shared pd-balanced boot disk made solve/test runs ~2x slower than Modal)
@@ -624,6 +628,7 @@ def down(api, cfg: OpsConfig, *, wait: bool = True, poll_s: float = 30.0) -> dic
     rep["resized"].append(cfg.system_pool)
     bcfg = gke_build.BuildConfig.load()
     if bcfg.registry:
+        rep["builds_cancelled"] = gke_build.cancel_ongoing(bcfg)     # before the purge: a build finishing later would push
         rep["images"] = gke_build.purge(bcfg, all_images=True)
     if bcfg.bucket:
         rep["uploads_deleted"] = gke_build.purge_staging(bcfg, older_than_s=0)
@@ -636,6 +641,35 @@ def down(api, cfg: OpsConfig, *, wait: bool = True, poll_s: float = 30.0) -> dic
     rep["metered_usd"] += gke_meter.meter_once(api, force=True)
     if wait:
         rep["residue"] = residue(cfg)
+    return rep
+
+
+def destroy(api, cfg: OpsConfig) -> dict:
+    """Undo everything scripts/gke/setup.sh made that can bill: `down` (pods, nodes, builds, images, uploads), then the cluster,
+    the image repository and the build bucket with whatever they still hold; then the residue audit, which should list nothing.
+    Service accounts, IAM bindings, enabled APIs and the budget alert stay: none of them bills, and setup.sh reuses them."""
+    from . import gke_build
+    rep = down(api, cfg, wait=True)
+    rep.pop("residue", None)
+    rep["cluster"] = teardown(api, cfg, delete_cluster=True)
+    bcfg = gke_build.BuildConfig.load()
+    if bcfg.registry:
+        repo, location, project = gke_build.repo_coordinates(bcfg)[1::2]
+        try:
+            cluster_op("artifacts", "repositories", "delete", repo, "--location", location, "--project", project, "--quiet",
+                       timeout=1800)
+            rep["repository_deleted"] = repo
+        except RuntimeError as e:
+            if "NOT_FOUND" not in str(e) and "not found" not in str(e).lower():
+                raise
+    if bcfg.bucket:
+        try:
+            gcloud("storage", "rm", "--recursive", f"gs://{bcfg.bucket}", timeout=3600)
+            rep["bucket_deleted"] = bcfg.bucket
+        except RuntimeError as e:
+            if "not found" not in str(e).lower() and "404" not in str(e):
+                raise
+    rep["residue"] = residue(cfg)
     return rep
 
 
@@ -753,6 +787,15 @@ def residue(cfg: OpsConfig, mcfg: Optional[gke_meter.MeterConfig] = None) -> dic
             idle = a.get("status") == "RESERVED"
             items.append({"what": "IP address" + (" (unused)" if idle else ""), "detail": a["name"], "usd_month": (0.01 if idle else 0.005) * 730})
 
+    def builds():
+        from . import gke_build
+        bcfg = gke_build.BuildConfig.load()
+        if not bcfg.region:
+            return
+        for b in _gjson("builds", "list", "--ongoing", *P, "--region", bcfg.region):
+            items.append({"what": "Cloud Build running", "detail": f"{b.get('id')} ({b.get('status')}; pushes an image when done)",
+                          "usd_month": float(bcfg.usd_per_minute) * 60 * 730})
+
     def forwarding():
         for f in _gjson("compute", "forwarding-rules", "list", *P):
             items.append({"what": "load balancer rule", "detail": f["name"], "usd_month": 0.025 * 730})
@@ -773,7 +816,8 @@ def residue(cfg: OpsConfig, mcfg: Optional[gke_meter.MeterConfig] = None) -> dic
                 items.append({"what": "bucket storage", "detail": f"{url} {size / 1e9:.2f} GB", "usd_month": size / 1e9 * 0.02})
 
     for name, fn in (("clusters", clusters), ("VMs", instances), ("disks", disks), ("snapshots", snapshots), ("VM images", images),
-                     ("addresses", addresses), ("load balancers", forwarding), ("registries", registries), ("buckets", buckets)):
+                     ("addresses", addresses), ("load balancers", forwarding), ("registries", registries), ("buckets", buckets),
+                     ("builds", builds)):
         section(name, fn)
     return {"items": items, "usd_month": sum(i["usd_month"] for i in items), "unlisted": unlisted}
 
@@ -803,6 +847,8 @@ def main(argv=None) -> int:
     sub.add_parser("up")
     d = sub.add_parser("down"); d.add_argument("--no-wait", action="store_true")
     sub.add_parser("residue")
+    x = sub.add_parser("destroy", help="down, then delete the cluster, the image repository and the build bucket")
+    x.add_argument("--yes", action="store_true")
     a = ap.parse_args(argv)
     if a.cmd == "residue":
         r = residue(OpsConfig.load())
@@ -830,6 +876,14 @@ def main(argv=None) -> int:
         if "residue" in rep:
             print("left in the project:\n" + format_residue(rep["residue"]))
         return 0
+    if a.cmd == "destroy":
+        if not a.yes:
+            print("destroy deletes the cluster, the image repository and the build bucket: add --yes", file=sys.stderr)
+            return 2
+        rep = destroy(api, OpsConfig.load())
+        print(json.dumps({k: v for k, v in rep.items() if k != "residue"}, indent=1, default=str))
+        print("left in the project:\n" + format_residue(rep["residue"]))
+        return 1 if rep["residue"]["items"] else 0
     if a.cmd == "sweep":
         rep = housekeep(api, dry_run=a.dry_run)
         print(format_report(rep))
