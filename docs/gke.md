@@ -32,6 +32,66 @@ cut capacity. The namespace's ResourceQuota (setup.sh: 1,500 pods / 2,000 reques
 the sandboxes plus whatever else runs: `kubectl patch resourcequota sandboxes-ceiling -n sandboxes --type merge -p
 '{"spec":{"hard":{"pods":"1500","requests.cpu":"2000"}}}'` on a cluster set up before.
 
+## What to expect
+
+What a run on this backend sees today (us-central1, measured 2026-10-30 with `scripts/gke/bench.py`, details below).
+
+**How many.** Up to ~1,150 sandboxes of 1 vCPU / 4 GiB / 10 GB at once, if nothing else runs on the project: the catalog's spot
+pools across seven machine families, capped by the project's 1,300 vCPUs. 1,000 at once was measured with other runs beside it.
+The namespace quota (1,000 pods / 1,000 requested vCPUs unless raised) and the machine-wide spend caps can stop a run first.
+Past the ceiling, a start raises `CapacityError` (immediately when every pool is at its node or quota limit, after up to 300 s
+when a pool cannot get a node), and the router can send it to another provider. A sandbox asking for more than a node holds
+is refused at once.
+
+**How fast it starts.**
+- Onto a node already up with the image cached: ~0.5 s (p50 0.54-0.64 s, max ~3 s).
+- Onto a new node: 1-2 minutes (E2 ~70 s, C3D/C2D/N4D with local SSD or Hyperdisk 90-120 s), plus the image's first pull on that
+  node (image streaming fetches only what the container reads). A task image is built once per Dockerfile context by Cloud
+  Build before its first start (~40 s for a small image).
+- A burst of 1,000: ~3.5 minutes until every one runs (p50 113 s).
+- When a spot machine type is out in a zone (seen: n2-standard-96 in all four zones, n4d-standard-96 in one), the sandboxes
+  placed on it wait: the autoscaler tries the other zones, and after 300 s the start moves to another pool (an on-demand
+  fallback pool for N2 and C4N). Expect up to 5-15 minutes for the last part of a large burst on such a day.
+- After `down` (or 60 idle minutes: `auto_down_min`) the first start brings the cluster back up: ~2 more minutes.
+
+**What a sandbox gets.**
+- CPU: one vCPU of its own (pinned; `nproc` = 1). A vCPU is a hyperthread: with its neighbour busy it runs ~45% slower (python
+  loop 0.71 s alone, 1.26 s on a full node). Single-thread speed is 1.1-2x below Modal's (field notes, same task image: 0.56 s
+  vs 0.29-0.51 s); C3D measured ~25% faster than N2D (0.71 vs 0.90 s), the other families not yet.
+- Memory: 4 GiB guaranteed, the limit too: past it the process is OOM-killed. `free` and `df` inside show the node's totals.
+- Disk: 10 GiB (past it the pod is evicted), on local NVMe on most pools: small-file work at about Modal's speed when the node is
+  quiet (3,000 files 0.24 s vs 0.21 s), 3-4x slower than that with every sandbox of the node writing at once, still 4x faster
+  than the network boot disk was. The N4/N4D/C4N, E2 and `n2d-96-spot` pools keep pods' storage on the boot disk (provisioned
+  Hyperdisk or pd-balanced): slower under load.
+- Network: the internet and DNS only (no cluster, VPC or metadata addresses); no inbound connections.
+
+**Commands and files.** Every exec is a new stream through the API server: ~0.2 s per call from New Jersey (us-central1),
+whatever the command. 1,000 sandboxes running a command at once: ~5 s for all. A 16 MiB upload takes ~0.85 s, a download
+2-4 s; 26 sandboxes transferring at once ~100 MB/s together through this machine. A command longer than 2 hours runs
+detached and is polled. Batch many small commands into one exec where latency matters.
+
+**What it costs.** Google bills nodes, not sandboxes: a full node costs the same with 1 sandbox or 90. Per sandbox-hour at full
+nodes (spot): C3D with local SSD $0.014, N2D $0.024, C2D/E2 $0.025-0.026, N4D $0.032, N4 $0.035, N2 $0.036, C4N $0.047;
+on-demand fallbacks ~2-4x that. Placement fills the cheapest pools first, so a fleet's average rises with its size: 100
+sandboxes ~$2/h, 800 ~$23.6/h, 1,000 ~$31.9/h. Idle nodes keep billing until they go: the autoscaler removes an empty node,
+typically within ~10 minutes of the last scale-up; the watchdog resizes idle pools after 15 minutes; `gke_ops down` at once.
+The ledger charges each sandbox its share of its node and the meter charges the rest (idle room) to run "". Image builds
+~$0.06 each.
+
+**What can go wrong.**
+- Spot nodes can be reclaimed by Google at ~30 s notice: every sandbox on that node is gone, and its commands return rc -1.
+  Callers that cannot redo a sandbox's work should use the on-demand pools (`spot: never`).
+- A failed image build surfaces as a sandbox that cannot open (`ImageBuildError` with the build log's tail): check
+  `gcloud builds list` before suspecting the backend.
+- Builds, the registry and kubectl use the operator's gcloud login: when it needs re-authentication everything fails at once
+  (`gcloud auth login --update-adc`).
+- A process killed mid-run leaves its pods until the watchdog or their lifetime (`auto_delete_minutes`, default 240) ends them:
+  run `python -m sandboxes.gke_ops watch` beside workloads, or `sandboxes stop --run R` after a crash.
+
+**After a run.** `python -m sandboxes.gke_ops down` leaves nothing billing but the free control plane (pods, nodes, running
+builds, images, uploads; it ends with the residue audit). `python -m sandboxes.gke_ops destroy --yes` also removes the
+cluster, the image repository and the build bucket.
+
 ## Performance and scale (2026-10-30, `scripts/gke/bench.py`)
 
 The greenhouse evolve runs on GKE found sandboxes ~2x slower than Modal on file-heavy work (docs/gke_field_notes.md in the main
