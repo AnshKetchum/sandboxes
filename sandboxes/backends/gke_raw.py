@@ -63,7 +63,9 @@ PERMANENT_PULL_HINTS = ("not found", "manifest unknown", "unauthorized", "denied
 IMAGE_WAIT_REASONS = ("ErrImagePull", "ImagePullBackOff", "InvalidImageName", "ErrImageNeverPull", "RegistryUnavailable")
 START_FAILURE_REASONS = ("CreateContainerConfigError", "CreateContainerError", "CrashLoopBackOff", "RunContainerError")
 PULL_GRACE_S = 180.0
-POLL_S = 2.0
+POLL_S = 2.0                                      # a starting pod's re-read cadence when no pod watch is running
+WATCH_FALLBACK_S = 30.0                           # with a live watch: re-read a pod the watch has said nothing about this long
+READ_ERRORS_TOLERATED = 8                         # consecutive failed reads (429, 5xx, connection) before a start gives up
 DELETE_TRIES = 4
 STDIN_CHUNK = 1 << 20
 MAX_OUTPUT_BYTES = 16 << 20                       # keep the tail of a runaway output, not all of it in memory
@@ -72,6 +74,7 @@ PENDING_DELETES = "gke_pending_deletes.jsonl"
 _api = None
 _api_lock = threading.Lock()
 _executor: Optional[ThreadPoolExecutor] = None
+_exec_executor: Optional[ThreadPoolExecutor] = None
 
 
 # -- client (one per process; the kubernetes client is synchronous, so calls run on a dedicated thread pool) --------------------
@@ -93,12 +96,144 @@ def _pool() -> ThreadPoolExecutor:
         return _executor
 
 
+def _exec_pool() -> ThreadPoolExecutor:
+    """Exec streams get their own threads: each holds one for the whole command (a test suite: minutes), so on the shared pool
+    256 long commands would starve every create, poll and delete of the process (1,000 sandboxes in one process need ~1,000)."""
+    global _exec_executor
+    with _api_lock:
+        if _exec_executor is None:
+            _exec_executor = ThreadPoolExecutor(max_workers=int(os.environ.get("GKE_EXEC_THREADS", "2048")),
+                                                thread_name_prefix="gke-exec")
+        return _exec_executor
+
+
 async def _call(fn, *args, **kw):
     return await asyncio.get_running_loop().run_in_executor(_pool(), functools.partial(fn, *args, **kw))
 
 
+async def _call_exec(fn, *args, **kw):
+    return await asyncio.get_running_loop().run_in_executor(_exec_pool(), functools.partial(fn, *args, **kw))
+
+
 def _status(e: BaseException) -> Optional[int]:
     return getattr(e, "status", None)
+
+
+def transient(e: BaseException) -> bool:
+    """An API error worth retrying: throttled (429), a server error, or no HTTP status at all (connection reset, timeout)."""
+    st = _status(e)
+    return st is None or st == 429 or st >= 500
+
+
+# -- one pod watch per process -----------------------------------------------------------------------------------------------
+class PodWatch:
+    """The latest state of every pod of ours in the namespace, from one list+watch stream per process. 1,000 starts each
+    polling their pod every 2 s is ~500 requests/s at the API server (API Priority and Fairness then answers 429); the watch is
+    one stream, and a pod's change reaches its waiter when it happens instead of up to POLL_S later. Waiters still read their
+    pod directly when the watch has been silent about it for WATCH_FALLBACK_S, and poll as before while the watch is down: a
+    stalled or failed stream costs latency, never correctness. GKE_POD_WATCH=0 turns it off."""
+
+    def __init__(self, ns: str):
+        self.ns = ns
+        self.lock = threading.Lock()
+        self.pods: dict = {}                    # name -> latest pod object
+        self.waiters: dict = {}                 # name -> {asyncio.Event: loop}
+        self.alive = False                      # a watch stream is open and delivering
+        self.thread: Optional[threading.Thread] = None
+        self.failures = 0
+        self.closed = False
+
+    def close(self) -> None:
+        """Stop after the current stream ends (tests; the process's own watch lives as long as the process)."""
+        self.closed = True
+
+    def ensure_started(self) -> None:
+        with self.lock:
+            if self.thread is None or not self.thread.is_alive():
+                self.thread = threading.Thread(target=self._run, name="gke-pod-watch", daemon=True)
+                self.thread.start()
+
+    def get(self, name: str):
+        with self.lock:
+            return self.pods.get(name)
+
+    def subscribe(self, name: str, ev: "asyncio.Event", loop) -> None:
+        with self.lock:
+            self.waiters.setdefault(name, {})[ev] = loop
+
+    def unsubscribe(self, name: str, ev: "asyncio.Event") -> None:
+        with self.lock:
+            w = self.waiters.get(name)
+            if w is not None:
+                w.pop(ev, None)
+                if not w:
+                    del self.waiters[name]
+
+    def _publish(self, name: str, pod) -> None:
+        with self.lock:
+            if pod is None:
+                self.pods.pop(name, None)
+            else:
+                self.pods[name] = pod
+            for ev, loop in list((self.waiters.get(name) or {}).items()):
+                try:
+                    loop.call_soon_threadsafe(ev.set)
+                except RuntimeError:                # the waiter's loop is closed
+                    pass
+
+    def _run(self) -> None:
+        from kubernetes import watch
+        while not self.closed:
+            try:
+                api = _core()
+                rv, seen, token = None, {}, None
+                while True:                         # list (paged): the state the watch continues from
+                    kw = {"label_selector": MANAGED_SELECTOR, "limit": 500, **({"_continue": token} if token else {})}
+                    res = api.list_namespaced_pod(self.ns, **kw)
+                    for p in res.items or []:
+                        seen[p.metadata.name] = p
+                    rv = getattr(res.metadata, "resource_version", None) or rv
+                    token = getattr(res.metadata, "_continue", None)
+                    if not token:
+                        break
+                for name in set(self.pods) - set(seen):
+                    self._publish(name, None)
+                for name, p in seen.items():
+                    self._publish(name, p)
+                w = watch.Watch()
+                self.alive, self.failures = True, 0
+                for ev in w.stream(api.list_namespaced_pod, self.ns, label_selector=MANAGED_SELECTOR, resource_version=rv,
+                                   timeout_seconds=300, allow_watch_bookmarks=True):
+                    if self.closed:
+                        break
+                    kind, obj = ev.get("type"), ev.get("object")
+                    if kind == "ERROR":             # 410 Gone (resource version too old): list again
+                        break
+                    if kind == "BOOKMARK" or obj is None or not getattr(obj, "metadata", None):
+                        continue
+                    self._publish(obj.metadata.name, None if kind == "DELETED" else obj)
+            except Exception as e:  # noqa: BLE001 — the stream is an optimisation; waiters fall back to reading
+                self.failures += 1
+                if self.failures in (1, 10, 100):
+                    print(f"[sandboxes] gke: pod watch failed ({type(e).__name__}: {str(e)[:160]}); starts poll until it is "
+                          "back", file=sys.stderr, flush=True)
+            self.alive = False
+            time.sleep(min(30.0, 0.5 * 2 ** min(self.failures, 6)) if self.failures else 0.2)
+
+
+_watch: Optional[PodWatch] = None
+
+
+def pod_watch() -> Optional[PodWatch]:
+    """The process's pod watch (started on first use), or None when GKE_POD_WATCH=0."""
+    global _watch
+    if os.environ.get("GKE_POD_WATCH", "1") == "0":
+        return None
+    with _api_lock:
+        if _watch is None or _watch.ns != namespace():
+            _watch = PodWatch(namespace())
+    _watch.ensure_started()
+    return _watch
 
 
 # -- pure helpers (unit tested) ------------------------------------------------------------------------------------------------
@@ -393,6 +528,27 @@ async def _delete_pod(name: str, namespace: str) -> bool:
 
 _UP = {"t": 0.0}
 UP_CHECK_S = 60.0
+_METERING = threading.Lock()
+
+
+def _meter_in_background() -> None:
+    """A meter pass on the API thread pool, not awaited: a pass reads nodes, pods, events and the ledgers (~2 s), and a start
+    that waited for it was that much slower. One in flight per process; meter_once itself skips passes < 30 s apart."""
+    if not _METERING.acquire(blocking=False):
+        return
+
+    def run():
+        try:
+            from .. import gke_meter
+            gke_meter.meter_once(_core())
+        except Exception:  # noqa: BLE001 — metering must never block or fail a sandbox
+            pass
+        finally:
+            _METERING.release()
+    try:
+        _pool().submit(run)
+    except Exception:  # noqa: BLE001
+        _METERING.release()
 
 
 def _ensure_up() -> None:
@@ -514,10 +670,7 @@ class GKERaw(RawSandbox):
         pod_spec = dataclasses.replace(s, image=image, extra=x)
         name = "sbx-" + uuid.uuid4().hex[:16]
         self.sandbox_id = name                          # fixed before the API call: a failure from here on deletes this name
-        try:
-            await self.meter()                          # the node bill is current whenever the fleet grows
-        except Exception:  # noqa: BLE001 — metering must never block a sandbox
-            pass
+        _meter_in_background()                          # the node bill is current whenever the fleet grows, without waiting on it
         try:
             await _call(_core().create_namespaced_pod, self._ns, pod_manifest(name, pod_spec, self._ns))
             await self._wait_ready(name, x)
@@ -529,35 +682,67 @@ class GKERaw(RawSandbox):
             self._rate, self.pool = placement.rate_h, placement.pool
 
     async def _wait_ready(self, name: str, extra: Optional[dict] = None) -> None:
+        """Until the pod runs (or cannot). Woken by the process's pod watch when it changes; reads it directly when the watch
+        has nothing (down, or silent about it for WATCH_FALLBACK_S). A failed read is retried READ_ERRORS_TOLERATED times:
+        an API server throttling a large ramp must not fail (and delete) pods that are starting fine."""
         x = extra if extra is not None else (self.spec.extra or {})
         capacity_wait = float(x.get("capacity_wait_s", 900))
         ready_timeout = ready_timeout_s(self.spec)
         t0 = time.time()
         unschedulable_since = None
         detail = ""
-        while True:
-            pod = await _call(_core().read_namespaced_pod, name, self._ns)
-            now = time.time()
-            state, detail = pod_start_state(pod, now, t0)
-            if state == "ready":
-                return
-            if state == "image_error":
-                raise ImageBuildError(f"gke: image {self.spec.image} cannot be pulled: {detail}")
-            if state == "failed":
-                raise SandboxCreateError(f"gke: pod {name} failed to start: {detail}")
-            if state == "unschedulable":
-                unschedulable_since = unschedulable_since or now
-                if now - unschedulable_since > capacity_wait:
-                    raise CapacityError("gke", f"pod unschedulable for {capacity_wait:.0f}s: {detail}")
-            else:
-                unschedulable_since = None
-            if now - t0 > ready_timeout:
-                raise SandboxCreateError(f"gke: pod {name} not ready after {ready_timeout:.0f}s ({detail})")
-            await asyncio.sleep(POLL_S)
+        watch = pod_watch()
+        changed = asyncio.Event()
+        if watch is not None:
+            watch.subscribe(name, changed, asyncio.get_running_loop())
+        pod, read_at, errors = None, 0.0, 0
+        try:
+            while True:
+                changed.clear()
+                live = watch is not None and watch.alive
+                seen = watch.get(name) if live else None
+                if seen is not None:
+                    pod = seen
+                if seen is None or time.time() - read_at > WATCH_FALLBACK_S:
+                    try:
+                        pod = await _call(_core().read_namespaced_pod, name, self._ns)
+                        read_at, errors = time.time(), 0
+                    except Exception as e:  # noqa: BLE001
+                        errors += 1
+                        if not transient(e) or errors > READ_ERRORS_TOLERATED:
+                            raise
+                        await asyncio.sleep(min(POLL_S * errors, 15.0))
+                        continue
+                now = time.time()
+                state, detail = pod_start_state(pod, now, t0)
+                if state == "ready":
+                    return
+                if state == "image_error":
+                    raise ImageBuildError(f"gke: image {self.spec.image} cannot be pulled: {detail}")
+                if state == "failed":
+                    raise SandboxCreateError(f"gke: pod {name} failed to start: {detail}")
+                if state == "unschedulable":
+                    unschedulable_since = unschedulable_since or now
+                    if now - unschedulable_since > capacity_wait:
+                        raise CapacityError("gke", f"pod unschedulable for {capacity_wait:.0f}s: {detail}")
+                else:
+                    unschedulable_since = None
+                if now - t0 > ready_timeout:
+                    raise SandboxCreateError(f"gke: pod {name} not ready after {ready_timeout:.0f}s ({detail})")
+                if live:
+                    try:
+                        await asyncio.wait_for(changed.wait(), timeout=min(WATCH_FALLBACK_S, 10.0))
+                    except asyncio.TimeoutError:
+                        pass
+                else:
+                    await asyncio.sleep(POLL_S)
+        finally:
+            if watch is not None:
+                watch.unsubscribe(name, changed)
 
     async def _run(self, argv: list, *, stdin: Optional[bytes] = None, timeout: float, stdout_only: bool = False):
-        return await _call(_stream_exec, _core(), self.sandbox_id, self._ns, argv, stdin=stdin, timeout=timeout,
-                           stdout_only=stdout_only)
+        return await _call_exec(_stream_exec, _core(), self.sandbox_id, self._ns, argv, stdin=stdin, timeout=timeout,
+                                stdout_only=stdout_only)
 
     async def _exec(self, command, cwd, env, timeout) -> ExecResult:
         t0 = time.time()

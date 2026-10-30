@@ -41,6 +41,7 @@ def k8s(tmp_path, monkeypatch):
     monkeypatch.setenv("SANDBOX_RATELIMIT_DIR", str(tmp_path / "rl"))
     monkeypatch.setenv("SANDBOX_HEALTH_DIR", str(tmp_path / "health"))
     monkeypatch.setenv("GKE_NAMESPACE", "sandboxes")
+    monkeypatch.setenv("GKE_POD_WATCH", "0")             # the watch has its own test (test_gke_watch.py)
     monkeypatch.setenv("SANDBOX_GKE_CONFIG", str(tmp_path / "no-gke-config.yaml"))
     from sandboxes import cost as cost_mod, guard
     for k in (cost_mod.SESSION_ENV, cost_mod.RUN_ENV, "SANDBOX_SESSION_CLIENT", "SANDBOX_CAP_USD", "SANDBOX_RUN_CAP_USD"):
