@@ -29,6 +29,7 @@ from typing import Optional
 import yaml
 
 POOL_LABEL = "sandboxes.pool"          # node label and taint key of every sandbox pool; pods select one and tolerate them all
+DELETING_TAINT = "ToBeDeletedByClusterAutoscaler"   # on a node the cluster autoscaler is removing
 HOURS_PER_MONTH = 730.0
 HYPERDISK_ONLY = ("c4", "c4a", "c4d", "n4", "n4d", "x4", "h4d")      # families that boot only from Hyperdisk
 COOLDOWN_S = 600.0                     # a pool that could not get a node is skipped this long
@@ -36,6 +37,8 @@ EPS = 1e-6                             # room is counted in floats: 0.95 subtrac
 LOCAL_SSD_GIB = 375.0                  # one local NVMe SSD (a pool's `local_ssd` counts these)
 LOCAL_SSD_GIB_MONTH = {"spot": 0.0478, "ondemand": 0.08}   # us-central1 catalog, 2026-10-30 (gke_meter.local_ssd_gib_month)
 NODE_IP_HOUR = {"spot": 0.0025, "ondemand": 0.005}         # a node's external IPv4 (gke_meter.node_ip_hour)
+# Hyperdisk Balanced (the only boot disk of N4/N4D/C4D): 3,000 IOPS and 140 MB/s are included; above that, per month
+HDB_FREE_IOPS, HDB_FREE_MBPS, HDB_IOPS_MONTH, HDB_MBPS_MONTH = 3000, 140, 0.005, 0.04
 
 
 def _fits(r, shape: "Shape") -> bool:
@@ -75,6 +78,12 @@ def allocatable_local_ssd_gib(count: int) -> float:
     for one SSD, 75 for two, 100 for three or more)."""
     n = int(count)
     return max(0.0, n * LOCAL_SSD_GIB * 0.9 - (50.0 if n == 1 else 75.0 if n == 2 else 100.0))
+
+
+def boot_perf_hour(iops: int = 0, mbps: int = 0) -> float:
+    """Provisioned Hyperdisk Balanced performance beyond what the disk includes, per hour."""
+    return (max(0, int(iops or 0) - HDB_FREE_IOPS) * HDB_IOPS_MONTH + max(0, int(mbps or 0) - HDB_FREE_MBPS) * HDB_MBPS_MONTH) \
+        / HOURS_PER_MONTH
 
 
 def local_ssd_hour(count: int, spot: bool, gib_month: Optional[dict] = None) -> float:
@@ -201,6 +210,9 @@ class Pool:
     disk_type: str = ""
     local_ssd: int = 0                         # local NVMe SSDs holding the pods' storage (0: the boot disk holds it)
     local_ssd_gib_month: Optional[dict] = None
+    boot_iops: int = 0                         # Hyperdisk Balanced boot disk: provisioned IOPS / MB/s (0: the included 3,000 / 140)
+    boot_mbps: int = 0
+    family_quota: Optional[float] = None       # the region's vCPU quota for its machine family (gke.quotas), shared by its pools
 
     @property
     def node_h(self) -> Optional[float]:
@@ -208,7 +220,7 @@ class Pool:
         if p is None:
             return None
         return (p + disk_hour(self.disk_gib) + local_ssd_hour(self.local_ssd, self.spot, self.local_ssd_gib_month)
-                + NODE_IP_HOUR["spot" if self.spot else "ondemand"])
+                + boot_perf_hour(self.boot_iops, self.boot_mbps) + NODE_IP_HOUR["spot" if self.spot else "ondemand"])
 
     def per_node(self, shape: Shape, max_pods: int = 256, oh: Overhead = Overhead()) -> int:
         return per_node(self.machine, shape, self.disk_gib, max_pods, oh, self.local_ssd)
@@ -257,7 +269,11 @@ def load_catalog(path: Optional[os.PathLike] = None) -> tuple:
         pr = prices.get(mt) or {}
         m = Machine(mt, float(shapes[mt]["vcpus"]), float(shapes[mt]["mem_gib"]), pr.get("spot"), pr.get("ondemand"))
         pools.append(Pool(e["name"], m, bool(e.get("spot", True)), int(e.get("disk_gb", 1000)), max_nodes_of(e, zones),
-                          e.get("disk_type", ""), int(e.get("local_ssd", 0) or 0), meter.get("local_ssd_gib_month")))
+                          e.get("disk_type", ""), int(e.get("local_ssd", 0) or 0), meter.get("local_ssd_gib_month"),
+                          int(e.get("boot_iops", 0) or 0), int(e.get("boot_mbps", 0) or 0)))
+    quotas = {str(k).upper(): float(v) for k, v in (g.get("quotas") or {}).items()}
+    for pool in pools:
+        pool.family_quota = quotas.get(pool.machine.family.upper())
     oh = Overhead(**(g.get("node_overhead") or {}))
     return pools, oh, int(g.get("max_pods_per_node", 256))
 
@@ -286,12 +302,18 @@ def place(shape: Shape, pools: list, snap: Optional[Snapshot] = None, *, oh: Ove
     if warm:
         p, n, rate = min(warm, key=lambda c: c[2])
         return Placement(p.name, rate, n, "room on a running node")
-    cold = [(p, n, rate) for p, n, rate in cands
-            if snap.nodes.get(p.name, 0) < p.max_nodes and now >= cooldown.get(p.name, 0.0)]
+    used: dict = {}                                  # vCPUs of each machine family's nodes, over every pool of the family
+    for p in pools:
+        used[p.machine.family] = used.get(p.machine.family, 0.0) + snap.nodes.get(p.name, 0) * p.machine.vcpus
+
+    def can_grow(p):
+        return snap.nodes.get(p.name, 0) < p.max_nodes and \
+            (p.family_quota is None or used[p.machine.family] + p.machine.vcpus <= p.family_quota + EPS)
+    cold = [(p, n, rate) for p, n, rate in cands if can_grow(p) and now >= cooldown.get(p.name, 0.0)]
     if not cold:
-        cold = [(p, n, rate) for p, n, rate in cands if snap.nodes.get(p.name, 0) < p.max_nodes]   # all cooling: try anyway
+        cold = [(p, n, rate) for p, n, rate in cands if can_grow(p)]                               # all cooling: try anyway
     if not cold:
-        raise LookupError(f"every sandbox pool that fits {shape} is at its node ceiling")
+        raise LookupError(f"every sandbox pool that fits {shape} is at its node ceiling or its family's vCPU quota")
     if spot == "prefer" and any(c[0].spot for c in cold):
         cold = [c for c in cold if c[0].spot]                  # on-demand pools are the fallback when no spot pool can grow
     p, n, rate = min(cold, key=lambda c: c[2])
@@ -330,6 +352,9 @@ def snapshot_from_api(api, pool_names) -> Snapshot:
         pool = (n.metadata.labels or {}).get(POOL_LABEL)
         if pool not in pool_names:
             continue
+        taints = {getattr(t, "key", "") for t in (getattr(getattr(n, "spec", None), "taints", None) or [])}
+        if DELETING_TAINT in taints:
+            continue                    # the autoscaler is removing it: no room, and not a node toward the pool's ceiling
         snap.nodes[pool] = snap.nodes.get(pool, 0) + 1
         a = getattr(n.status, "allocatable", None) or {}
         ready = any(c.type == "Ready" and c.status == "True" for c in (getattr(n.status, "conditions", None) or []))

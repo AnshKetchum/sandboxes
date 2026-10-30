@@ -70,6 +70,7 @@ class MeterConfig:
     pool_disk_gb: dict = field(default_factory=dict)       # node pool -> boot disk GB
     default_disk_gb: float = 100.0
     pool_local_ssd: dict = field(default_factory=dict)     # node pool -> local SSDs per node (the catalog's `local_ssd`)
+    pool_boot_perf: dict = field(default_factory=dict)     # node pool -> [provisioned IOPS, MB/s] of its Hyperdisk boot disk
     local_ssd_gib_month: dict = field(default_factory=lambda: {"spot": 0.0478, "ondemand": 0.08})
     node_ip_hour: dict = field(default_factory=lambda: {"spot": 0.0025, "ondemand": 0.005})   # each node's external IPv4
     cluster_fee_hour: float = 0.10
@@ -86,6 +87,8 @@ class MeterConfig:
                 c.pool_disk_gb.setdefault(pool["name"], float(pool["disk_gb"]))
             if pool.get("name") and pool.get("local_ssd"):
                 c.pool_local_ssd.setdefault(pool["name"], int(pool["local_ssd"]))
+            if pool.get("name") and (pool.get("boot_iops") or pool.get("boot_mbps")):
+                c.pool_boot_perf.setdefault(pool["name"], [int(pool.get("boot_iops") or 0), int(pool.get("boot_mbps") or 0)])
         return c
 
 
@@ -114,8 +117,8 @@ class OpenPod:
 
 
 def node_price_hour(node: Node, cfg: MeterConfig) -> float:
-    """What the node costs per hour: its machine type at spot or on-demand price, plus its boot disk, local SSDs and external
-    IP."""
+    """What the node costs per hour: its machine type at spot or on-demand price, plus its boot disk (and any provisioned
+    Hyperdisk performance), local SSDs and external IP."""
     kind = "spot" if node.spot else "ondemand"
     price = (cfg.machine_prices.get(node.machine) or {}).get(kind)
     if price is None:
@@ -123,9 +126,9 @@ def node_price_hour(node: Node, cfg: MeterConfig) -> float:
         print(f"[sandboxes] gke_meter: no {kind} price for {node.machine!r}; using {node.vcpus:g} vCPU x fallback "
               f"= ${price:.4f}/h (add it to the gke_meter config)", file=sys.stderr, flush=True)
     disk = float(cfg.pool_disk_gb.get(node.pool, cfg.default_disk_gb)) * cfg.disk_gb_month / HOURS_PER_MONTH
-    from .gke_place import local_ssd_hour
+    from .gke_place import boot_perf_hour, local_ssd_hour
     return (float(price) + disk + local_ssd_hour(cfg.pool_local_ssd.get(node.pool, 0), node.spot, cfg.local_ssd_gib_month)
-            + float(cfg.node_ip_hour.get(kind, 0.0)))
+            + boot_perf_hour(*cfg.pool_boot_perf.get(node.pool, (0, 0))) + float(cfg.node_ip_hour.get(kind, 0.0)))
 
 
 def ephemeral_price_hour(pool: str, prev_nodes: dict, nodes: list, cfg: MeterConfig, pool_prices: Optional[dict] = None) -> float:

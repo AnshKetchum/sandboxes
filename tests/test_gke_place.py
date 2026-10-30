@@ -237,3 +237,54 @@ def test_the_catalog_reads_local_ssds_and_the_meter_charges_them(tmp_path):
     assert pools[0].local_ssd == 8
     node = Node("gke-c-l-1", 0.0, "c3d-standard-90-lssd", True, "l", 90)
     assert node_price_hour(node, MeterConfig.load(p)) == pytest.approx(pools[0].node_h)   # placement and meter agree
+
+
+def test_a_node_the_autoscaler_is_removing_does_not_hold_its_pools_ceiling(k8s):
+    """Found live: a one-node pool whose idle node was being scaled down refused 26 starts as 'at its node ceiling'."""
+    from types import SimpleNamespace
+    going = fk.make_node("n-going", time.time(), sandbox_pool="c3d-180-spot")
+    going.spec.taints = [SimpleNamespace(key=gp.DELETING_TAINT, value="1700000000", effect="NoSchedule")]
+    k8s.nodes = [going]
+    snap = gp.snapshot_from_api(k8s, {"c3d-180-spot"})
+    assert snap.nodes.get("c3d-180-spot", 0) == 0 and not snap.room.get("c3d-180-spot")
+    assert place(UNIT, pools(c3d=1), snap).pool == "c3d-180-spot"
+
+
+def test_a_hyperdisk_pool_pays_for_the_performance_it_provisions(tmp_path):
+    import yaml
+    from sandboxes.gke_meter import MeterConfig, Node, node_price_hour
+    assert gp.boot_perf_hour(3000, 140) == 0 and gp.boot_perf_hour(0, 0) == 0
+    assert gp.boot_perf_hour(30000, 1000) == pytest.approx((27000 * 0.005 + 860 * 0.04) / 730)
+    p = tmp_path / "gke.yaml"
+    p.write_text(yaml.safe_dump({
+        "gke": {"pools": [{"name": "h", "machine": "n4d-standard-96", "spot": True, "disk_gb": 1250, "boot_iops": 30000,
+                           "boot_mbps": 1000, "max_nodes": 2}]},
+        "gke_meter": {"machine_shapes": {"n4d-standard-96": {"vcpus": 96, "mem_gib": 384}},
+                      "machine_prices": {"n4d-standard-96": {"spot": 2.4378, "ondemand": 4.0656}}}}))
+    pool = gp.load_catalog(p)[0][0]
+    assert (pool.boot_iops, pool.boot_mbps) == (30000, 1000)
+    node = Node("gke-c-h-1", 0.0, "n4d-standard-96", True, "h", 96)
+    assert node_price_hour(node, MeterConfig.load(p)) == pytest.approx(pool.node_h)
+
+
+def test_pools_of_one_family_share_its_quota():
+    """Two N2D pools of 2 nodes each under a 200-vCPU N2D quota: the on-demand one cannot grow while spot holds 192 vCPUs."""
+    ps = [Pool("n2d-96-spot", N2D96, True, 1250, 2, family_quota=200), Pool("n2d-96-od", N2D96, False, 1250, 2, family_quota=200),
+          Pool("c3d-180-od", C3D180, False, 2200, 2)]
+    full = Snapshot(nodes={"n2d-96-spot": 2})
+    assert place(UNIT, ps, full).pool == "c3d-180-od"                       # not n2d-96-od: its node would be past the quota
+    assert place(UNIT, ps, Snapshot(nodes={"n2d-96-spot": 1}), spot="never").pool == "n2d-96-od"     # 96 + 96 <= 200
+    with pytest.raises(LookupError, match="quota"):
+        place(UNIT, ps[:2], full)
+
+
+def test_the_catalog_reads_family_quotas(tmp_path):
+    import yaml
+    p = tmp_path / "gke.yaml"
+    p.write_text(yaml.safe_dump({
+        "gke": {"quotas": {"N2D": 200}, "pools": [{"name": "a", "machine": "n2d-standard-96", "max_nodes": 2},
+                                                   {"name": "b", "machine": "c3d-standard-90", "max_nodes": 2}]},
+        "gke_meter": {"machine_shapes": {"n2d-standard-96": {"vcpus": 96, "mem_gib": 384}, "c3d-standard-90": {"vcpus": 90, "mem_gib": 360}},
+                      "machine_prices": {"n2d-standard-96": {"spot": 1.9567}, "c3d-standard-90": {"spot": 0.9866}}}}))
+    pools = {x.name: x for x in gp.load_catalog(p)[0]}
+    assert pools["a"].family_quota == 200 and pools["b"].family_quota is None
