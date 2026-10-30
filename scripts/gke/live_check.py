@@ -22,6 +22,7 @@ import asyncio
 import json
 import os
 import random
+import shlex
 import subprocess
 import sys
 import threading
@@ -29,6 +30,19 @@ import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+
+
+def workdir_of(task: Path) -> str:
+    """The task's working directory: its Dockerfile's last absolute WORKDIR (harbor runs solve.sh and test.sh there), else /app."""
+    wd = "/app"
+    try:
+        for line in (task / "environment" / "Dockerfile").read_text().splitlines():
+            parts = line.strip().split(None, 1)
+            if len(parts) == 2 and parts[0].upper() == "WORKDIR" and parts[1].strip().startswith("/"):
+                wd = parts[1].strip()
+    except OSError:
+        pass
+    return wd
 
 
 def gcloud_json(*args):
@@ -93,7 +107,8 @@ async def check_one(sb, task: Path, idx: int) -> dict:
         out[name] = (r.rc != 0) if name.endswith("_blocked") else (r.rc == 0)
     await sb.put_file(task / "tests", "/tests")
     await sb.put_file(task / "solution", "/solution")
-    r = await sb.exec("mkdir -p /logs/verifier /outputs && bash /solution/solve.sh && cd /app && bash /tests/test.sh "
+    wd = shlex.quote(workdir_of(task))
+    r = await sb.exec(f"mkdir -p /logs/verifier /outputs && cd {wd} && bash /solution/solve.sh && cd {wd} && bash /tests/test.sh "
                       "&& cat /logs/verifier/reward.txt", timeout=600)
     out["verifier_reward"] = (r.stdout.strip().splitlines() or [""])[-1]
     return out

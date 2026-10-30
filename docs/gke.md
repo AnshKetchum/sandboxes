@@ -54,7 +54,8 @@ is refused at once.
 - A burst of 1,000: ~3.5 minutes until every one runs (p50 113 s).
 - When a spot machine type is out in a zone (seen: n2-standard-96 in all four zones, n4d-standard-96 in one), the sandboxes
   placed on it wait: the autoscaler tries the other zones, and after 300 s the start moves to another pool (an on-demand
-  fallback pool for N2 and C4N). Expect up to 5-15 minutes for the last part of a large burst on such a day.
+  fallback pool for N2 and C4N). Expect up to 5-15 minutes for the last part of a large burst on such a day. The N2 pools
+  are the least reliable: later the same day n2-standard-96 with 16 local SSDs was out on demand too, in all four zones.
 - After `down` (or 60 idle minutes: `auto_down_min`) the first start brings the cluster back up: ~2 more minutes.
 
 **What a sandbox gets.**
@@ -160,6 +161,7 @@ an independent gcloud listing of everything billable.
 |---|---|---|---|---|---|---|---|
 | gke-live-1d | 1 (+1 warm) | all pass | 1 | 255 s | 6.0 s | 1.08x (over) | control plane only |
 | gke-live-8 | 8 concurrent (+1 warm) | all pass | 1 | 268 s | 6.2 s | 1.13x (over) | control plane only |
+| gke-live-merged2 (2026-10-30, merged gke-backend) | 1 (+1 warm), c3d-60-lssd | all pass | 1 | 85 s (node up) | 1.2 s | not comparable: live runs shared the window | (no `down`: live runs) |
 
 Cold start, from the pod's creation: node scale-up ~48 s, image pull ~8 s (one pull shared by all 8 pods), container start at
 ~62 s; the rest of the 255-270 s is the cluster coming back up from `down` (~2 min) and the Cloud Build (~40 s). Warm (node up,
