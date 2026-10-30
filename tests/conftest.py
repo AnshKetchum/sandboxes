@@ -28,6 +28,8 @@ def no_real_cloud(tmp_path_factory, monkeypatch):
             monkeypatch.setenv(k, str(base / d))
     for k in ("GKE_PROJECT", "GKE_LOCATION", "GKE_CLUSTER", "GKE_REGISTRY"):
         monkeypatch.delenv(k, raising=False)
+    # no process-wide pod watch thread: it would outlive the test's fakes and reach the real cluster (test_gke_watch turns it on)
+    monkeypatch.setenv("GKE_POD_WATCH", "0")
     from sandboxes import gke_build, gke_ops
     from sandboxes.backends import gke_raw
     monkeypatch.setattr(gke_ops, "gcloud", _refuse("gcloud (gke_ops)"))

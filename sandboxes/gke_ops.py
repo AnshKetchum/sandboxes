@@ -67,7 +67,7 @@ ORPHAN_SLACK_S = 300.0          # Pending this long past its creator's wait: the
 STUCK_DELETING_S = 120.0        # still there this long after a delete: its node is gone; drop the object (grace 0 is a force delete)
 NODE_GONE_WAIT_S = 1200.0       # teardown --pools: how long to keep metering while the nodes drain
 ARTIFACT_PURGE_EVERY_S = 600.0  # unused images and stale build uploads are looked for this often
-HYPERDISK_ONLY = ("c4", "c4a", "c4d", "n4", "n4d", "x4", "h4d")
+HYPERDISK_ONLY = ("c4", "c4a", "c4d", "c4n", "n4", "n4d", "x4", "h4d")
 
 
 @dataclass
@@ -221,6 +221,17 @@ def retry_pending_deletes(api) -> tuple[int, int]:
     return done, failed
 
 
+def our_pools(api, cfg: OpsConfig) -> list:
+    """Every sandbox pool that may hold nodes of ours: the catalog's, plus any pool whose nodes carry the sandbox pool label (one
+    made from another catalog or worktree, one disabled or dropped since): a node bills whichever config created it."""
+    names = list(cfg.sandbox_pools)
+    for n in api.list_node(label_selector="sandboxes.pool").items or []:
+        pool = (n.metadata.labels or {}).get("cloud.google.com/gke-nodepool")
+        if pool and pool not in names and pool != cfg.system_pool:
+            names.append(pool)
+    return names
+
+
 def scale_down_idle(api, cfg: OpsConfig, state: dict, now: float, active: int) -> list:
     """Resize the sandbox pools that still have nodes to 0 when none of our pods has existed for idle_scale_down_min. Returns
     the pools resized."""
@@ -231,7 +242,8 @@ def scale_down_idle(api, cfg: OpsConfig, state: dict, now: float, active: int) -
     idle_s = cfg.idle_scale_down_min * 60.0
     if now - float(state["last_busy"]) < idle_s or now - float(state.get("last_resize", 0)) < idle_s:
         return []
-    nodes = [n for n in gke_meter.nodes_from_api(api) if n.pool in cfg.sandbox_pools]
+    pools = our_pools(api, cfg)
+    nodes = [n for n in gke_meter.nodes_from_api(api) if n.pool in pools]
     if not nodes:
         return []
     blockers = foreign_pods_on(api, [n.name for n in nodes])
@@ -430,12 +442,13 @@ def teardown(api, cfg: Optional[OpsConfig] = None, *, run: Optional[str] = None,
             raise RuntimeError(f"gke: {len(others)} pod(s) of ours are still running ({others[:3]}...): not resizing the pools "
                                "under them. Tear down without --run first.")
     if pools and not delete_cluster:
-        for pool in cfg.sandbox_pools:
+        names = our_pools(api, cfg)
+        for pool in names:
             resize_pool(cfg, pool, 0)
             rep["resized"].append(pool)
         t0 = time.time()
         while wait and time.time() - t0 < NODE_GONE_WAIT_S:
-            if not [n for n in gke_meter.nodes_from_api(api) if n.pool in cfg.sandbox_pools]:
+            if not [n for n in gke_meter.nodes_from_api(api) if n.pool in names]:
                 break
             time.sleep(poll_s)
             rep["metered_usd"] += gke_meter.meter_once(api)
@@ -460,6 +473,7 @@ def cluster_pools(cfg: OpsConfig) -> dict:
                           "max_nodes": int(total) if total is not None else int(a.get("maxNodeCount") or 0) * max(1, len(zones)),
                           "disk_gb": int(c.get("diskSizeGb") or 0), "disk_type": c.get("diskType"), "zones": n.get("locations") or [],
                           "kubelet": {k: v for k, v in (c.get("kubeletConfig") or {}).items() if k in ("cpuManagerPolicy",)},
+                          "local_ssd": int((c.get("ephemeralStorageLocalSsdConfig") or {}).get("localSsdCount") or 0),
                           "ours": "sandboxes.pool" in (c.get("labels") or {})}
     return out
 
@@ -470,7 +484,8 @@ def disk_type_for(machine: str) -> str:
 
 def plan_pools(cfg: OpsConfig, current: dict) -> list:
     """What makes the cluster's sandbox pools match the catalog: [(action, name, detail)] with action create | update | replace |
-    delete | ok. A pool's machine, spot-ness and disk cannot change in place: those are `replace` (delete + create, empty only)."""
+    delete | ok. A pool's machine, spot-ness, disk and local SSDs cannot change in place: those are `replace` (delete + create,
+    empty only)."""
     actions = []
     from .gke_place import max_nodes_of
     zones = max(1, len(cfg.zones))
@@ -479,9 +494,11 @@ def plan_pools(cfg: OpsConfig, current: dict) -> list:
         want_disk, want_max = int(p.get("disk_gb", 1000)), max_nodes_of(p, zones)
         if cur is None:
             actions.append(("create", p["name"], f"{p['machine']} {'spot' if p.get('spot', True) else 'on demand'} 0..{want_max} nodes"))
-        elif (cur["machine"], cur["spot"], cur["disk_gb"]) != (p["machine"], bool(p.get("spot", True)), want_disk):
-            actions.append(("replace", p["name"], f"{cur['machine']}/{'spot' if cur['spot'] else 'od'}/{cur['disk_gb']}GB -> "
-                                                  f"{p['machine']}/{'spot' if p.get('spot', True) else 'od'}/{want_disk}GB"))
+        elif (cur["machine"], cur["spot"], cur["disk_gb"], cur.get("local_ssd", 0)) != \
+                (p["machine"], bool(p.get("spot", True)), want_disk, int(p.get("local_ssd", 0) or 0)):
+            actions.append(("replace", p["name"], f"{cur['machine']}/{'spot' if cur['spot'] else 'od'}/{cur['disk_gb']}GB"
+                                                  f"/{cur.get('local_ssd', 0)} SSD -> {p['machine']}/"
+                                                  f"{'spot' if p.get('spot', True) else 'od'}/{want_disk}GB/{p.get('local_ssd', 0)} SSD"))
         elif cur["max_nodes"] != want_max:
             actions.append(("update", p["name"], f"max {cur['max_nodes']} -> {want_max} nodes"))
         elif any(cur.get("kubelet", {}).get(k) != v for k, v in cfg.kubelet_config.items()):
@@ -505,10 +522,19 @@ def create_pool_args(cfg: OpsConfig, p: dict) -> list:
             "--disk-size", str(int(p.get("disk_gb", 1000))), "--node-labels", f"sandboxes.pool={p['name']}",
             "--node-taints", f"sandboxes.pool={p['name']}:NoSchedule", "--workload-metadata", "GKE_METADATA",
             "--enable-image-streaming"]
-    if cfg.zones:
-        args += ["--node-locations", ",".join(cfg.zones)]
+    zones = p.get("zones") or cfg.zones                  # a pool's own zones: where its machine type is offered
+    if zones:
+        args += ["--node-locations", ",".join(zones)]
     if p.get("spot", True):
         args.append("--spot")
+    if p.get("boot_iops"):
+        args += ["--boot-disk-provisioned-iops", str(int(p["boot_iops"]))]
+    if p.get("boot_mbps"):
+        args += ["--boot-disk-provisioned-throughput", str(int(p["boot_mbps"]))]
+    if p.get("local_ssd"):
+        # pods' writable layers, emptyDirs and the image cache on local NVMe instead of the network boot disk (field notes
+        # 2026-10-30: the shared pd-balanced boot disk made solve/test runs ~2x slower than Modal)
+        args += ["--ephemeral-storage-local-ssd", f"count={int(p['local_ssd'])}"]
     if cfg.node_service_account:
         args += ["--service-account", cfg.node_service_account]
     if cfg.kubelet_config:
@@ -603,6 +629,7 @@ def down(api, cfg: OpsConfig, *, wait: bool = True, poll_s: float = 30.0) -> dic
     rep["resized"].append(cfg.system_pool)
     bcfg = gke_build.BuildConfig.load()
     if bcfg.registry:
+        rep["builds_cancelled"] = gke_build.cancel_ongoing(bcfg)     # before the purge: a build finishing later would push
         rep["images"] = gke_build.purge(bcfg, all_images=True)
     if bcfg.bucket:
         rep["uploads_deleted"] = gke_build.purge_staging(bcfg, older_than_s=0)
@@ -615,6 +642,35 @@ def down(api, cfg: OpsConfig, *, wait: bool = True, poll_s: float = 30.0) -> dic
     rep["metered_usd"] += gke_meter.meter_once(api, force=True)
     if wait:
         rep["residue"] = residue(cfg)
+    return rep
+
+
+def destroy(api, cfg: OpsConfig) -> dict:
+    """Undo everything scripts/gke/setup.sh made that can bill: `down` (pods, nodes, builds, images, uploads), then the cluster,
+    the image repository and the build bucket with whatever they still hold; then the residue audit, which should list nothing.
+    Service accounts, IAM bindings, enabled APIs and the budget alert stay: none of them bills, and setup.sh reuses them."""
+    from . import gke_build
+    rep = down(api, cfg, wait=True)
+    rep.pop("residue", None)
+    rep["cluster"] = teardown(api, cfg, delete_cluster=True)
+    bcfg = gke_build.BuildConfig.load()
+    if bcfg.registry:
+        repo, location, project = gke_build.repo_coordinates(bcfg)[1::2]
+        try:
+            cluster_op("artifacts", "repositories", "delete", repo, "--location", location, "--project", project, "--quiet",
+                       timeout=1800)
+            rep["repository_deleted"] = repo
+        except RuntimeError as e:
+            if "NOT_FOUND" not in str(e) and "not found" not in str(e).lower():
+                raise
+    if bcfg.bucket:
+        try:
+            gcloud("storage", "rm", "--recursive", f"gs://{bcfg.bucket}", timeout=3600)
+            rep["bucket_deleted"] = bcfg.bucket
+        except RuntimeError as e:
+            if "not found" not in str(e).lower() and "404" not in str(e):
+                raise
+    rep["residue"] = residue(cfg)
     return rep
 
 
@@ -696,9 +752,18 @@ def residue(cfg: OpsConfig, mcfg: Optional[gke_meter.MeterConfig] = None) -> dic
                 continue
             mt = i.get("machineType", "").rsplit("/", 1)[-1]
             spot = (i.get("scheduling") or {}).get("provisioningModel") == "SPOT"
-            price = (mcfg.machine_prices.get(mt) or {}).get("spot" if spot else "ondemand")
-            items.append({"what": "VM", "detail": f"{i['name']} {mt}{' spot' if spot else ''}",
-                          "usd_month": (price or 0.0) * 730, **({} if price else {"unpriced": True})})
+            kind = "spot" if spot else "ondemand"
+            price = (mcfg.machine_prices.get(mt) or {}).get(kind)
+            # what bills with the VM besides the machine: local SSDs (SCRATCH disks, not in the disk listing) and external IPs
+            ssd_gib = sum(float(d.get("diskSizeGb") or 375) for d in i.get("disks") or [] if d.get("type") == "SCRATCH")
+            ips = sum(1 for nic in i.get("networkInterfaces") or [] for ac in nic.get("accessConfigs") or [] if ac.get("natIP"))
+            ssd_rate = (getattr(mcfg, "local_ssd_gib_month", None) or {"spot": 0.0478, "ondemand": 0.08})[kind]
+            ip_rate = (getattr(mcfg, "node_ip_hour", None) or {"spot": 0.0025, "ondemand": 0.005})[kind]
+            extra_h = ssd_gib * float(ssd_rate) / 730 + ips * float(ip_rate)
+            detail = f"{i['name']} {mt}{' spot' if spot else ''}" + (f" +{ssd_gib:.0f} GiB local SSD" if ssd_gib else "") \
+                + (f" +{ips} external IP" if ips else "")
+            items.append({"what": "VM", "detail": detail,
+                          "usd_month": ((price or 0.0) + extra_h) * 730, **({} if price else {"unpriced": True})})
 
     def disks():
         for d in _gjson("compute", "disks", "list", *P):
@@ -723,6 +788,15 @@ def residue(cfg: OpsConfig, mcfg: Optional[gke_meter.MeterConfig] = None) -> dic
             idle = a.get("status") == "RESERVED"
             items.append({"what": "IP address" + (" (unused)" if idle else ""), "detail": a["name"], "usd_month": (0.01 if idle else 0.005) * 730})
 
+    def builds():
+        from . import gke_build
+        bcfg = gke_build.BuildConfig.load()
+        if not bcfg.region:
+            return
+        for b in _gjson("builds", "list", "--ongoing", *P, "--region", bcfg.region):
+            items.append({"what": "Cloud Build running", "detail": f"{b.get('id')} ({b.get('status')}; pushes an image when done)",
+                          "usd_month": float(bcfg.usd_per_minute) * 60 * 730})
+
     def forwarding():
         for f in _gjson("compute", "forwarding-rules", "list", *P):
             items.append({"what": "load balancer rule", "detail": f["name"], "usd_month": 0.025 * 730})
@@ -743,7 +817,8 @@ def residue(cfg: OpsConfig, mcfg: Optional[gke_meter.MeterConfig] = None) -> dic
                 items.append({"what": "bucket storage", "detail": f"{url} {size / 1e9:.2f} GB", "usd_month": size / 1e9 * 0.02})
 
     for name, fn in (("clusters", clusters), ("VMs", instances), ("disks", disks), ("snapshots", snapshots), ("VM images", images),
-                     ("addresses", addresses), ("load balancers", forwarding), ("registries", registries), ("buckets", buckets)):
+                     ("addresses", addresses), ("load balancers", forwarding), ("registries", registries), ("buckets", buckets),
+                     ("builds", builds)):
         section(name, fn)
     return {"items": items, "usd_month": sum(i["usd_month"] for i in items), "unlisted": unlisted}
 
@@ -769,9 +844,12 @@ def main(argv=None) -> int:
     pl = sub.add_parser("pools")
     pl.add_argument("action", choices=["plan", "apply"]); pl.add_argument("--replace", action="store_true")
     pl.add_argument("--prune", action="store_true")
+    pl.add_argument("--only", nargs="+", default=None, help="act on these pools only (others may be in use)")
     sub.add_parser("up")
     d = sub.add_parser("down"); d.add_argument("--no-wait", action="store_true")
     sub.add_parser("residue")
+    x = sub.add_parser("destroy", help="down, then delete the cluster, the image repository and the build bucket")
+    x.add_argument("--yes", action="store_true")
     a = ap.parse_args(argv)
     if a.cmd == "residue":
         r = residue(OpsConfig.load())
@@ -784,7 +862,7 @@ def main(argv=None) -> int:
         return 0
     if a.cmd == "pools":
         cfg = OpsConfig.load()
-        actions = plan_pools(cfg, cluster_pools(cfg))
+        actions = [x for x in plan_pools(cfg, cluster_pools(cfg)) if not a.only or x[1] in a.only]
         for action, name, detail in actions:
             print(f"  {action:<8} {name:<24} {detail}")
         if a.action == "apply":
@@ -799,6 +877,14 @@ def main(argv=None) -> int:
         if "residue" in rep:
             print("left in the project:\n" + format_residue(rep["residue"]))
         return 0
+    if a.cmd == "destroy":
+        if not a.yes:
+            print("destroy deletes the cluster, the image repository and the build bucket: add --yes", file=sys.stderr)
+            return 2
+        rep = destroy(api, OpsConfig.load())
+        print(json.dumps({k: v for k, v in rep.items() if k != "residue"}, indent=1, default=str))
+        print("left in the project:\n" + format_residue(rep["residue"]))
+        return 1 if rep["residue"]["items"] else 0
     if a.cmd == "sweep":
         rep = housekeep(api, dry_run=a.dry_run)
         print(format_report(rep))

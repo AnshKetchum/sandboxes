@@ -99,9 +99,11 @@ python -m sandboxes.cost --run scale-200 --watch 30 --cap 120       # live table
 | daytona | 0.166 | RAM quota ~120 at 4 GiB (tested to 5 here) | 1 s / - | flat | yes, 10 GB disk |
 | modal | 0.380 | 2000 of 2000 started (Team plan: 5,000) | 0.8 s / 1.1 s / 11 s (2000) | flat | yes with `runtime: vm` |
 
-GKE (`name: gke`, not benchmarked yet): one pod per sandbox on a spot node pool; Google bills nodes, so a node meter puts the
-node bill in the ledger and a watchdog deletes what dead processes leave and scales idle pools to zero. Setup, cost model,
-deletion layers and billing reconciliation: [docs/gke.md](docs/gke.md).
+GKE (`name: gke`): one pod per sandbox on our own cluster's spot node pools (pods' storage on local NVMe where the family has
+it); Google bills nodes, so a node meter puts the node bill in the ledger and a watchdog deletes what dead processes leave and
+scales idle pools to zero. 2026-10-30, `scripts/gke/bench.py`: 1,000 of 1,000 at once (1 vCPU / 4 GiB / 10 GB, all ready in
+196 s) for $31.9/h (~$0.032 per sandbox-hour, six machine families under today's quotas), warm start 0.56 s, exec ~0.2 s a call. Setup, quotas, cost model, deletion
+layers, teardown and billing reconciliation: [docs/gke.md](docs/gke.md).
 
 `python scripts/benchmark_concurrency.py --provider X --concurrencies 1 10 100` reproduces a row;
 `python scripts/verify_costs.py` checks the cost model and the ledger against the published rates and, where the provider has an API,
@@ -114,11 +116,20 @@ set their identity once (`sandboxes.set_context(owner="euphoria")`, optionally `
 (`SandboxRouter`, `harbor_adapter.make_env` for harbor tasks), and use the same commands as everyone else:
 
 ```
-sandboxes ls    [--owner X] [--run R] [--older-than H]     what is alive, on every provider and local docker
-sandboxes stop  --owner X | --run R | --older-than H | --all [--dry-run] [--batch N --pause S]
-sandboxes reap  [--owner X]                                 delete broken sandboxes (error state, stuck creating)
+sandboxes ls    [--owner X] [--run R] [--label k=v ...] [--older-than H]   what is alive, on every provider and local docker
+sandboxes stop  --owner X | --run R | --label k=v ... | --older-than H | --all [--dry-run] [--batch N --pause S]
+sandboxes reap  [--owner X] [--label k=v ...]               delete broken sandboxes (error state, stuck creating)
+sandboxes hold  --label k=v ... [--reason T]                 no new sandbox with these labels opens, any provider
+sandboxes release --label k=v ... | sandboxes holds          lift a hold | list them
 sandboxes cost | guard | janitor | providers | audit
 ```
+
+One job of a run, not the whole run: a caller's own labels scope every command (`--label` keys AND together). Greenhouse labels
+each sandbox `greenhouse.run` and `greenhouse.task`, so one unit of a run is
+`--label greenhouse.run=R --label greenhouse.task=T`. `stop` ends that unit's open sandboxes and nothing else of the run; `hold`
+makes the library refuse that unit's next sandbox (`SandboxHeld`, on every provider, checked in `RawSandbox.start`), so the
+caller cannot just open new ones; `release` lets it open sandboxes again. Holds are per machine (`<cache dir>/holds.json`), like
+the spend caps. Pausing a unit and resuming it where it was needs the caller to keep its state: a hold only stops new sandboxes.
 
 A project's own stop/clean command is a one-line wrapper (`sandboxes.cli.stop_for("greenhouse", run=...)`): `euphoria stop`,
 `greenhouse clean`, `pr_task_synthesis/stop_lane.py` are all `sandboxes stop --owner <project>`. Every sandbox carries

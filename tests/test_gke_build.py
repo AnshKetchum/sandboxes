@@ -18,6 +18,7 @@ from sandboxes.errors import ImageBuildError
 from sandboxes.gke_build import BuildConfig, purge, purge_staging
 
 REG = "us-central1-docker.pkg.dev/p/envs"
+REAL_REGISTRY_REQUEST = gke_build.registry_request     # conftest replaces it with a refusal; this test fakes urlopen
 GiB = 2 ** 30
 
 
@@ -178,6 +179,7 @@ def test_the_build_uses_buildkit_cloud_logging_only_and_the_tasks_own_dockerfile
     step = conf["steps"][0]
     assert "DOCKER_BUILDKIT=1" in step["env"] and step["args"][step["args"].index("-f") + 1] == "docker/Dockerfile.gpu"
     assert not any(a.startswith("--network") for a in step["args"])          # BuildKit rejects --network=cloudbuild (seen live)
+    assert "BUILDKIT_SYNTAX=docker/dockerfile:1" in step["args"]             # RUN heredocs parse (seen live)
     assert conf["options"]["logging"] == "CLOUD_LOGGING_ONLY" and conf["images"] == [step["args"][step["args"].index("-t") + 1]]
 
 
@@ -326,3 +328,32 @@ def test_an_unreadable_manifest_deletes_no_blob(cloud):
     with pytest.raises(ImageBuildError, match="not deleting blobs blind"):
         gke_build.purge_files(CFG, [keep])
     assert "sha256:orphan" in cloud.files and "sha256:base" in cloud.files
+
+
+def test_a_registry_401_gets_a_fresh_token_and_one_retry(monkeypatch):
+    import urllib.error
+    tokens, seen = iter(["stale", "fresh"]), []
+    monkeypatch.setattr(gke_build, "gcloud", lambda *a, **k: next(tokens))
+    monkeypatch.setattr(gke_build, "_token", {"value": "", "t": 0.0})
+
+    class Response:
+        status = 200
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *a):
+            return False
+
+        def read(self):
+            return b"{}"
+
+    def urlopen(req, timeout):
+        seen.append(req.headers["Authorization"])
+        if req.headers["Authorization"] == "Bearer stale":
+            raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+        return Response()
+
+    monkeypatch.setattr(gke_build.urllib.request, "urlopen", urlopen)
+    assert REAL_REGISTRY_REQUEST("https://r/v2/x/manifests/y", "HEAD") == (200, b"")
+    assert seen == ["Bearer stale", "Bearer fresh"]

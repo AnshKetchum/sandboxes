@@ -171,6 +171,8 @@ class RawSandbox(ABC):
     async def start(self) -> "RawSandbox":
         from .labels import standard_labels
         self.spec.labels = standard_labels(extra=self.spec.labels)       # managed + owner + run, whatever the provider calls labels
+        from .holds import check as check_hold
+        check_hold(self.spec.labels)                    # SandboxHeld: this job is held (`sandboxes holds`), before anything is created
         from .guard import check_admission
         check_admission(self.provider, provider_cap_usd=self.spec.extra.get("spend_cap_usd"))      # SpendCapExceeded before anything is created
         last: Optional[Exception] = None

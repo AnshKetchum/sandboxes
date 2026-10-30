@@ -20,7 +20,7 @@ import gke_fakes as fk
 
 PRICE = 3.60          # USD/h for the test machine type
 VCPUS = 192
-CFG = MeterConfig(machine_prices={"c4d-standard-192": {"spot": PRICE, "ondemand": 9.0}}, disk_gb_month=0.0, cluster_fee_hour=0.0)
+CFG = MeterConfig(machine_prices={"c4d-standard-192": {"spot": PRICE, "ondemand": 9.0}}, disk_gb_month=0.0, node_ip_hour={}, cluster_fee_hour=0.0)
 MODEL = CostModel("gke", vcpu_hour=PRICE / VCPUS)
 T0 = 1_000_000.0
 
@@ -87,7 +87,7 @@ def test_a_node_alive_across_a_meter_outage_is_charged_for_all_of_it():
 
 
 def test_the_cluster_fee_starts_at_cluster_creation_and_is_then_charged_per_pass():
-    cfg = MeterConfig(machine_prices=CFG.machine_prices, disk_gb_month=0.0, cluster_fee_hour=0.10)
+    cfg = MeterConfig(machine_prices=CFG.machine_prices, disk_gb_month=0.0, node_ip_hour={}, cluster_fee_hour=0.10)
     charges, st = compute_charges(T0 + 3600, {}, [], [], cfg, MODEL, cluster_created=T0 - 3600)
     assert total(charges, "cluster_fee") == pytest.approx(0.20)
     charges, st = compute_charges(T0 + 7200, st, [], [], cfg, MODEL, cluster_created=None)
@@ -97,7 +97,7 @@ def test_the_cluster_fee_starts_at_cluster_creation_and_is_then_charged_per_pass
 def test_prices_spot_on_demand_disk_and_unknown_machine_fallback(capsys):
     cfg = MeterConfig(machine_prices={"c4d-standard-192": {"spot": 3.6, "ondemand": 9.0}},
                       fallback_vcpu_hour={"spot": 0.01, "ondemand": 0.04}, disk_gb_month=73.0, pool_disk_gb={"big": 10},
-                      default_disk_gb=1)
+                      default_disk_gb=1, node_ip_hour={})
     assert node_price_hour(node(spot=True), cfg) == pytest.approx(3.6 + 1 * 73.0 / 730)
     assert node_price_hour(node(spot=False), cfg) == pytest.approx(9.0 + 0.1)
     assert node_price_hour(node(pool="big"), cfg) == pytest.approx(3.6 + 1.0)
@@ -194,7 +194,7 @@ def test_a_node_born_and_gone_between_passes_is_charged_from_its_events():
 
 def test_an_event_only_node_with_no_removal_event_is_charged_up_to_now_at_its_pools_price():
     other = MeterConfig(machine_prices={"c4d-standard-192": {"spot": PRICE, "ondemand": 9.0}, "e2-standard-4": {"spot": 0.04}},
-                        disk_gb_month=0.0, cluster_fee_hour=0.0)
+                        disk_gb_month=0.0, node_ip_hour={}, cluster_fee_hour=0.0)
     st = {"version": 1, "last_pass": T0, "nodes": {"gke-c-system-x": {"until": T0, "price_h": 0.04, "pool": "system"}}}
     ev = [{"name": "gke-c-sandbox-spot-z", "born": T0 + 10, "died": None, "pool": "sandbox-spot"}]
     charges, _ = compute_charges(T0 + 70, st, [node("gke-c-system-x", machine="e2-standard-4", pool="system")], [], other, MODEL,
@@ -394,7 +394,7 @@ def test_a_folded_registration_older_than_the_gone_time_charges_from_the_gone_ti
 
 def test_after_a_close_out_the_cluster_fee_is_not_charged_again_from_the_clusters_creation():
     st = {"version": 1, "last_pass": T0, "nodes": {}, "gone": {}, "cluster_until": None, "cluster_closed": T0}
-    cfg = MeterConfig(machine_prices=CFG.machine_prices, disk_gb_month=0.0, cluster_fee_hour=0.10)
+    cfg = MeterConfig(machine_prices=CFG.machine_prices, disk_gb_month=0.0, node_ip_hour={}, cluster_fee_hour=0.10)
     charges, st = compute_charges(T0 + 3600, st, [], [], cfg, MODEL, cluster_created=T0 - 86400)
     assert sum(c["usd"] for c in charges if c["kind"] == "cluster_fee") == pytest.approx(0.10)
 
@@ -475,7 +475,7 @@ def test_pods_and_meter_add_up_to_the_node_bill_through_random_churn(tmp_path, m
     monkeypatch.setattr(cost, "time", SimpleNamespace(time=lambda: clock[0]))
     monkeypatch.setattr(gke_meter, "cost_model_for", lambda p: MODEL)
     monkeypatch.setattr(gke_meter, "_rate_warned", {"c4d-standard-192"})
-    cfg = MeterConfig(machine_prices=CFG.machine_prices, disk_gb_month=0.0, cluster_fee_hour=0.0)
+    cfg = MeterConfig(machine_prices=CFG.machine_prices, disk_gb_month=0.0, node_ip_hour={}, cluster_fee_hour=0.0)
     for trial in range(60):
         d = tmp_path / f"t{trial}"
         monkeypatch.setenv("SANDBOX_CACHE_DIR", str(d / "cache"))

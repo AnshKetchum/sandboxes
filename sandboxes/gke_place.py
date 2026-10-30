@@ -29,10 +29,18 @@ from typing import Optional
 import yaml
 
 POOL_LABEL = "sandboxes.pool"          # node label and taint key of every sandbox pool; pods select one and tolerate them all
+DELETING_TAINT = "ToBeDeletedByClusterAutoscaler"   # on a node the cluster autoscaler is removing
 HOURS_PER_MONTH = 730.0
-HYPERDISK_ONLY = ("c4", "c4a", "c4d", "n4", "n4d", "x4", "h4d")      # families that boot only from Hyperdisk
+HYPERDISK_ONLY = ("c4", "c4a", "c4d", "c4n", "n4", "n4d", "x4", "h4d")      # families that boot only from Hyperdisk
 COOLDOWN_S = 600.0                     # a pool that could not get a node is skipped this long
 EPS = 1e-6                             # room is counted in floats: 0.95 subtracted 90 times must still leave the 91st slot
+MEM_VISIBLE = 0.983                    # the kernel keeps ~1.7% of a VM's memory before GKE reserves its share (live 2026-10-30:
+                                       # c3d-60 235.9 of 240 GiB, c3d-90 354.1 of 360, n2d-96 377.9 of 384)
+LOCAL_SSD_GIB = 375.0                  # one local NVMe SSD (a pool's `local_ssd` counts these)
+LOCAL_SSD_GIB_MONTH = {"spot": 0.0478, "ondemand": 0.08}   # us-central1 catalog, 2026-10-30 (gke_meter.local_ssd_gib_month)
+NODE_IP_HOUR = {"spot": 0.0025, "ondemand": 0.005}         # a node's external IPv4 (gke_meter.node_ip_hour)
+# Hyperdisk Balanced (the only boot disk of N4/N4D/C4D): 3,000 IOPS and 140 MB/s are included; above that, per month
+HDB_FREE_IOPS, HDB_FREE_MBPS, HDB_IOPS_MONTH, HDB_MBPS_MONTH = 3000, 140, 0.005, 0.04
 
 
 def _fits(r, shape: "Shape") -> bool:
@@ -66,6 +74,25 @@ def allocatable_disk_gib(disk_gib: float) -> float:
     return max(0.0, float(disk_gib) * 0.9 - min(0.35 * float(disk_gib), 6.0))
 
 
+def allocatable_local_ssd_gib(count: int) -> float:
+    """Ephemeral storage on `count` local SSDs (a pool made with --ephemeral-storage-local-ssd: pods' writable layers, emptyDirs
+    and the image cache all live there, not on the boot disk): 10% eviction threshold, and the system's reservation (50 GiB
+    for one SSD, 75 for two, 100 for three or more)."""
+    n = int(count)
+    return max(0.0, n * LOCAL_SSD_GIB * 0.9 - (50.0 if n == 1 else 75.0 if n == 2 else 100.0))
+
+
+def boot_perf_hour(iops: int = 0, mbps: int = 0) -> float:
+    """Provisioned Hyperdisk Balanced performance beyond what the disk includes, per hour."""
+    return (max(0, int(iops or 0) - HDB_FREE_IOPS) * HDB_IOPS_MONTH + max(0, int(mbps or 0) - HDB_FREE_MBPS) * HDB_MBPS_MONTH) \
+        / HOURS_PER_MONTH
+
+
+def local_ssd_hour(count: int, spot: bool, gib_month: Optional[dict] = None) -> float:
+    rate = (gib_month or LOCAL_SSD_GIB_MONTH)["spot" if spot else "ondemand"]
+    return int(count) * LOCAL_SSD_GIB * float(rate) / HOURS_PER_MONTH
+
+
 @dataclass
 class Shape:
     """A sandbox's size: what it requests from its node."""
@@ -86,9 +113,11 @@ class Shape:
 
 @dataclass
 class Overhead:
-    """What every node runs besides sandboxes (DaemonSets: networking, logging, metadata server, CSI, image streaming)."""
-    cpu: float = 0.5
-    mem_gib: float = 1.5
+    """What every node runs besides sandboxes (DaemonSets: networking, logging, metadata server, CSI, image streaming), plus
+    what the kubelet keeps beyond GKE's published table. Live 2026-10-30 (c3d-60/90-lssd, n2d-96): DaemonSets request 1.25
+    vCPU (fluentbit's 256-pod variant alone 850m) and 1.07 GiB, and allocatable CPU is 0.4 under the table."""
+    cpu: float = 1.7
+    mem_gib: float = 1.6
     pods: int = 12
     image_cache_gib: float = 200.0             # task images on the node's disk (image streaming keeps only what is read)
 
@@ -109,14 +138,18 @@ class Machine:
         return self.spot_h if spot else self.ondemand_h
 
 
-def per_node(m: Machine, shape: Shape, disk_gib: Optional[float] = None, max_pods: int = 256, oh: Overhead = Overhead()) -> int:
-    """How many sandboxes of `shape` fit one node of `m` (with a boot disk of `disk_gib`; None: the disk is sized to fit)."""
+def per_node(m: Machine, shape: Shape, disk_gib: Optional[float] = None, max_pods: int = 256, oh: Overhead = Overhead(),
+             local_ssd: int = 0) -> int:
+    """How many sandboxes of `shape` fit one node of `m` (with a boot disk of `disk_gib`; None: the disk is sized to fit; with
+    `local_ssd` disks, pods' storage is on those instead of the boot disk)."""
     cpu = m.vcpus - reserved_cpu(m.vcpus) - oh.cpu
-    mem = m.mem_gib - reserved_mem_gib(m.mem_gib) - oh.mem_gib
+    visible = m.mem_gib * MEM_VISIBLE
+    mem = visible - reserved_mem_gib(visible) - oh.mem_gib
     fits = [int(cpu // shape.cpu_req) if shape.cpu_req else 10 ** 6, int(mem // shape.mem_gib) if shape.mem_gib else 10 ** 6,
             max_pods - oh.pods]
-    if disk_gib is not None and shape.disk_req:
-        fits.append(int(max(0.0, allocatable_disk_gib(disk_gib) - oh.image_cache_gib) // shape.disk_req))
+    if shape.disk_req and (local_ssd or disk_gib is not None):
+        eph = allocatable_local_ssd_gib(local_ssd) if local_ssd else allocatable_disk_gib(disk_gib)
+        fits.append(int(max(0.0, eph - oh.image_cache_gib) // shape.disk_req))
     return max(0, min(fits))
 
 
@@ -180,18 +213,32 @@ class Pool:
     disk_gib: int
     max_nodes: int                             # over all its zones
     disk_type: str = ""
+    local_ssd: int = 0                         # local NVMe SSDs holding the pods' storage (0: the boot disk holds it)
+    local_ssd_gib_month: Optional[dict] = None
+    boot_iops: int = 0                         # Hyperdisk Balanced boot disk: provisioned IOPS / MB/s (0: the included 3,000 / 140)
+    boot_mbps: int = 0
+    family_quota: Optional[float] = None       # the region's vCPU quota for its machine family (gke.quotas), shared by its pools
+    all_quota: Optional[float] = None          # vCPUs every sandbox pool together may hold (gke.quotas.ALL: CPUS_ALL_REGIONS,
+                                               # less what runs outside the sandbox pools)
 
     @property
     def node_h(self) -> Optional[float]:
         p = self.machine.price(self.spot)
-        return None if p is None else p + disk_hour(self.disk_gib)
+        if p is None:
+            return None
+        return (p + disk_hour(self.disk_gib) + local_ssd_hour(self.local_ssd, self.spot, self.local_ssd_gib_month)
+                + boot_perf_hour(self.boot_iops, self.boot_mbps) + NODE_IP_HOUR["spot" if self.spot else "ondemand"])
+
+    def per_node(self, shape: Shape, max_pods: int = 256, oh: Overhead = Overhead()) -> int:
+        return per_node(self.machine, shape, self.disk_gib, max_pods, oh, self.local_ssd)
 
 
 @dataclass
 class Snapshot:
     """What the sandbox pools hold now: nodes per pool, and per node the room left (cpu, mem GiB, disk GiB, pods)."""
     nodes: dict = field(default_factory=dict)          # pool -> number of nodes (up or coming)
-    room: dict = field(default_factory=dict)           # pool -> [[cpu, mem, disk, pods], ...] per ready node
+    room: dict = field(default_factory=dict)           # pool -> [[cpu, mem, disk, pods], ...] per schedulable node
+    pending: dict = field(default_factory=dict)        # pool -> [(cpu, mem GiB, disk GiB), ...] of pods not yet on a node
     taken_at: float = 0.0
 
 
@@ -230,7 +277,12 @@ def load_catalog(path: Optional[os.PathLike] = None) -> tuple:
         pr = prices.get(mt) or {}
         m = Machine(mt, float(shapes[mt]["vcpus"]), float(shapes[mt]["mem_gib"]), pr.get("spot"), pr.get("ondemand"))
         pools.append(Pool(e["name"], m, bool(e.get("spot", True)), int(e.get("disk_gb", 1000)), max_nodes_of(e, zones),
-                          e.get("disk_type", "")))
+                          e.get("disk_type", ""), int(e.get("local_ssd", 0) or 0), meter.get("local_ssd_gib_month"),
+                          int(e.get("boot_iops", 0) or 0), int(e.get("boot_mbps", 0) or 0)))
+    quotas = {str(k).upper(): float(v) for k, v in (g.get("quotas") or {}).items()}
+    for pool in pools:
+        pool.family_quota = quotas.get(pool.machine.family.upper())
+        pool.all_quota = quotas.get("ALL")
     oh = Overhead(**(g.get("node_overhead") or {}))
     return pools, oh, int(g.get("max_pods_per_node", 256))
 
@@ -248,7 +300,7 @@ def place(shape: Shape, pools: list, snap: Optional[Snapshot] = None, *, oh: Ove
             continue
         if (spot == "only" and not p.spot) or (spot == "never" and p.spot) or p.node_h is None:
             continue
-        n = per_node(p.machine, shape, p.disk_gib, max_pods, oh)
+        n = p.per_node(shape, max_pods, oh)
         if n <= 0:
             continue
         cands.append((p, n, p.node_h / n))
@@ -259,12 +311,20 @@ def place(shape: Shape, pools: list, snap: Optional[Snapshot] = None, *, oh: Ove
     if warm:
         p, n, rate = min(warm, key=lambda c: c[2])
         return Placement(p.name, rate, n, "room on a running node")
-    cold = [(p, n, rate) for p, n, rate in cands
-            if snap.nodes.get(p.name, 0) < p.max_nodes and now >= cooldown.get(p.name, 0.0)]
+    used: dict = {}                                  # vCPUs of each machine family's nodes, over every pool of the family
+    for p in pools:
+        used[p.machine.family] = used.get(p.machine.family, 0.0) + snap.nodes.get(p.name, 0) * p.machine.vcpus
+    used_all = sum(used.values())
+
+    def can_grow(p):
+        return snap.nodes.get(p.name, 0) < p.max_nodes and \
+            (p.family_quota is None or used[p.machine.family] + p.machine.vcpus <= p.family_quota + EPS) and \
+            (p.all_quota is None or used_all + p.machine.vcpus <= p.all_quota + EPS)
+    cold = [(p, n, rate) for p, n, rate in cands if can_grow(p) and now >= cooldown.get(p.name, 0.0)]
     if not cold:
-        cold = [(p, n, rate) for p, n, rate in cands if snap.nodes.get(p.name, 0) < p.max_nodes]   # all cooling: try anyway
+        cold = [(p, n, rate) for p, n, rate in cands if can_grow(p)]                               # all cooling: try anyway
     if not cold:
-        raise LookupError(f"every sandbox pool that fits {shape} is at its node ceiling")
+        raise LookupError(f"every sandbox pool that fits {shape} is at its node ceiling or its family's vCPU quota")
     if spot == "prefer" and any(c[0].spot for c in cold):
         cold = [c for c in cold if c[0].spot]                  # on-demand pools are the fallback when no spot pool can grow
     p, n, rate = min(cold, key=lambda c: c[2])
@@ -303,16 +363,29 @@ def snapshot_from_api(api, pool_names) -> Snapshot:
         pool = (n.metadata.labels or {}).get(POOL_LABEL)
         if pool not in pool_names:
             continue
+        taints = {getattr(t, "key", "") for t in (getattr(getattr(n, "spec", None), "taints", None) or [])}
+        if DELETING_TAINT in taints:
+            continue                    # the autoscaler is removing it: no room, and not a node toward the pool's ceiling
         snap.nodes[pool] = snap.nodes.get(pool, 0) + 1
         a = getattr(n.status, "allocatable", None) or {}
-        ready = any(c.type == "Ready" and c.status == "True" for c in (getattr(n.status, "conditions", None) or []))
         unsched = bool(getattr(getattr(n, "spec", None), "unschedulable", False))
-        if ready and not unsched:
+        if not unsched:                 # Ready, or registered and coming up: either way its room is spoken for by what we place
             nodes[n.metadata.name] = [pool, [_qty(a.get("cpu"), "cpu"), _qty(a.get("memory"), "mem"),
                                              _qty(a.get("ephemeral-storage"), "disk"), int(a.get("pods", 0) or 0)]]
     for p in api.list_pod_for_all_namespaces().items or []:
         node = getattr(p.spec, "node_name", None)
-        if node not in nodes or getattr(p.status, "phase", None) in ("Succeeded", "Failed"):
+        if getattr(p.status, "phase", None) in ("Succeeded", "Failed"):
+            continue
+        if node is None:                # placed on a pool whose node is not there yet: it will take room there
+            pool = (getattr(p.spec, "node_selector", None) or {}).get(POOL_LABEL)
+            if pool in pool_names and getattr(p.metadata, "deletion_timestamp", None) is None:
+                cpu = mem = disk = 0.0
+                for c in getattr(p.spec, "containers", None) or []:
+                    req = (getattr(getattr(c, "resources", None), "requests", None) or {})
+                    cpu += _qty(req.get("cpu"), "cpu"); mem += _qty(req.get("memory"), "mem"); disk += _qty(req.get("ephemeral-storage"), "disk")
+                snap.pending.setdefault(pool, []).append((cpu, mem, disk))
+            continue
+        if node not in nodes:
             continue
         r = nodes[node][1]
         r[3] -= 1
@@ -342,6 +415,15 @@ class Placer:
                 except Exception as e:  # noqa: BLE001 — no snapshot: place by price alone
                     print(f"[sandboxes] gke_place: cannot read the cluster ({e!r}); placing by price only", file=sys.stderr, flush=True)
                     self.snap = Snapshot(taken_at=time.time())
+                # Pods placed but not on a node yet (waiting for a scale-up) hold their room: without this, a refresh during a
+                # burst forgot every placement whose node had not come up and sent the next ones to the same pool again
+                # (live, 1,000 at once: 372 pods sent to a 2-node pool of 180, and none to the next pool).
+                by_name = {p.name: p for p in pools}
+                for pool, reqs in self.snap.pending.items():
+                    for cpu, mem, disk in reqs:
+                        sh = Shape(cpu, mem, disk, 1.0)
+                        reserve(self.snap, pool, sh, max(1, by_name[pool].per_node(sh, kw.get("max_pods", 256),
+                                                                                   kw.get("oh", Overhead()))))
             pl = place(shape, pools, self.snap, cooldown=self.cooldown, **kw)
             reserve(self.snap, pl.pool, shape, pl.per_node)
             return pl
@@ -385,8 +467,8 @@ def main(argv=None) -> int:
             print(("  " if a.max_usd_h is None or o.total_h <= a.max_usd_h else "x ") + o.line())
         return 0 if opts and (a.max_usd_h is None or opts[0].total_h <= a.max_usd_h) else 1
     pools, oh, max_pods = load_catalog()
-    for p in sorted(pools, key=lambda p: (p.node_h or 1e9) / max(1, per_node(p.machine, shape, p.disk_gib, max_pods, oh))):
-        n = per_node(p.machine, shape, p.disk_gib, max_pods, oh)
+    for p in sorted(pools, key=lambda p: (p.node_h or 1e9) / max(1, p.per_node(shape, max_pods, oh))):
+        n = p.per_node(shape, max_pods, oh)
         rate = (p.node_h / n) if n and p.node_h else None
         print(f"{p.name:<24} {p.machine.name:<18} {'spot' if p.spot else 'on demand':<9} {n:>4}/node  up to {p.max_nodes} nodes  "
               + (f"${rate:.5f}/sandbox-h" if rate else "does not fit"))

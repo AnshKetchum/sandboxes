@@ -55,9 +55,12 @@ class FakeGcloud:
             return ""
         if a[:2] == ["storage", "du"]:
             return self.lists.get("du", {}).get(a[-1], "0  " + a[-1])
+        if a[:2] in (["builds", "cancel"], ["storage", "rm"]) or a[:3] == ["artifacts", "repositories", "delete"]:
+            return ""
         if a[:3] in (["compute", "instances", "list"], ["compute", "disks", "list"], ["compute", "snapshots", "list"],
                      ["compute", "images", "list"], ["compute", "addresses", "list"], ["compute", "forwarding-rules", "list"],
-                     ["artifacts", "repositories", "list"], ["storage", "buckets", "list"], ["container", "clusters", "list"]):
+                     ["artifacts", "repositories", "list"], ["storage", "buckets", "list"], ["container", "clusters", "list"],
+                     ["builds", "list", "--ongoing"]):
             return "[]"
         raise AssertionError(f"unexpected gcloud {a}")
 
@@ -109,6 +112,24 @@ def test_applying_the_plan_creates_tainted_labelled_pools_and_never_deletes_one_
     assert any(c[:4] == ["container", "node-pools", "delete", "old-sandboxes"] for c in g.calls)
 
 
+def test_a_local_ssd_pool_puts_pod_storage_on_nvme_and_a_change_of_ssds_is_a_replace(g):
+    p = {"name": "c3d-90-lssd-spot", "machine": "c3d-standard-90-lssd", "spot": True, "disk_gb": 100, "local_ssd": 8, "max_nodes": 2}
+    args = gke_ops.create_pool_args(cfg(), p)
+    assert args[args.index("--ephemeral-storage-local-ssd") + 1] == "count=8" and args[args.index("--disk-size") + 1] == "100"
+    assert "--ephemeral-storage-local-ssd" not in gke_ops.create_pool_args(cfg(), CATALOG[0])
+    hd = gke_ops.create_pool_args(cfg(), {"name": "n4d", "machine": "n4d-standard-96", "boot_iops": 30000, "boot_mbps": 1000})
+    assert hd[hd.index("--disk-type") + 1] == "hyperdisk-balanced" and hd[hd.index("--boot-disk-provisioned-iops") + 1] == "30000"
+    assert hd[hd.index("--boot-disk-provisioned-throughput") + 1] == "1000"
+    c4n = gke_ops.create_pool_args(cfg(), {"name": "c4n", "machine": "c4n-standard-96", "zones": ["us-central1-a"]})
+    assert c4n[c4n.index("--disk-type") + 1] == "hyperdisk-balanced" and c4n[c4n.index("--node-locations") + 1] == "us-central1-a"
+    c = cfg()
+    c.pools, c.sandbox_pools = [p], [p["name"]]
+    g.pools = {p["name"]: pool_json(p["name"], p["machine"], True, 100, 2)}
+    assert [a for a, _, _ in gke_ops.plan_pools(c, gke_ops.cluster_pools(c))] == ["replace"]      # made without the SSDs
+    g.pools[p["name"]]["config"]["ephemeralStorageLocalSsdConfig"] = {"localSsdCount": 8}
+    assert [a for a, _, _ in gke_ops.plan_pools(c, gke_ops.cluster_pools(c))] == ["ok"]
+
+
 # -- down and up -------------------------------------------------------------------------------------------------------------
 def test_down_leaves_no_pod_no_node_no_image_and_no_upload(g, k8s, monkeypatch):
     purged = {}
@@ -116,6 +137,7 @@ def test_down_leaves_no_pod_no_node_no_image_and_no_upload(g, k8s, monkeypatch):
         project="p", registry="r/p/envs", bucket="stage", region="us-central1")))
     monkeypatch.setattr(gke_build, "purge", lambda bcfg, all_images=False, **kw: purged.setdefault("images", all_images) and {"deleted": ["x"]})
     monkeypatch.setattr(gke_build, "purge_staging", lambda bcfg, older_than_s=3600, **kw: purged.setdefault("uploads", older_than_s) or 1)
+    monkeypatch.setattr(gke_build, "cancel_ongoing", lambda bcfg: [])
     k8s.nodes = [fk.make_node("gke-c-c3d-180-spot-1", time.time(), pool="c3d-180-spot"),
                  fk.make_node("gke-c-default-pool-1", time.time(), pool="default-pool", spot=False)]
     sb = GKERaw(spec()); run(sb.start())
@@ -129,6 +151,56 @@ def test_down_leaves_no_pod_no_node_no_image_and_no_upload(g, k8s, monkeypatch):
     assert off and off[0] < sys_resize[0]                                    # autoscaling off first, or it would bring a node back
     assert rep["residue"]["items"] == [] and not [e for e in ledger_events(k8s) if e["ev"] == "open"
                                                   and e["id"] not in {x["id"] for x in ledger_events(k8s) if x["ev"] == "close"}]
+
+
+def test_down_also_empties_a_pool_of_ours_that_the_catalog_does_not_name(g, k8s):
+    """A pool made from another catalog (a benchmark's, another worktree's) or disabled since: its nodes bill all the same."""
+    k8s.nodes = [fk.make_node("gke-c-bench-1", time.time(), pool="bench-lssd", sandbox_pool="bench-lssd"),
+                 fk.make_node("gke-c-default-pool-1", time.time(), pool="default-pool", spot=False)]
+    gke_ops.down(k8s, cfg())
+    resized = {c[c.index("--node-pool") + 1] for c in g.calls if c[:3] == ["container", "clusters", "resize"]}
+    assert "bench-lssd" in resized and not k8s.nodes
+
+
+def _build_config(monkeypatch):
+    monkeypatch.setattr(gke_build.BuildConfig, "load", classmethod(lambda cls, path=None: gke_build.BuildConfig(
+        project="p", registry="us-central1-docker.pkg.dev/p/envs", bucket="stage", region="us-central1")))
+
+
+def test_down_cancels_builds_still_running_before_it_purges_the_registry(g, k8s, monkeypatch):
+    """A build that finished after the purge would push an image that bills until the cleanup policy (days)."""
+    _build_config(monkeypatch)
+    order = []
+    monkeypatch.setattr(gke_build, "purge", lambda bcfg, all_images=False, **kw: order.append("purge") or {"deleted": []})
+    monkeypatch.setattr(gke_build, "purge_staging", lambda bcfg, older_than_s=3600, **kw: 0)
+    real = g.__call__
+
+    def gc(*args, timeout=0):
+        if list(args[:3]) == ["builds", "list", "--ongoing"] and "purge" not in order:
+            return json.dumps([{"id": "b-1", "status": "WORKING"}])
+        if list(args[:2]) == ["builds", "cancel"]:
+            order.append(f"cancel {args[2]}")
+        return real(*args, timeout=timeout)
+    monkeypatch.setattr(gke_ops, "gcloud", gc)
+    monkeypatch.setattr(gke_build, "gcloud", gc)
+    rep = gke_ops.down(k8s, cfg())
+    assert order == ["cancel b-1", "purge"] and rep["builds_cancelled"] == ["b-1"]
+
+
+def test_destroy_removes_the_cluster_the_repository_and_the_bucket_and_audits_nothing_left(g, k8s, monkeypatch):
+    _build_config(monkeypatch)
+    monkeypatch.setattr(gke_build, "gcloud", g)
+    monkeypatch.setattr(gke_build, "purge", lambda bcfg, all_images=False, **kw: {"deleted": []})
+    monkeypatch.setattr(gke_build, "purge_staging", lambda bcfg, older_than_s=3600, **kw: 0)
+    k8s.nodes = [fk.make_node("gke-c-c3d-180-spot-1", time.time(), pool="c3d-180-spot", sandbox_pool="c3d-180-spot"),
+                 fk.make_node("gke-c-default-pool-1", time.time(), pool="default-pool", spot=False)]
+    sb = GKERaw(spec()); run(sb.start())
+    rep = gke_ops.destroy(k8s, cfg())
+    assert not k8s.pods and not k8s.nodes
+    assert any(c[:3] == ["container", "clusters", "delete"] for c in g.calls)
+    assert ["artifacts", "repositories", "delete", "envs", "--location", "us-central1", "--project", "p", "--quiet"] in g.calls
+    assert ["storage", "rm", "--recursive", "gs://stage"] in g.calls
+    assert rep["repository_deleted"] == "envs" and rep["bucket_deleted"] == "stage" and rep["residue"]["items"] == []
 
 
 def test_up_brings_the_system_pool_back_and_waits_for_a_ready_node(g, k8s):
@@ -204,6 +276,10 @@ def test_residue_prices_everything_that_bills_while_idle_and_says_what_it_could_
         "container clusters list": [{"name": "c", "location": "us-central1-a"}],
         "compute instances list": [{"name": "gke-c-x", "status": "RUNNING", "machineType": "zones/a/machineTypes/c3d-standard-180",
                                     "scheduling": {"provisioningModel": "SPOT"}},
+                                   {"name": "gke-c-lssd", "status": "RUNNING", "machineType": "x/c3d-standard-180",
+                                    "scheduling": {"provisioningModel": "SPOT"},
+                                    "disks": [{"type": "PERSISTENT", "diskSizeGb": "100"}] + [{"type": "SCRATCH", "diskSizeGb": "375"}] * 2,
+                                    "networkInterfaces": [{"accessConfigs": [{"natIP": "34.1.2.3"}]}]},
                                    {"name": "stopped", "status": "TERMINATED", "machineType": "x/e2-small"}],
         "compute disks list": [{"name": "gke-c-x", "sizeGb": "2200", "type": "x/pd-balanced", "users": ["vm"]},
                                {"name": "pvc-lost", "sizeGb": "100", "type": "x/pd-ssd"}],
@@ -215,7 +291,11 @@ def test_residue_prices_everything_that_bills_while_idle_and_says_what_it_could_
     mcfg = type("M", (), {"machine_prices": {"c3d-standard-180": {"spot": 1.9732}}})()
     r = gke_ops.residue(cfg(), mcfg)
     what = {i["what"]: i for i in r["items"]}
-    assert what["VM"]["usd_month"] == pytest.approx(1.9732 * 730) and "stopped" not in json.dumps(r["items"])
+    vms = {i["detail"].split()[0]: i for i in r["items"] if i["what"] == "VM"}
+    assert vms["gke-c-x"]["usd_month"] == pytest.approx(1.9732 * 730) and "stopped" not in json.dumps(r["items"])
+    # local SSDs and an external IP bill with the VM, and are not in the disk listing
+    assert vms["gke-c-lssd"]["usd_month"] == pytest.approx(1.9732 * 730 + 750 * 0.0478 + 0.0025 * 730)
+    assert "750 GiB local SSD" in vms["gke-c-lssd"]["detail"] and "1 external IP" in vms["gke-c-lssd"]["detail"]
     assert what["ORPHANED disk"]["usd_month"] == pytest.approx(17.0) and what["disk"]["usd_month"] == pytest.approx(220.0)
     assert what["registry storage"]["usd_month"] == pytest.approx(0.95) and what["bucket storage"]["usd_month"] == pytest.approx(0.04)
     assert what["GKE cluster"]["usd_month"] == pytest.approx(73.0)

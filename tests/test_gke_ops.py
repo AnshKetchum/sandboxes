@@ -319,7 +319,7 @@ def test_status_shows_pools_burn_pods_and_queued_deletes(ops):
     a = GKERaw(spec(labels={"sandboxes.run": "r1"})); run(a.start())
     queue_pending_delete("sbx-x", "sandboxes", "500")
     st = gke_ops.status(ops)
-    assert st["pools"][POOL]["nodes"] == 2 and st["pools"][POOL]["usd_per_hour"] == pytest.approx(7.2)
-    assert st["burn_usd_per_hour"] == pytest.approx(7.3) and st["pods_by_run"] == {"r1": 1} and st["pending_deletes"] == 1
+    assert st["pools"][POOL]["nodes"] == 2 and st["pools"][POOL]["usd_per_hour"] == pytest.approx(7.2 + 2 * 0.0025)   # + IPs
+    assert st["burn_usd_per_hour"] == pytest.approx(7.305) and st["pods_by_run"] == {"r1": 1} and st["pending_deletes"] == 1
     assert "DELETES QUEUED" in gke_ops.format_status(st)
     run(a.stop())

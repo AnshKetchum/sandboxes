@@ -161,7 +161,7 @@ def test_the_ledger_side_matches_what_the_backend_and_meter_wrote(tmp_path, monk
     api.nodes = [fk.make_node("gke-c-sandbox-spot-1", t0)]
     monkeypatch.setattr(gke_raw, "_core", lambda: api)
     monkeypatch.setattr(gke_raw, "_stream_exec", fk.local_exec)
-    cfg = gke_meter.MeterConfig(machine_prices={"c4d-standard-192": {"spot": 3.6}}, disk_gb_month=0, cluster_fee_hour=0.1)
+    cfg = gke_meter.MeterConfig(machine_prices={"c4d-standard-192": {"spot": 3.6}}, disk_gb_month=0, node_ip_hour={}, cluster_fee_hour=0.1)
     monkeypatch.setattr(gke_meter.MeterConfig, "load", classmethod(lambda cls, path=None: cfg))
     monkeypatch.setattr(gke_meter, "MIN_INTERVAL_S", 1e9)                              # only the forced passes below
     sb = gke_raw.GKERaw(spec(cpu=1))

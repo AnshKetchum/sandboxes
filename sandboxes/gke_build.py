@@ -95,15 +95,21 @@ MANIFEST_TYPES = ", ".join(["application/vnd.oci.image.index.v1+json", "applicat
 
 
 def registry_request(url: str, method: str = "GET") -> tuple:
-    """(HTTP status, body) of a registry request, with this machine's gcloud credentials."""
-    if time.time() - _token["t"] > 1800:
-        _token.update(value=gcloud("auth", "print-access-token").strip(), t=time.time())
-    req = urllib.request.Request(url, method=method, headers={"Authorization": f"Bearer {_token['value']}", "Accept": MANIFEST_TYPES})
-    try:
-        with urllib.request.urlopen(req, timeout=30) as r:
-            return r.status, (r.read() if method == "GET" else b"")
-    except urllib.error.HTTPError as e:
-        return e.code, b""
+    """(HTTP status, body) of a registry request, with this machine's gcloud credentials. gcloud hands out its cached
+    token, which may be minutes from expiry, so a 401 gets a fresh token and one retry (live: 401s for ~25 min of every
+    30-min cache window once the login's first token aged out, failing every sandbox start in that window)."""
+    for attempt in range(2):
+        if attempt or time.time() - _token["t"] > 1800:
+            _token.update(value=gcloud("auth", "print-access-token").strip(), t=time.time())
+        req = urllib.request.Request(url, method=method,
+                                     headers={"Authorization": f"Bearer {_token['value']}", "Accept": MANIFEST_TYPES})
+        try:
+            with urllib.request.urlopen(req, timeout=30) as r:
+                return r.status, (r.read() if method == "GET" else b"")
+        except urllib.error.HTTPError as e:
+            if e.code != 401 or attempt:
+                return e.code, b""
+    return 401, b""
 
 
 # -- the record of what we pushed --------------------------------------------------------------------------------------------
@@ -167,8 +173,11 @@ def image_exists(ref: str) -> bool:
 
 
 def build_config_yaml(cfg: BuildConfig, ref: str, dockerfile_rel: str) -> str:
+    # BUILDKIT_SYNTAX: the builder's own Dockerfile frontend predates RUN heredocs (`cat > f <<'EOF'`), which task
+    # Dockerfiles use and Modal/Daytona/docker build; the current frontend parses them (live: "unknown instruction").
     conf = {"steps": [{"name": "gcr.io/cloud-builders/docker", "env": ["DOCKER_BUILDKIT=1"],
-                       "args": ["build", "-t", ref, "-f", dockerfile_rel, "."]}],     # BuildKit refuses --network=cloudbuild
+                       "args": ["build", "--build-arg", "BUILDKIT_SYNTAX=docker/dockerfile:1", "-t", ref,
+                                "-f", dockerfile_rel, "."]}],     # BuildKit refuses --network=cloudbuild
             "images": [ref], "timeout": f"{int(cfg.timeout_s)}s",
             "options": {"machineType": cfg.machine_type, "logging": "CLOUD_LOGGING_ONLY"}}
     if cfg.service_account:
@@ -456,3 +465,18 @@ def purge_staging(cfg: BuildConfig, older_than_s: float = 3600.0, now: Optional[
     for i in range(0, len(old), 100):
         gcloud("storage", "rm", *old[i:i + 100])
     return len(old)
+
+
+def cancel_ongoing(cfg: BuildConfig) -> list:
+    """Cancel every build still queued or running in the project's build region: one that finished after `down` purged the
+    registry would push an image that bills until the cleanup policy removes it. Returns the cancelled build ids."""
+    if not (cfg.project and cfg.region):
+        return []
+    ids = [b["id"] for b in json.loads(gcloud("builds", "list", "--ongoing", "--format=json", "--project", cfg.project,
+                                              "--region", cfg.region) or "[]") if b.get("id")]
+    for bid in ids:
+        try:
+            gcloud("builds", "cancel", bid, "--project", cfg.project, "--region", cfg.region)
+        except RuntimeError as e:
+            print(f"[sandboxes] gke_build: could not cancel build {bid}: {str(e)[:200]}", file=sys.stderr, flush=True)
+    return ids
