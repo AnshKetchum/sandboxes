@@ -100,8 +100,8 @@ cluster, the image repository and the build bucket.
 
 ## Performance and scale (2026-10-30, `scripts/gke/bench.py`)
 
-The greenhouse evolve runs on GKE found sandboxes ~2x slower than Modal on file-heavy work (docs/gke_field_notes.md in the main
-checkout). Measured since, with python:3.12-slim sandboxes of 1 vCPU / 4 GiB / 10 GB, from this machine (New Jersey, ~32 ms to
+The greenhouse evolve runs on GKE found sandboxes ~2x slower than Modal on file-heavy work
+([gke_field_notes.md](gke_field_notes.md)). Measured since, with python:3.12-slim sandboxes of 1 vCPU / 4 GiB / 10 GB, from this machine (New Jersey, ~32 ms to
 us-central1):
 
 **Disk.** Pods wrote to overlay on the node's network boot disk, shared by every pod of the node. Same machine (c3d-standard-30),
