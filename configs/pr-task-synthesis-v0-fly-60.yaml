@@ -1,0 +1,10 @@
+# Fly-only pool for a 200-concurrent build-and-run check of fly_raw (Dockerfiles built in Fly builder VMs, pushed to registry.fly.io).
+total_spend_cap_usd: 700
+sandbox_providers:
+  - name: fly
+    cpu: 1
+    memory_mb: 2048
+    peak_concurrent_sandboxes: 60
+    spend_cap_usd: 300
+    auto_delete_minutes: 180
+    extra: {cpu_kind: performance, region: iad}

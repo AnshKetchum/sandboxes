@@ -1,0 +1,5 @@
+total_spend_cap_usd: 2580
+sandbox_providers:
+  - {base: /ansh/sandboxes/configs/daytona.yaml, overrides: {cpu: 2, memory_mb: 4096, disk_gb: 10, peak_concurrent_sandboxes: 15, auto_delete_minutes: 120}}
+  - {base: /ansh/sandboxes/configs/e2b.yaml, overrides: {cpu: 2, memory_mb: 4096, peak_concurrent_sandboxes: 25, auto_delete_minutes: 120}}
+  - {base: /ansh/sandboxes/configs/fly.yaml, overrides: {cpu: 2, memory_mb: 4096, peak_concurrent_sandboxes: 15, auto_delete_minutes: 120}}

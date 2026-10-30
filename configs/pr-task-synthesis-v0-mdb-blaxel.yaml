@@ -1,0 +1,30 @@
+# Euphoria pool for pr-task-synthesis-v0: modal 100 + daytona 230 + e2b 50 (380 total), none needs a prebuilt image.
+#   daytona 230  its own base: 1 vCPU / 2 GiB / 8 GB (fits the account caps only at this size); builds the Dockerfile server-side
+#   modal   100  Daytona-sized, runtime vm; Image.from_dockerfile (heavy toolchain Dockerfiles can run out of builder memory)
+total_spend_cap_usd: 700                # the ledger holds ~$430 of mostly stale open entries: raise this or clean the ledger before a long run
+# + blaxel 100 (memory 8192: its root fs is RAM-backed, half the memory, and the grove harness needs ~0.5 GiB of it plus the task repo): its image builds run ~10 at a time (1-4 min each), so more slots than ~100 just queue; failed or stuck (>10 min) builds fail fast
+# and images are deleted after use / by the janitor (python -m sandboxes janitor).
+sandbox_providers:
+  - {base: /ansh/sandboxes/configs/daytona.yaml, overrides: {peak_concurrent_sandboxes: 230}}
+  # e2b at 50 to start (plan allows 100): builds are gated to 15 at once and a cold pool fills over ~10 min; ~90% of tasks build there (the rest fail fast and retry elsewhere)
+  - {base: /ansh/sandboxes/configs/e2b.yaml, overrides: {peak_concurrent_sandboxes: 50}}
+  - name: modal
+    cpu: 1
+    memory_mb: 2048
+    peak_concurrent_sandboxes: 100     # the Modal workspace limit is 100 concurrent sandboxes (dashboard); more just queue in scheduling
+    spend_cap_usd: 2500
+    auto_delete_minutes: 180
+    extra: {runtime: vm}
+  # blaxel 100 at 8192 MiB: its root fs is RAM-backed (half the memory; the grove harness alone needs ~0.5 GiB of it), builds run ~10 at a time, and
+  # a failed or stuck (>10 min of actual building) build fails fast. Evidence for these settings: /ansh/euphoria_runs/pr-task-synthesis-v0-blaxel-test-200.
+  - {base: /ansh/sandboxes/configs/blaxel.yaml, overrides: {peak_concurrent_sandboxes: 100, memory_mb: 8192}}
+  # fly 60: builds a task's Dockerfile in a Fly builder VM, pushes it to registry.fly.io and boots from there (or boots a prebuilt image directly).
+  # Tested in isolation at this size (pr-task-synthesis-v0-fly-60: 0 machine-limit errors). The org's Fly machine limit is ~100 live machines INCLUDING
+  # builder VMs (SANDBOX_FLY_BUILD_SLOTS, default 12), so 60 + 12 stays under it; do not raise this without asking Fly what the limit is.
+  - name: fly
+    cpu: 1
+    memory_mb: 2048
+    peak_concurrent_sandboxes: 60
+    spend_cap_usd: 300
+    auto_delete_minutes: 180
+    extra: {cpu_kind: performance, region: iad}

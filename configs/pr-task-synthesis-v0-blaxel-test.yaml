@@ -1,0 +1,6 @@
+# Blaxel-only check: concurrent sandboxes that build the task image (Dockerfile) and run the agent + verifier, as they would inside the main run.
+# memory 8192: Blaxel's root filesystem is half the sandbox memory, and the grove harness alone needs ~540 MiB of it (390 MiB venv + the tarballs),
+# so 2048 (996 MiB of root) and 4096 (2 GiB) fails agent setup with tar exit 2.
+total_spend_cap_usd: 1500
+sandbox_providers:
+  - {base: /ansh/sandboxes/configs/blaxel.yaml, overrides: {peak_concurrent_sandboxes: 100, memory_mb: 8192}}

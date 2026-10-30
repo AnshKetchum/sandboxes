@@ -1,0 +1,23 @@
+# Euphoria pool for pr-task-synthesis-v0: daytona 230 (its own base: 1 vCPU / 2 GiB / 8 GB, fits the account caps only at this size)
+# + modal 500 (Daytona-sized, 1 vCPU / 2 GiB, runtime vm). Neither needs a prebuilt image: daytona builds the Dockerfile server-side
+# (euphoria run.auto_snapshot), modal builds it with Image.from_dockerfile (modal_raw). Heavy toolchain Dockerfiles can still fail to build
+# on modal (the builder runs out of memory).
+total_spend_cap_usd: 700                # the ledger is at ~$433 (mostly stale open entries): raise this or clean the ledger before a long run
+sandbox_providers:
+  - {base: /ansh/sandboxes/configs/daytona.yaml, overrides: {peak_concurrent_sandboxes: 230}}
+  - name: modal
+    cpu: 1
+    memory_mb: 2048
+    peak_concurrent_sandboxes: 100     # the Modal workspace limit is 100 concurrent sandboxes (dashboard); more just queue in scheduling
+    spend_cap_usd: 2500
+    auto_delete_minutes: 180
+    extra: {runtime: vm}
+  # fly: builds a task's Dockerfile in a Fly builder VM (volume-backed docker), pushes it to registry.fly.io and boots from there (fly_raw);
+  # prebuilt images boot directly. Daytona-sized (1 vCPU / 2 GiB, performance preset). 200 of the ~190-260 machines Fly allows the org (tested at 200 concurrent in pr-task-synthesis-v0-fly-200.yaml, which has this same entry).
+  - name: fly
+    cpu: 1
+    memory_mb: 2048
+    peak_concurrent_sandboxes: 200
+    spend_cap_usd: 300
+    auto_delete_minutes: 180
+    extra: {cpu_kind: performance, region: iad}

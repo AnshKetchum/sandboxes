@@ -1,0 +1,18 @@
+# Sandbox pool for euphoria/configs/pr-task-synthesis-v0-grove.yaml, concurrency pinned per provider to
+# the "Max Concurrent" figures in "Cost comparisons - formulas.xlsx" (2026-10-06). Sizes are each base
+# config's own (daytona/e2b/blaxel 1 vCPU / 2 GiB / 8 GB; fly 2 vCPU / 4 GiB), i.e. NOT the 2/4/10 the
+# sheet's per-sandbox cost columns (H:J) currently model: set H:J to match before reading $/hr or runway.
+#
+#   daytona  230  its own base value; fits the account caps (250 vCPU / 500 GiB RAM / 2000 GiB disk) only at
+#                 this size: at 2 vCPU / 4 GiB the same caps allow ~125, so do not raise cpu/memory here
+#   blaxel   200  the sheet's figure (blaxel.yaml says 250, measured); NOTE its root fs is RAM-backed, so
+#                 large task images may not fit
+#   e2b      100  Pro plan limit
+#   fly      200  performance preset (shared is ~3x cheaper per hour but unmeasured). Runs harbor tasks through
+#                 sandboxes.harbor_raw (prebuilt images only), since harbor has no native Fly environment.
+total_spend_cap_usd: 500                # same as multi.yaml / multi-dind.yaml
+sandbox_providers:
+  - {base: /ansh/sandboxes/configs/daytona.yaml, overrides: {peak_concurrent_sandboxes: 230}}
+  - {base: /ansh/sandboxes/configs/blaxel.yaml, overrides: {peak_concurrent_sandboxes: 200}}
+  - {base: /ansh/sandboxes/configs/e2b.yaml, overrides: {peak_concurrent_sandboxes: 100}}
+  - {base: /ansh/sandboxes/configs/fly.yaml, overrides: {peak_concurrent_sandboxes: 200}}
