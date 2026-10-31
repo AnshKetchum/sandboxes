@@ -5,6 +5,7 @@ ledger, and nothing left behind: no source upload, and no image once it is unuse
 from __future__ import annotations
 
 import datetime as dt
+import hashlib
 import json
 import threading
 import time
@@ -180,7 +181,12 @@ def test_the_build_uses_buildkit_cloud_logging_only_and_the_tasks_own_dockerfile
     assert "DOCKER_BUILDKIT=1" in step["env"] and step["args"][step["args"].index("-f") + 1] == "docker/Dockerfile.gpu"
     assert not any(a.startswith("--network") for a in step["args"])          # BuildKit rejects --network=cloudbuild (seen live)
     assert "BUILDKIT_SYNTAX=docker/dockerfile:1" in step["args"]             # RUN heredocs parse (seen live)
-    assert conf["options"]["logging"] == "CLOUD_LOGGING_ONLY" and conf["images"] == [step["args"][step["args"].index("-t") + 1]]
+    ref = step["args"][step["args"].index("-t") + 1]
+    cache = step["args"][step["args"].index("--cache-from") + 1]
+    assert conf["options"]["logging"] == "CLOUD_LOGGING_ONLY" and conf["images"] == [ref, cache]
+    # The layers of the last image built from the same Dockerfile: a package-only change rebuilds from its COPY.
+    assert cache.endswith(":cache-" + hashlib.sha256(b"FROM ubuntu\n").hexdigest()[:16])
+    assert "BUILDKIT_INLINE_CACHE=1" in step["args"] and step["args"][-1] == "."
 
 
 def test_many_sandboxes_of_one_task_at_once_trigger_one_build(cloud, tmp_path):

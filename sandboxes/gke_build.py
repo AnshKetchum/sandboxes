@@ -2,7 +2,10 @@
 
 GKE runs registry images. A sandbox opened from a Dockerfile and its context (a harbor task's environment/) is built by Cloud
 Build into Artifact Registry as `<registry>/ctx:<digest>`, the digest being the 16-hex content hash euphoria and greenhouse tag
-their images with: built once, then every sandbox of that context runs the same image. The rest is about cost:
+their images with: built once, then every sandbox of that context runs the same image. Each build also pushes the tag
+`ctx:cache-<hash of the Dockerfile>` with BuildKit's inline cache and builds from the one before it, so a context whose
+Dockerfile is unchanged (an evolving task's package edits) rebuilds only from the layer its change touches. The rest is about
+cost:
 
   - build minutes are charged to the ledger when the build ends (kind "image_build")
   - the source upload is deleted when its build ends; the staging bucket's lifecycle rule deletes any leftover after a day
@@ -19,6 +22,7 @@ max_concurrent, image_ttl_h, cleanup_days, service_account).
 from __future__ import annotations
 
 import fcntl
+import hashlib
 import json
 import math
 import os
@@ -58,6 +62,7 @@ class BuildConfig:
     image_ttl_h: float = 6.0
     cleanup_days: int = 2
     service_account: str = ""
+    layer_cache: bool = True              # build from the last image of the same Dockerfile (ctx:cache-<hash>)
 
     @classmethod
     def load(cls, path: Optional[os.PathLike] = None) -> "BuildConfig":
@@ -172,13 +177,20 @@ def image_exists(ref: str) -> bool:
     raise ImageBuildError(f"gke: registry answered {status} for {ref}")
 
 
-def build_config_yaml(cfg: BuildConfig, ref: str, dockerfile_rel: str) -> str:
+def cache_ref(cfg: BuildConfig, dockerfile: Path) -> str:
+    """The tag every build from this Dockerfile's text pushes and builds from: the layers before its context changes."""
+    return f"{cfg.registry}/{IMAGE_NAME}:cache-{hashlib.sha256(dockerfile.read_bytes()).hexdigest()[:16]}"
+
+
+def build_config_yaml(cfg: BuildConfig, ref: str, dockerfile_rel: str, cache: str = "") -> str:
     # BUILDKIT_SYNTAX: the builder's own Dockerfile frontend predates RUN heredocs (`cat > f <<'EOF'`), which task
     # Dockerfiles use and Modal/Daytona/docker build; the current frontend parses them (live: "unknown instruction").
+    args = ["build", "--build-arg", "BUILDKIT_SYNTAX=docker/dockerfile:1", "-t", ref, "-f", dockerfile_rel]
+    if cache:       # a missing cache image is only a cache miss: BuildKit builds from scratch
+        args += ["--build-arg", "BUILDKIT_INLINE_CACHE=1", "--cache-from", cache, "-t", cache]
     conf = {"steps": [{"name": "gcr.io/cloud-builders/docker", "env": ["DOCKER_BUILDKIT=1"],
-                       "args": ["build", "--build-arg", "BUILDKIT_SYNTAX=docker/dockerfile:1", "-t", ref,
-                                "-f", dockerfile_rel, "."]}],     # BuildKit refuses --network=cloudbuild
-            "images": [ref], "timeout": f"{int(cfg.timeout_s)}s",
+                       "args": args + ["."]}],     # BuildKit refuses --network=cloudbuild
+            "images": [ref] + ([cache] if cache else []), "timeout": f"{int(cfg.timeout_s)}s",
             "options": {"machineType": cfg.machine_type, "logging": "CLOUD_LOGGING_ONLY"}}
     if cfg.service_account:
         conf["serviceAccount"] = f"projects/{cfg.project}/serviceAccounts/{cfg.service_account}"
@@ -201,7 +213,7 @@ def run_build(cfg: BuildConfig, context_dir, dockerfile, ref: str, poll_s: float
     except ValueError:
         raise ImageBuildError(f"gke: the Dockerfile {df} is outside its context {ctx}")
     with tempfile.NamedTemporaryFile("w", suffix=".yaml", delete=False) as f:
-        f.write(build_config_yaml(cfg, ref, df_rel))
+        f.write(build_config_yaml(cfg, ref, df_rel, cache_ref(cfg, df) if cfg.layer_cache else ""))
         conf_path = f.name
     try:
         out = gcloud("builds", "submit", str(ctx), "--config", conf_path, "--async", "--format=json", "--project", cfg.project,
