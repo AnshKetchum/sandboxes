@@ -11,7 +11,9 @@ from __future__ import annotations
 
 from typing import Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+from .lifetime import DEFAULT_IDLE_STOP_MIN, DEFAULT_LIFETIME_MIN, clamp_lifetime_min
 
 
 class CommandResult(BaseModel):
@@ -94,8 +96,22 @@ class SandboxProviderConfig(BaseModel):
                                                    # live: 30 max), and one snapshot per sandbox
                                                    # open burns through it fast with nothing ever
                                                    # reusing the snapshot anyway.
-    auto_stop_minutes: int = 0
-    auto_delete_minutes: int = 0
+    auto_stop_minutes: int = DEFAULT_IDLE_STOP_MIN       # idle minutes before daytona stops it (inactivity, not a hard cap)
+    auto_delete_minutes: int = DEFAULT_LIFETIME_MIN      # lifetime ceiling; 0 / negative / missing means the default, never unlimited
+    @field_validator("auto_delete_minutes", mode="before")
+    @classmethod
+    def _finite_lifetime(cls, v):
+        return clamp_lifetime_min(v)
+
+    @field_validator("auto_stop_minutes", mode="before")
+    @classmethod
+    def _finite_idle_stop(cls, v):
+        try:
+            v = int(v or 0)
+        except (TypeError, ValueError):
+            v = 0
+        return v if v > 0 else DEFAULT_IDLE_STOP_MIN
+
     usd_per_hour: float = 0.0                      # daytona: fallback estimate when the
                                                    # Analytics API is unreachable; 0 for docker
     registry: Optional[str] = None                 # default push target

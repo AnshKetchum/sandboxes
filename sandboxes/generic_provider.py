@@ -16,11 +16,12 @@ from pathlib import Path
 from typing import ClassVar, Optional, Union
 
 from .base import SandboxProvider
-from .errors import BuildError, CapacityError, PushError, SandboxNotOpenError, SandboxOpenError
+from .buildctx import resolve_dockerfile
+from .errors import BuildError, CapacityError, ImageBuildError, PushError, SandboxNotOpenError, SandboxOpenError
 from .models import BuildResult, CommandResult, DependencyEntry, PushResult, SandboxProviderConfig
 from .pricing import cost_model_for
 from .raw import RawSandbox, SandboxSpec
-from .registry import PROVIDERS, load_class
+from .registry import PROVIDERS, capabilities, load_class
 
 _loop: Optional[asyncio.AbstractEventLoop] = None
 _loop_lock = threading.Lock()
@@ -70,10 +71,33 @@ class RawBackedProvider(SandboxProvider):
             raise SandboxOpenError("already open — call close() first")
         if volumes:
             raise SandboxOpenError(f"{self.name} does not support host bind mounts (volumes=); use put_file/get_file")
+        self._start(self._spec(image, name_prefix), workdir)
+
+    def can_open_from_dockerfile(self) -> bool:
+        return bool(capabilities(self.config).get("builds_dockerfile"))
+
+    def open_from_dockerfile(self, context_dir, *, dockerfile: Optional[str] = None, workdir: str = "/",
+                             network: str = "bridge", name_prefix: Optional[str] = None,
+                             labels: Optional[dict] = None, build_timeout: float = 1800.0) -> None:
+        """The raw backend builds `extra["dockerfile"]` + `extra["context_dir"]` itself (modal, fly: `builds_dockerfile`);
+        the config's `image` is ignored. `labels` join the sandbox's labels; the build is bounded by the backend."""
+        if self._is_open:
+            raise SandboxOpenError("already open — call close() first")
+        if not self.can_open_from_dockerfile():
+            return super().open_from_dockerfile(context_dir, dockerfile=dockerfile)
+        spec = self._spec("", name_prefix)
+        spec.image = ""
+        spec.labels.update(labels or {})
+        spec.extra.update(dockerfile=str(resolve_dockerfile(context_dir, dockerfile)), context_dir=str(context_dir))
+        self._start(spec, workdir)
+
+    def _start(self, spec: SandboxSpec, workdir: str) -> None:
         cls = load_class(PROVIDERS[self.name].raw)
-        raw = cls(self._spec(image, name_prefix), cost_model_for(self.name, self.config.pricing))
+        raw = cls(spec, cost_model_for(self.name, self.config.pricing))
         try:
             run_sync(raw.start(), timeout=raw.spec.create_timeout * raw.spec.create_tries + 900)
+        except ImageBuildError:
+            raise                                   # the build output is the caller's feedback; not an open failure
         except CapacityError as e:
             raise SandboxOpenError(f"{self.name} is at capacity: {e}") from e
         except Exception as e:
@@ -142,3 +166,15 @@ class E2BProvider(RawBackedProvider):
 
 class BlaxelProvider(RawBackedProvider):
     name: ClassVar[str] = "blaxel"
+
+
+class ModalProvider(RawBackedProvider):
+    name: ClassVar[str] = "modal"
+
+
+class FlyProvider(RawBackedProvider):
+    name: ClassVar[str] = "fly"
+
+
+class GKEProvider(RawBackedProvider):
+    name: ClassVar[str] = "gke"

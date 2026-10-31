@@ -59,7 +59,7 @@ def test_daytona_shaped_config_parses_every_field(tmp_path):
     assert provider.config.peak_concurrent_sandboxes == 230
     assert provider.config.spend_cap_usd == 2500
     assert provider.config.auto_stop_minutes == 120
-    assert provider.config.auto_delete_minutes == 0
+    assert provider.config.auto_delete_minutes == 240      # 0 used to mean "no auto-delete"; it now means the finite default
 
 
 def test_empty_sandbox_providers_list_defaults_to_docker(tmp_path):

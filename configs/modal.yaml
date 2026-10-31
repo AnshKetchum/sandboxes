@@ -1,0 +1,11 @@
+# Modal sandboxes. runtime: vm is a real VM (own kernel, large root disk) so docker-in-docker works; gvisor cannot run a
+# daemon. Plan limits: Starter 100 containers ($0), Team 5,000 ($250/mo). Credentials: ~/.modal.toml profile or
+# MODAL_TOKEN_ID / MODAL_TOKEN_SECRET. `cpu` is what nproc reports inside; there is no per-sandbox disk setting.
+sandbox_providers:
+  - name: modal
+    cpu: 2
+    memory_mb: 4096
+    peak_concurrent_sandboxes: 100      # the Modal workspace limit (dashboard, 2026-10-07): sandboxes beyond it sit in scheduling. An earlier benchmark started 2000, so the limit has changed
+    spend_cap_usd: 2500
+    auto_delete_minutes: 240
+    extra: {runtime: vm}

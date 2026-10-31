@@ -1,0 +1,338 @@
+"""Pool placement: GKE's allocatable arithmetic, packing, the cheapest fleet for N sandboxes, and the per-sandbox choice
+(room on a running node first, then the cheapest pool that can grow, spot preferred, pools that failed cooled down), wired
+through the backend so a pod lands on its pool and its ledger entry carries its share of the node."""
+
+from __future__ import annotations
+
+import json
+import time
+
+import pytest
+
+from sandboxes import gke_place as gp
+from sandboxes.backends.gke_raw import GKERaw
+from sandboxes.gke_place import Machine, Overhead, Pool, Shape, Snapshot, per_node, place, plan, reserve
+
+import gke_fakes as fk
+from test_gke_raw import k8s, ledger_events, run, spec  # noqa: F401  (k8s is a fixture, used by name)
+
+# us-central1 catalog prices, 2026-10-27 (scripts/gke/prices.py)
+C3D180 = Machine("c3d-standard-180", 180, 720, 1.9732, 8.1718)
+C3D90 = Machine("c3d-standard-90", 90, 360, 0.9866, 4.0859)
+C4D192 = Machine("c4d-standard-192", 192, 744, 4.0293, 9.0716)
+N2D96 = Machine("n2d-standard-96", 96, 384, 1.9567, 4.0556)
+N2DHM = Machine("n2d-highmem-96", 96, 768, 2.6394, 5.4710)
+C3DHC = Machine("c3d-highcpu-180", 180, 354, 1.6225, 6.7228)
+E2_32 = Machine("e2-standard-32", 32, 128, 0.6434, 1.0722)
+ALL = [C3D180, C3D90, C4D192, N2D96, N2DHM, C3DHC, E2_32]
+UNIT = Shape(cpu=1, mem_gib=4, disk_gib=10)
+
+
+# -- what a node keeps for itself --------------------------------------------------------------------------------------------
+@pytest.mark.parametrize("vcpus,reserved", [(1, 0.06), (2, 0.07), (4, 0.08), (8, 0.09), (180, 0.52)])
+def test_cpu_reservation_follows_gkes_table(vcpus, reserved):
+    assert gp.reserved_cpu(vcpus) == pytest.approx(reserved)
+
+
+@pytest.mark.parametrize("mem,reserved", [(4, 1.0), (8, 1.8), (16, 2.6), (128, 9.32), (720, 21.16)])
+def test_memory_reservation_follows_gkes_table(mem, reserved):
+    assert gp.reserved_mem_gib(mem) == pytest.approx(reserved + 100 / 1024)
+
+
+def test_packing_is_set_by_the_tightest_resource():
+    assert per_node(C3D180, UNIT) == 171                                   # memory: (720 x 0.983 - 21.0 - 1.6) / 4
+    assert per_node(C3DHC, UNIT) == 83                                     # half the memory of the same CPUs
+    assert per_node(C3D180, Shape(1, 2, 10)) == 187                        # 2 GiB: the CPUs bind (177.78 / 0.95)
+    assert per_node(E2_32, Shape(1, 4, 10), disk_gib=100) == 0             # 100 GB boot disk: no room after the image cache
+    assert per_node(Machine("tiny", 400, 4000, 1, 1), Shape(1, 1, 1)) == 256 - Overhead().pods   # the pod limit binds
+
+
+# -- the cheapest fleet ------------------------------------------------------------------------------------------------------
+def test_1000_units_of_1_vcpu_4_gib_10_gb_cost_well_under_75_an_hour():
+    opts = plan(UNIT, 1000, ALL)
+    best = opts[0]
+    assert (best.machine, best.spot, best.nodes) == ("c3d-standard-180", True, 6)
+    assert best.total_h < 15 and best.disk_gib >= 171 * 10                 # guaranteed 10 GB each, disks included
+    assert all(o.total_h < 75 for o in opts if o.spot)
+    assert all(o.per_node * o.nodes >= 1000 for o in opts)
+
+
+def test_the_shape_picks_the_machine():
+    assert plan(Shape(1, 7, 10), 98, ALL, spot=True)[0].machine == "n2d-highmem-96"    # memory heavy: cheapest GiB (98: one node)
+    assert plan(Shape(1, 1, 10), 1000, ALL, spot=True)[0].machine == "c3d-highcpu-180"  # CPU heavy: cheapest vCPU
+
+
+# -- one sandbox at a time ---------------------------------------------------------------------------------------------------
+def pools(**ceil):
+    return [Pool("c3d-180-spot", C3D180, True, 2200, ceil.get("c3d", 6)), Pool("n2d-96-spot", N2D96, True, 1250, ceil.get("n2d", 2)),
+            Pool("c3d-180-od", C3D180, False, 2200, ceil.get("od", 6))]
+
+
+def test_a_new_node_goes_to_the_pool_cheapest_per_sandbox():
+    pl = place(UNIT, pools(), Snapshot())
+    assert pl.pool == "c3d-180-spot" and pl.per_node == 171
+    assert pl.rate_h == pytest.approx((1.9732 + 2200 * 0.10 / 730 + gp.NODE_IP_HOUR["spot"]) / 171)     # machine + boot disk + IP
+
+
+def test_room_on_a_running_node_wins_over_a_cheaper_new_node():
+    snap = Snapshot(nodes={"n2d-96-spot": 1}, room={"n2d-96-spot": [[10, 40, 100, 10]]})
+    assert place(UNIT, pools(), snap).pool == "n2d-96-spot"
+
+
+def test_spot_is_preferred_and_on_demand_is_the_fallback():
+    full = Snapshot(nodes={"c3d-180-spot": 6, "n2d-96-spot": 2})
+    assert place(UNIT, pools(), full).pool == "c3d-180-od"
+    assert place(UNIT, pools(), Snapshot(), spot="never").pool == "c3d-180-od"
+    with pytest.raises(LookupError):
+        place(UNIT, pools(), full, spot="only")
+
+
+def test_a_pool_that_failed_to_get_a_node_is_skipped_until_it_cools_down():
+    t = time.time()
+    cool = {"c3d-180-spot": t + 600}
+    assert place(UNIT, pools(), Snapshot(), cooldown=cool, now=t).pool == "n2d-96-spot"
+    assert place(UNIT, pools(), Snapshot(), cooldown=cool, now=t + 601).pool == "c3d-180-spot"
+    every = {"c3d-180-spot": t + 600, "n2d-96-spot": t + 600, "c3d-180-od": t + 600}
+    assert place(UNIT, pools(), Snapshot(), cooldown=every, now=t).pool == "c3d-180-spot"     # all cooling: try the best anyway
+
+
+def test_a_sandbox_too_big_for_every_pool_is_refused():
+    with pytest.raises(LookupError, match="no sandbox pool fits"):
+        place(Shape(200, 4, 10), pools(), Snapshot())
+
+
+def test_a_fleet_placed_one_by_one_fills_nodes_and_spills_at_ceilings():
+    snap, counts = Snapshot(), {}
+    ps = pools(c3d=2)
+    for _ in range(1000):
+        pl = place(UNIT, ps, snap)
+        reserve(snap, pl.pool, UNIT, pl.per_node)
+        counts[pl.pool] = counts.get(pl.pool, 0) + 1
+    assert snap.nodes["c3d-180-spot"] == 2 and counts["c3d-180-spot"] == 342
+    assert snap.nodes["n2d-96-spot"] == 2 and counts["n2d-96-spot"] == 2 * per_node(N2D96, UNIT, 1250)
+    assert sum(counts.values()) == 1000 and snap.nodes["c3d-180-od"] == 3                # the other 470, on demand
+    cost = sum(snap.nodes[p.name] * p.node_h for p in ps)
+    assert cost < 75
+
+
+def test_the_snapshot_reads_room_from_allocatable_minus_every_pods_requests(k8s):
+    k8s.nodes = [fk.make_node("n-a", time.time(), sandbox_pool="c3d-180-spot",
+                              allocatable={"cpu": "179480m", "memory": "700Gi", "ephemeral-storage": "1900Gi", "pods": "256"}),
+                 fk.make_node("n-b", time.time(), sandbox_pool="c3d-180-spot", ready=False),
+                 fk.make_node("n-sys", time.time(), pool="system")]
+    pod = fk.make_pod({"metadata": {"name": "p1", "labels": {}}, "spec": {"containers": [
+        {"image": "x", "resources": {"requests": {"cpu": "950m", "memory": "4Gi", "ephemeral-storage": "10Gi"}}}]}}, time.time())
+    fk.set_ready(pod, node="n-a")
+    k8s.other_pods = [pod]
+    snap = gp.snapshot_from_api(k8s, {"c3d-180-spot"})
+    assert snap.nodes == {"c3d-180-spot": 2}                               # the not-ready one is coming: counted, no room yet
+    cpu, mem, disk, pods_left = snap.room["c3d-180-spot"][0]
+    assert (cpu, mem, disk, pods_left) == (pytest.approx(178.53), pytest.approx(696), pytest.approx(1890), 255)
+
+
+# -- through the backend -----------------------------------------------------------------------------------------------------
+CATALOG_YAML = {
+    "gke": {"zones": ["us-central1-a"], "pools": [
+        {"name": "c3d-180-spot", "machine": "c3d-standard-180", "spot": True, "disk_gb": 2200, "max_nodes": 6},
+        {"name": "n2d-96-spot", "machine": "n2d-standard-96", "spot": True, "disk_gb": 1250, "max_nodes": 2}]},
+    "gke_meter": {"machine_shapes": {"c3d-standard-180": {"vcpus": 180, "mem_gib": 720}, "n2d-standard-96": {"vcpus": 96, "mem_gib": 384}},
+                  "machine_prices": {"c3d-standard-180": {"spot": 1.9732, "ondemand": 8.1718},
+                                     "n2d-standard-96": {"spot": 1.9567, "ondemand": 4.0556}}}}
+
+
+@pytest.fixture
+def catalog(k8s, tmp_path, monkeypatch):
+    (tmp_path / "gke.yaml").write_text(json.dumps(CATALOG_YAML))
+    monkeypatch.setenv("SANDBOX_GKE_CONFIG", str(tmp_path / "gke.yaml"))
+    monkeypatch.setattr(gp, "PLACER", gp.Placer())
+    return k8s
+
+
+def test_a_sandbox_lands_on_its_pool_and_its_entry_carries_its_share_of_the_node(catalog):
+    sb = GKERaw(spec(cpu=1, mem_gb=4, disk_gb=10)); run(sb.start())
+    pod = catalog.pods[sb.sandbox_id]
+    assert pod.spec.node_selector == {"sandboxes.pool": "c3d-180-spot"} and sb.pool == "c3d-180-spot"
+    assert {"key": "sandboxes.pool", "operator": "Exists", "effect": "NoSchedule"} in pod.spec.tolerations
+    opened = [e for e in ledger_events(catalog) if e["ev"] == "open"][0]
+    assert opened["usd_per_hour"] == pytest.approx((1.9732 + 2200 * 0.10 / 730 + gp.NODE_IP_HOUR["spot"]) / 171, rel=1e-6)
+    run(sb.stop())
+
+
+def test_a_spot_stockout_moves_the_retry_to_another_pool(catalog, monkeypatch):
+    def unschedulable_on_c3d(pod):
+        if pod.spec.node_selector.get("sandboxes.pool") == "c3d-180-spot":
+            fk.set_unschedulable(pod, "0/1 nodes available; scale-up failed: ZONE_RESOURCE_POOL_EXHAUSTED")
+        else:
+            fk.set_ready(pod)
+    catalog.on_create = unschedulable_on_c3d
+    sb = GKERaw(spec(cpu=1, mem_gb=4, disk_gb=10, create_tries=2, extra={"capacity_wait_s": 0.05}))
+    run(sb.start())
+    assert sb.pool == "n2d-96-spot" and len(catalog.created) == 2 and len(catalog.pods) == 1
+    run(sb.stop())
+
+
+def test_a_dockerfile_sandbox_runs_the_image_built_for_its_context(catalog, tmp_path, monkeypatch):
+    from sandboxes import gke_build
+    ctx = tmp_path / "environment"; ctx.mkdir()
+    (ctx / "Dockerfile").write_text("FROM python:3.12-slim\n")
+    calls = []
+
+    def ensure(cfg, context_dir, dockerfile=None, *, run="", ledger=None):
+        calls.append((str(context_dir), str(dockerfile)))
+        return "us-central1-docker.pkg.dev/p/envs/ctx:abc"
+    monkeypatch.setattr(gke_build.BUILDER, "ensure", ensure)
+    sb = GKERaw(spec(image="", extra={"dockerfile": str(ctx / "Dockerfile"), "context_dir": str(ctx)}))
+    run(sb.start())
+    pod = catalog.pods[sb.sandbox_id]
+    assert pod.spec.containers[0].image == "us-central1-docker.pkg.dev/p/envs/ctx:abc"
+    assert calls == [(str(ctx), str(ctx / "Dockerfile"))]
+    run(sb.stop())
+
+
+def test_with_a_catalog_a_pool_gets_300_s_to_find_a_node_before_the_next_is_tried(catalog, monkeypatch):
+    waits = []
+    real = GKERaw._wait_ready
+
+    async def spy(self, name, extra=None):
+        waits.append((extra or {}).get("capacity_wait_s"))
+        return await real(self, name, extra)
+    monkeypatch.setattr(GKERaw, "_wait_ready", spy)
+    sb = GKERaw(spec()); run(sb.start())
+    assert waits == [300]
+    run(sb.stop())
+
+
+def test_excluded_pools_are_never_placed_on(catalog):
+    sb = GKERaw(spec(cpu=1, mem_gb=4, disk_gb=10, extra={"exclude_pools": ["c3d-180-spot"]})); run(sb.start())
+    assert sb.pool and sb.pool != "c3d-180-spot"
+    run(sb.stop())
+
+
+def test_when_every_pool_fails_the_provider_reports_capacity_for_the_router(catalog):
+    from sandboxes.errors import CapacityError
+    catalog.on_create = lambda pod: fk.set_unschedulable(pod)
+    with pytest.raises(CapacityError):
+        run(GKERaw(spec(extra={"capacity_wait_s": 0.02})).start())
+    assert len(catalog.created) == 2 and not catalog.pods                 # each pool tried once, nothing left behind
+
+
+# -- local SSD pools ---------------------------------------------------------------------------------------------------------
+def test_a_local_ssd_pool_keeps_pod_storage_on_its_ssds_and_charges_them():
+    c3d90l = Machine("c3d-standard-90-lssd", 90, 360, 0.9866, 4.0859)
+    assert gp.allocatable_local_ssd_gib(1) == pytest.approx(375 * 0.9 - 50)
+    assert gp.allocatable_local_ssd_gib(2) == pytest.approx(750 * 0.9 - 75)
+    assert gp.allocatable_local_ssd_gib(8) == pytest.approx(3000 * 0.9 - 100)
+    pool = Pool("c3d-90-lssd-spot", c3d90l, True, 100, 2, local_ssd=8)
+    assert per_node(C3D90, UNIT, disk_gib=100) == 0                       # pods on a 100 GB boot disk: no room
+    assert pool.per_node(UNIT) == per_node(C3D90, UNIT) == 84             # on the SSDs: memory binds, the boot disk does not
+    assert pool.node_h == pytest.approx(0.9866 + 100 * 0.10 / 730 + 8 * 375 * 0.0478 / 730 + 0.0025)
+    od = Pool("c3d-90-lssd-od", c3d90l, False, 100, 2, local_ssd=8)
+    assert od.node_h == pytest.approx(4.0859 + 100 * 0.10 / 730 + 8 * 375 * 0.08 / 730 + 0.005)
+
+
+def test_the_catalog_reads_local_ssds_and_the_meter_charges_them(tmp_path):
+    import yaml
+    from sandboxes.gke_meter import MeterConfig, Node, node_price_hour
+    p = tmp_path / "gke.yaml"
+    p.write_text(yaml.safe_dump({
+        "gke": {"pools": [{"name": "l", "machine": "c3d-standard-90-lssd", "spot": True, "disk_gb": 100, "local_ssd": 8, "max_nodes": 2}]},
+        "gke_meter": {"machine_shapes": {"c3d-standard-90-lssd": {"vcpus": 90, "mem_gib": 360}},
+                      "machine_prices": {"c3d-standard-90-lssd": {"spot": 0.9866, "ondemand": 4.0859}},
+                      "local_ssd_gib_month": {"spot": 0.0478, "ondemand": 0.08}}}))
+    pools, _, _ = gp.load_catalog(p)
+    assert pools[0].local_ssd == 8
+    node = Node("gke-c-l-1", 0.0, "c3d-standard-90-lssd", True, "l", 90)
+    assert node_price_hour(node, MeterConfig.load(p)) == pytest.approx(pools[0].node_h)   # placement and meter agree
+
+
+def test_a_node_the_autoscaler_is_removing_does_not_hold_its_pools_ceiling(k8s):
+    """Found live: a one-node pool whose idle node was being scaled down refused 26 starts as 'at its node ceiling'."""
+    from types import SimpleNamespace
+    going = fk.make_node("n-going", time.time(), sandbox_pool="c3d-180-spot")
+    going.spec.taints = [SimpleNamespace(key=gp.DELETING_TAINT, value="1700000000", effect="NoSchedule")]
+    k8s.nodes = [going]
+    snap = gp.snapshot_from_api(k8s, {"c3d-180-spot"})
+    assert snap.nodes.get("c3d-180-spot", 0) == 0 and not snap.room.get("c3d-180-spot")
+    assert place(UNIT, pools(c3d=1), snap).pool == "c3d-180-spot"
+
+
+def test_a_hyperdisk_pool_pays_for_the_performance_it_provisions(tmp_path):
+    import yaml
+    from sandboxes.gke_meter import MeterConfig, Node, node_price_hour
+    assert gp.boot_perf_hour(3000, 140) == 0 and gp.boot_perf_hour(0, 0) == 0
+    assert gp.boot_perf_hour(30000, 1000) == pytest.approx((27000 * 0.005 + 860 * 0.04) / 730)
+    p = tmp_path / "gke.yaml"
+    p.write_text(yaml.safe_dump({
+        "gke": {"pools": [{"name": "h", "machine": "n4d-standard-96", "spot": True, "disk_gb": 1250, "boot_iops": 30000,
+                           "boot_mbps": 1000, "max_nodes": 2}]},
+        "gke_meter": {"machine_shapes": {"n4d-standard-96": {"vcpus": 96, "mem_gib": 384}},
+                      "machine_prices": {"n4d-standard-96": {"spot": 2.4378, "ondemand": 4.0656}}}}))
+    pool = gp.load_catalog(p)[0][0]
+    assert (pool.boot_iops, pool.boot_mbps) == (30000, 1000)
+    node = Node("gke-c-h-1", 0.0, "n4d-standard-96", True, "h", 96)
+    assert node_price_hour(node, MeterConfig.load(p)) == pytest.approx(pool.node_h)
+
+
+def test_pools_of_one_family_share_its_quota():
+    """Two N2D pools of 2 nodes each under a 200-vCPU N2D quota: the on-demand one cannot grow while spot holds 192 vCPUs."""
+    ps = [Pool("n2d-96-spot", N2D96, True, 1250, 2, family_quota=200), Pool("n2d-96-od", N2D96, False, 1250, 2, family_quota=200),
+          Pool("c3d-180-od", C3D180, False, 2200, 2)]
+    full = Snapshot(nodes={"n2d-96-spot": 2})
+    assert place(UNIT, ps, full).pool == "c3d-180-od"                       # not n2d-96-od: its node would be past the quota
+    assert place(UNIT, ps, Snapshot(nodes={"n2d-96-spot": 1}), spot="never").pool == "n2d-96-od"     # 96 + 96 <= 200
+    with pytest.raises(LookupError, match="quota"):
+        place(UNIT, ps[:2], full)
+
+
+def test_the_catalog_reads_family_quotas(tmp_path):
+    import yaml
+    p = tmp_path / "gke.yaml"
+    p.write_text(yaml.safe_dump({
+        "gke": {"quotas": {"N2D": 200}, "pools": [{"name": "a", "machine": "n2d-standard-96", "max_nodes": 2},
+                                                   {"name": "b", "machine": "c3d-standard-90", "max_nodes": 2}]},
+        "gke_meter": {"machine_shapes": {"n2d-standard-96": {"vcpus": 96, "mem_gib": 384}, "c3d-standard-90": {"vcpus": 90, "mem_gib": 360}},
+                      "machine_prices": {"n2d-standard-96": {"spot": 1.9567}, "c3d-standard-90": {"spot": 0.9866}}}}))
+    pools = {x.name: x for x in gp.load_catalog(p)[0]}
+    assert pools["a"].family_quota == 200 and pools["b"].family_quota is None
+
+
+def test_the_model_packs_what_live_nodes_really_hold():
+    """Live 2026-10-30: a c3d-standard-60-lssd node held 55 one-vCPU / 4 GiB pods (allocatable 223.99 GiB, DaemonSets 1.07 GiB),
+    a c3d-standard-90-lssd 84 (339.61 GiB): the model said 56 and 86 before it counted the kernel's memory and the DaemonSets."""
+    assert per_node(Machine("c3d-standard-60-lssd", 60, 240), UNIT) == int((223.99 - 1.07) // 4) == 55
+    assert per_node(Machine("c3d-standard-90-lssd", 90, 360), UNIT) == int((339.61 - 1.07) // 4) == 84
+
+
+def test_every_pool_together_stays_under_the_projects_vcpu_quota():
+    """CPUS_ALL_REGIONS (1,300 here) caps all families together: the next node of any pool past it is not asked for."""
+    ps = [Pool("n2d-96-spot", N2D96, True, 1250, 4, family_quota=400, all_quota=300),
+          Pool("c3d-180-spot", C3D180, True, 2200, 4, all_quota=300)]
+    assert place(UNIT, ps, Snapshot(nodes={"c3d-180-spot": 1})).pool == "n2d-96-spot"      # 180 + 96 <= 300
+    with pytest.raises(LookupError, match="quota"):
+        place(UNIT, ps, Snapshot(nodes={"c3d-180-spot": 1, "n2d-96-spot": 1}))            # 276 + 96 > 300
+
+
+def test_pods_waiting_for_a_node_hold_their_pools_room_across_a_refresh(k8s):
+    """Live, 1,000 at once: each 15 s refresh forgot placements whose node had not come up, and sent the next pods to the
+    same (cheapest) pool again: 372 pods for a 2-node pool of 180, none for the next pool."""
+    from types import SimpleNamespace
+    pools_ = pools(c3d=1, n2d=2)                                             # c3d-180-spot: 1 node of 171; then n2d-96-spot
+    for i in range(171):                                                     # placed on c3d, no node yet
+        k8s.pods[f"p{i}"] = SimpleNamespace(
+            metadata=SimpleNamespace(name=f"p{i}", deletion_timestamp=None),
+            spec=SimpleNamespace(node_name=None, node_selector={"sandboxes.pool": "c3d-180-spot"},
+                                 containers=[SimpleNamespace(resources=SimpleNamespace(
+                                     requests={"cpu": "1", "memory": "4Gi", "ephemeral-storage": "10Gi"}))]),
+            status=SimpleNamespace(phase="Pending"))
+    placer = gp.Placer(refresh_s=0.0)                                        # a refresh before every choice
+    got = placer.choose(k8s, UNIT, pools_, oh=Overhead())
+    assert got.pool == "n2d-96-spot"                                          # c3d's one node is spoken for
+
+
+def test_a_node_still_coming_up_offers_its_room(k8s):
+    node = fk.make_node("n-new", time.time(), sandbox_pool="n2d-96-spot", ready=False,
+                        allocatable={"cpu": "95290m", "memory": "362Gi", "ephemeral-storage": "1100Gi", "pods": "256"})
+    k8s.nodes = [node]
+    snap = gp.snapshot_from_api(k8s, {"n2d-96-spot"})
+    assert snap.nodes == {"n2d-96-spot": 1} and len(snap.room["n2d-96-spot"]) == 1
+    assert place(UNIT, pools(), snap).reason == "room on a running node"

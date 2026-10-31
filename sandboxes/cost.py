@@ -5,12 +5,23 @@ cost from `pricing.CostModel`) when it ends, into one append-only JSONL ledger. 
 never closed (the process was killed) are counted as running until `max_age_s`, so a crash cannot
 hide spend. Storage (snapshots, images, volumes) goes in as `storage` events.
 
-    SANDBOX_COST_LEDGER=/path/costs.jsonl     where to write (default ~/.cache/sandboxes/costs.jsonl)
+    SANDBOX_COST_LEDGER=/path/costs.jsonl     where to write (default: the active session's ledger, else ~/.cache/sandboxes/costs.jsonl)
+    SANDBOX_SESSION_DIR=<dir>                 set by sandboxes.session.open_session(): the active session's own ledger directory
     SANDBOX_RUN_ID=v0-scale-200               tag events so one run can be reported on its own
+
+Each client (euphoria, greenhouse, pr_task_synthesis ...) opens a SESSION (sandboxes/session.py) and gets its own ledger,
+~/.cache/sandboxes/sessions/<client>/<session id>/costs.jsonl, so its spend can be read on its own without filtering a shared file.
+The spend caps still hold machine-wide: `summary_all()` sums the legacy ledger and every session ledger.
 
     python -m sandboxes.cost                  # totals per provider, now
     python -m sandboxes.cost --run v0-scale-200 --watch 30
     python -m sandboxes.cost --cap 120        # exit status 2 once the total passes $120
+
+Ledger format (JSON lines, the one uniform shape every provider is normalized into; times are epoch seconds):
+
+    {"ev":"open",    "t","id","provider","run","sid","cpu","ram_gib","disk_gib","labels"}   a sandbox started
+    {"ev":"close",   "t","id","provider","run","seconds","usd"[, "note"]}                    it ended; usd from the provider's CostModel
+    {"ev":"storage", "t","provider","run","kind","gib","seconds","usd","label"}              image / snapshot / volume storage, or a one-off charge
 
 The ledger is the single place to look at sandbox spend. It does not know about LLM spend; the
 caller adds that (`summary()["total_usd"]` is sandbox dollars only).
@@ -34,9 +45,42 @@ from .pricing import CostModel, cost_model_for
 
 LEDGER_ENV = "SANDBOX_COST_LEDGER"
 RUN_ENV = "SANDBOX_RUN_ID"
+SESSION_ENV = "SANDBOX_SESSION_DIR"
 DEFAULT_LEDGER = Path.home() / ".cache" / "sandboxes" / "costs.jsonl"
+
+
+def cache_dir() -> Path:
+    return Path(os.environ.get("SANDBOX_CACHE_DIR", Path.home() / ".cache" / "sandboxes"))
+
+
+def sessions_dir() -> Path:
+    return cache_dir() / "sessions"
+
+
+def default_ledger_path() -> Path:
+    """Where this process writes: SANDBOX_COST_LEDGER, else the active session's ledger, else the legacy shared ledger."""
+    if os.environ.get(LEDGER_ENV):
+        return Path(os.environ[LEDGER_ENV])
+    if os.environ.get(SESSION_ENV):
+        return Path(os.environ[SESSION_ENV]) / "costs.jsonl"
+    return Path(os.environ["SANDBOX_CACHE_DIR"]) / "costs.jsonl" if os.environ.get("SANDBOX_CACHE_DIR") else DEFAULT_LEDGER
+
+
+def all_ledger_paths() -> list[Path]:
+    """The legacy shared ledger plus every session ledger (what the machine-wide spend cap adds up). An explicit SANDBOX_COST_LEDGER is a
+    deliberate redirect (tests, a one-off experiment): then that one file is the whole ledger, as before sessions existed."""
+    if os.environ.get(LEDGER_ENV):
+        return [Path(os.environ[LEDGER_ENV])]
+    legacy = Path(os.environ["SANDBOX_CACHE_DIR"]) / "costs.jsonl" if os.environ.get("SANDBOX_CACHE_DIR") else DEFAULT_LEDGER
+    out = [legacy] if legacy.exists() else []
+    sd = sessions_dir()
+    if sd.is_dir():
+        out += sorted(sd.glob("*/*/costs.jsonl"))
+    return out
 # an `open` with no `close` older than this is treated as dead (killed process), billed up to here
-STALE_AFTER_S = float(os.environ.get("SANDBOX_STALE_AFTER_S", 4 * 3600))
+from .lifetime import MAX_LIFETIME_MIN
+
+STALE_AFTER_S = float(os.environ.get("SANDBOX_STALE_AFTER_S", MAX_LIFETIME_MIN * 60))      # past the lifetime ceiling a sandbox is dead
 
 
 class SpendCapExceeded(SandboxError):
@@ -45,7 +89,7 @@ class SpendCapExceeded(SandboxError):
 
 class CostLedger:
     def __init__(self, path: Optional[os.PathLike] = None, run: Optional[str] = None):
-        self.path = Path(path or os.environ.get(LEDGER_ENV) or DEFAULT_LEDGER)
+        self.path = Path(path) if path else default_ledger_path()
         self.run = run if run is not None else os.environ.get(RUN_ENV, "")
         self._lock = threading.Lock()
         self._open: dict[str, dict] = {}
@@ -63,11 +107,14 @@ class CostLedger:
 
     # -- sandboxes ------------------------------------------------------------------------------
     def open(self, provider: str, *, cpu: float, ram_gib: float, disk_gib: float,
-             labels: Optional[dict] = None, sandbox_id: str = "") -> str:
-        """Record a sandbox start; returns the handle to pass to `close`."""
+             labels: Optional[dict] = None, sandbox_id: str = "", usd_per_hour: Optional[float] = None) -> str:
+        """Record a sandbox start; returns the handle to pass to `close`. `usd_per_hour` (the sandbox's rate at open) is what every
+        later reader charges it at (its close, a reconcile or a meter in another process), whatever their own price settings."""
         h = uuid.uuid4().hex[:12]
         rec = {"t": time.time(), "ev": "open", "id": h, "provider": provider, "run": self.run,
                "sid": sandbox_id, "cpu": cpu, "ram_gib": ram_gib, "disk_gib": disk_gib, "labels": labels or {}}
+        if usd_per_hour is not None:
+            rec["usd_per_hour"] = round(float(usd_per_hour), 8)
         self._open[h] = rec
         self._append(rec)
         return h
@@ -78,7 +125,7 @@ class CostLedger:
         if rec is None:
             return 0.0
         seconds = time.time() - rec["t"]
-        usd = model.sandbox_usd(rec["cpu"], rec["ram_gib"], rec["disk_gib"], seconds)
+        usd = entry_usd(rec, seconds, model)
         self._append({"t": time.time(), "ev": "close", "id": handle, "provider": rec["provider"], "run": self.run,
                       "seconds": round(seconds, 2), "usd": round(usd, 6)})
         return usd
@@ -98,6 +145,14 @@ class CostLedger:
                       "kind": kind, "gib": 0, "seconds": 0, "usd": round(usd, 6), "label": label})
 
 
+def entry_usd(rec: dict, seconds: float, model: Optional[CostModel] = None) -> float:
+    """What a sandbox entry costs for `seconds`: at the rate recorded when it opened, else at `model` (or the provider's)."""
+    if rec.get("usd_per_hour") is not None:
+        return float(rec["usd_per_hour"]) * max(0.0, seconds) / 3600.0
+    m = model or cost_model_for(rec["provider"])
+    return m.sandbox_usd(rec["cpu"], rec["ram_gib"], rec["disk_gib"], seconds)
+
+
 _ledger: Optional[CostLedger] = None
 _ledger_lock = threading.Lock()
 
@@ -105,14 +160,65 @@ _ledger_lock = threading.Lock()
 def get_ledger() -> CostLedger:
     """The process-wide ledger (path from SANDBOX_COST_LEDGER)."""
     global _ledger
+    if os.environ.get("SANDBOX_SESSION_CLIENT") and not os.environ.get(SESSION_ENV) and not os.environ.get(LEDGER_ENV):
+        from .session import ensure_env_session            # a launcher script opted this process in with env vars alone
+        ensure_env_session()
     with _ledger_lock:
-        path = os.environ.get(LEDGER_ENV)
-        if _ledger is None or (path and Path(path) != _ledger.path):
+        want = default_ledger_path()
+        if _ledger is None or want != _ledger.path:
             _ledger = CostLedger()
         return _ledger
 
 
 # -- reading ---------------------------------------------------------------------------------------------
+_REPLAY: dict = {}
+_REPLAY_LOCK = threading.Lock()
+_TAIL = 256
+
+
+def _replay(path: Path, run: Optional[str]) -> tuple[dict, dict, dict]:
+    """A ledger's opens, closes and storage charges (copies), read incrementally: a ledger only grows by appends, so a call parses
+    just the lines added since the previous one. Re-reading every ledger in full took ~3.5 s for the ~60 MB a busy machine holds,
+    on every spend check (each sandbox start, at most every 30 s), blocking the caller's event loop while it ran. A ledger
+    replaced (new inode), shortened, or rewritten in place (the bytes before the read position changed) is read again whole."""
+    key = (str(path), run)
+    with _REPLAY_LOCK:
+        try:
+            st = os.stat(path)
+        except OSError:
+            _REPLAY.pop(key, None)
+            return {}, {}, {}
+        c = _REPLAY.get(key)
+        with open(path, "rb") as f:
+            if c is not None and c["ino"] == st.st_ino and st.st_size >= c["off"]:
+                f.seek(max(0, c["off"] - _TAIL))
+                if f.read(min(_TAIL, c["off"])) != c["tail"]:
+                    c = None
+            if c is None or c["ino"] != st.st_ino or st.st_size < c["off"]:
+                c = _REPLAY[key] = {"ino": st.st_ino, "off": 0, "tail": b"", "opens": {}, "closes": {},
+                                    "storage": defaultdict(float)}
+            f.seek(c["off"])
+            data = f.read()
+        end = data.rfind(b"\n") + 1                     # a line still being written is read next time
+        for line in data[:end].splitlines():
+            try:
+                r = json.loads(line)
+            except ValueError:
+                continue
+            if run is not None and r.get("run", "") != run:
+                continue
+            if r.get("ev") == "open":
+                c["opens"][r["id"]] = r
+            elif r.get("ev") == "close":
+                c["closes"][r["id"]] = r
+            elif r.get("ev") == "storage":
+                c["storage"][r["provider"]] += r.get("usd", 0.0)
+        if end:
+            c["off"] += end
+            c["tail"] = (c["tail"] + data[:end])[-_TAIL:]
+        return dict(c["opens"]), dict(c["closes"]), dict(c["storage"])
+
+
 def summary(path: Optional[os.PathLike] = None, *, run: Optional[str] = None, models: Optional[dict] = None,
             now: Optional[float] = None) -> dict:
     """Replay the ledger. Returns per-provider and overall totals in dollars:
@@ -121,27 +227,10 @@ def summary(path: Optional[os.PathLike] = None, *, run: Optional[str] = None, mo
                               "running_usd", "storage_usd", "total_usd", "burn_usd_per_hour"}},
          "total_usd", "running_usd", "burn_usd_per_hour", "as_of"}
     """
-    path = Path(path or os.environ.get(LEDGER_ENV) or DEFAULT_LEDGER)
+    path = Path(path) if path else default_ledger_path()
     now = now or time.time()
     models = models or {}
-    opens: dict[str, dict] = {}
-    closes: dict[str, dict] = {}
-    storage = defaultdict(float)
-    if path.exists():
-        with open(path) as f:
-            for line in f:
-                try:
-                    r = json.loads(line)
-                except ValueError:
-                    continue
-                if run is not None and r.get("run", "") != run:
-                    continue
-                if r["ev"] == "open":
-                    opens[r["id"]] = r
-                elif r["ev"] == "close":
-                    closes[r["id"]] = r
-                elif r["ev"] == "storage":
-                    storage[r["provider"]] += r.get("usd", 0.0)
+    opens, closes, storage = _replay(path, run)
     out: dict[str, dict] = {}
 
     def row(p):
@@ -155,13 +244,13 @@ def summary(path: Optional[os.PathLike] = None, *, run: Optional[str] = None, mo
         else:
             m = models.get(p) or cost_model_for(p)
             age = now - o["t"]; billed = min(age, STALE_AFTER_S)
-            a["running_usd"] += m.sandbox_usd(o["cpu"], o["ram_gib"], o["disk_gib"], billed)
+            a["running_usd"] += entry_usd(o, billed, m)
             a["sandbox_hours"] += billed / 3600.0
             if age > STALE_AFTER_S:
                 a["stale"] += 1
             else:
                 a["running"] += 1
-                a["burn_usd_per_hour"] += m.hourly_usd(o["cpu"], o["ram_gib"], o["disk_gib"])
+                a["burn_usd_per_hour"] += entry_usd(o, 3600.0, m)
     for p, usd in storage.items():
         row(p)["storage_usd"] += usd
     for a in out.values():
@@ -169,6 +258,30 @@ def summary(path: Optional[os.PathLike] = None, *, run: Optional[str] = None, mo
         for k in ("closed_usd", "running_usd", "storage_usd", "total_usd", "sandbox_hours", "burn_usd_per_hour"):
             a[k] = round(a[k], 4)
     return {"providers": out, "as_of": now,
+            "total_usd": round(sum(a["total_usd"] for a in out.values()), 4),
+            "running_usd": round(sum(a["running_usd"] for a in out.values()), 4),
+            "burn_usd_per_hour": round(sum(a["burn_usd_per_hour"] for a in out.values()), 4)}
+
+
+def summary_all(*, run: Optional[str] = None, models: Optional[dict] = None, now: Optional[float] = None) -> dict:
+    """`summary()` over the legacy ledger and every session ledger, added together. This is what a machine-wide spend cap compares against."""
+    now = now or time.time()
+    parts = [summary(p, run=run, models=models, now=now) for p in all_ledger_paths()]
+    return merge_summaries(parts, now)
+
+
+def merge_summaries(parts: list, now: Optional[float] = None) -> dict:
+    out: dict[str, dict] = {}
+    keys = ("opened", "running", "closed", "stale", "sandbox_hours", "closed_usd", "running_usd", "storage_usd", "total_usd", "burn_usd_per_hour")
+    for s in parts:
+        for p, a in s["providers"].items():
+            o = out.setdefault(p, {k: 0 for k in keys})
+            for k in keys:
+                o[k] += a.get(k, 0)
+    for a in out.values():
+        for k in ("closed_usd", "running_usd", "storage_usd", "total_usd", "sandbox_hours", "burn_usd_per_hour"):
+            a[k] = round(a[k], 4)
+    return {"providers": out, "as_of": now or time.time(),
             "total_usd": round(sum(a["total_usd"] for a in out.values()), 4),
             "running_usd": round(sum(a["running_usd"] for a in out.values()), 4),
             "burn_usd_per_hour": round(sum(a["burn_usd_per_hour"] for a in out.values()), 4)}

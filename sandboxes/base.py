@@ -48,6 +48,7 @@ from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import ClassVar, Iterator, Optional, Union
 
+from .errors import SandboxOpenError
 from .models import BuildResult, CommandResult, DependencyEntry, PushResult, SandboxProviderConfig
 
 
@@ -116,6 +117,55 @@ class SandboxProvider(ABC):
         find/kill everything belonging to one job via `docker ps`/`daytona
         list` without needing a separate label mechanism. None (the
         default) keeps each provider's original unprefixed naming."""
+
+    def can_open_from_dockerfile(self) -> bool:
+        """Whether `open_from_dockerfile` works on this provider (with this
+        config). False by default; docker and daytona always can, a
+        RawSandbox-backed provider can when its `builds_dockerfile`
+        capability is set (registry.capabilities, config overrides
+        included)."""
+        return False
+
+    def open_from_dockerfile(
+        self,
+        context_dir: Union[str, Path],
+        *,
+        dockerfile: Optional[str] = None,
+        workdir: str = "/",
+        network: str = "bridge",
+        name_prefix: Optional[str] = None,
+        labels: Optional[dict[str, str]] = None,
+        build_timeout: float = 1800.0,
+    ) -> None:
+        """Build `context_dir` (a directory with a Dockerfile, or
+        `dockerfile` naming one, relative to it unless absolute) and start
+        the sandbox from the result — the one call that means the same
+        thing on every provider that can build, where `open(image)`'s
+        argument differs per backend (see the module docstring). A caller
+        that only has a task's environment/ dir uses this and never needs
+        to know which provider it is talking to.
+
+        Rebuilding an unchanged context is a cache hit (content-addressed,
+        buildctx.context_digest), and an edited one is a fresh build — never
+        a stale image keyed by path. A failed build raises ImageBuildError
+        carrying the build output's tail (what a caller repairing the
+        Dockerfile needs); a failed start raises SandboxOpenError.
+        `build_timeout` bounds a local build; a remote provider's build is
+        bounded by its own create timeout. `labels` are attached however
+        the provider labels a sandbox (docker labels, Modal tags, ...)."""
+        raise SandboxOpenError(
+            f"{self.name} cannot build a Dockerfile (no builds_dockerfile capability); "
+            "open() a prebuilt registry image instead, or use docker, daytona, modal or fly")
+
+    def release_dockerfile_image(
+        self, context_dir: Union[str, Path], *, dockerfile: Optional[str] = None
+    ) -> bool:
+        """Drop the locally cached image `open_from_dockerfile` built for
+        this context, once a caller is done with it (a night of tasks
+        otherwise leaves tens of GB of one-off images on a docker host).
+        True if something was removed; False on providers that keep no
+        local image (the default)."""
+        return False
 
     @abstractmethod
     def close(self) -> None:

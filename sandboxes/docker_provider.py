@@ -22,7 +22,8 @@ from pathlib import Path
 from typing import ClassVar, Optional, Union
 
 from .base import SandboxProvider
-from .errors import BuildError, PushError, SandboxNotOpenError, SandboxOpenError
+from .buildctx import context_digest, resolve_dockerfile
+from .errors import BuildError, ImageBuildError, PushError, SandboxNotOpenError, SandboxOpenError
 from .models import BuildResult, CommandResult, DependencyEntry, PushResult, SandboxProviderConfig
 
 # A container-start error that means the image vanished between build and
@@ -56,7 +57,43 @@ def _sanitize_name_prefix(prefix: str, max_len: int = 100) -> str:
     return s or "sbx"
 
 
+_networks_ready: set = set()
+
+
+def _ensure_network(name: str, subnet: Optional[str]) -> str:
+    """`name` if it exists or could be created (bridge driver, `subnet` when
+    given), else "bridge". A user-defined network is how a shared host gets
+    past a small default bridge (a /28 on the euphoria/greenhouse host:
+    13 addresses for every agent's containers) without touching others'."""
+    if name in ("bridge", "host", "none") or name in _networks_ready:
+        return name
+    try:
+        if _docker("network", "inspect", name, timeout=20).returncode != 0:
+            args = ["network", "create", "--driver", "bridge", "--label", "sandboxes.managed=true"]
+            if subnet:
+                args += ["--subnet", subnet]
+            c = _docker(*args, name, timeout=60)
+            if c.returncode != 0 and "already exists" not in c.stderr:
+                print(f"sandboxes: could not create docker network {name!r} ({c.stderr.strip()[:200]}); "
+                      f"falling back to bridge", flush=True)
+                return "bridge"
+    except subprocess.TimeoutExpired:
+        return "bridge"
+    _networks_ready.add(name)
+    return name
+
+
 class DockerProvider(SandboxProvider):
+    """Config `extra` knobs (all optional):
+      network          network a sandbox joins when open() is given the
+                       default "bridge" — created on first use
+      network_subnet   subnet for creating `network`
+      build_network    network RUN steps of open_from_dockerfile's build use
+                       (e.g. "host" when the default bridge has no route)
+      image_namespace  repository open_from_dockerfile tags its builds under
+                       (`<namespace>:<context digest>`; default sandboxes-ctx)
+    """
+
     name: ClassVar[str] = "docker"
 
     def __init__(self, config: Optional[SandboxProviderConfig] = None):
@@ -92,11 +129,16 @@ class DockerProvider(SandboxProvider):
         prefix = _sanitize_name_prefix(name_prefix) if name_prefix else "sbx"
         name = f"{prefix}-" + re.sub(r"[^A-Za-z0-9_.-]", "-", uuid.uuid4().hex[:12])
         cfg = self.config
+        extra = cfg.extra or {}
+        if network == "bridge" and extra.get("network"):
+            network = _ensure_network(str(extra["network"]), extra.get("network_subnet"))
         args = ["run", "-d", "--name", name, "--network", network]
         # `labels` (e.g. {"greenhouse": "1", "greenhouse.run": "<run id>"}) let a
         # caller find exactly its own containers on a host shared with other
         # agents: `docker ps --filter label=greenhouse.run=<run id>`.
-        for k, v in (labels or {}).items():
+        from .labels import standard_labels
+        std = standard_labels(run=name_prefix if name_prefix and not os.environ.get("SANDBOX_RUN_ID") else None, extra=labels)
+        for k, v in std.items():
             args += ["--label", f"{k}={v}"]
         if cfg.cpu:
             args += ["--cpus", str(cfg.cpu)]
@@ -126,6 +168,53 @@ class DockerProvider(SandboxProvider):
         self._is_open = True
         self._opened_at = time.monotonic()
         self._closed_at: Optional[float] = None
+
+    def can_open_from_dockerfile(self) -> bool:
+        return True
+
+    def _dockerfile_tag(self, context_dir, dockerfile: Optional[str]) -> str:
+        ns = (self.config.extra or {}).get("image_namespace") or "sandboxes-ctx"
+        return f"{ns}:{context_digest(context_dir, dockerfile)}"
+
+    def open_from_dockerfile(
+        self,
+        context_dir: Union[str, Path],
+        *,
+        dockerfile: Optional[str] = None,
+        workdir: str = "/",
+        network: str = "bridge",
+        name_prefix: Optional[str] = None,
+        labels: Optional[dict[str, str]] = None,
+        build_timeout: float = 1800.0,
+    ) -> None:
+        """`docker build` the context under its content tag unless that tag
+        already exists locally (an unchanged context reopens instantly),
+        then `open()` it. Not built through `open()`'s retry: an image-gone
+        race after the existence check is `open()`'s own retry case."""
+        tag = self._dockerfile_tag(context_dir, dockerfile)
+        try:
+            exists = _docker("image", "inspect", tag, timeout=20).returncode == 0
+        except subprocess.TimeoutExpired:
+            exists = False
+        if not exists:
+            r = self.build_sandbox_image(
+                context_dir, tag=tag, timeout=build_timeout,
+                network=(self.config.extra or {}).get("build_network"),
+                dockerfile=str(resolve_dockerfile(context_dir, dockerfile)) if dockerfile else None)
+            if not r.ok:
+                raise ImageBuildError(f"docker: image build failed for {context_dir}: {r.detail}")
+        self.open(tag, workdir=workdir, network=network, name_prefix=name_prefix, labels=labels)
+
+    def release_dockerfile_image(
+        self, context_dir: Union[str, Path], *, dockerfile: Optional[str] = None
+    ) -> bool:
+        """`docker image rm` the context's tag; docker refuses while a
+        container still uses it, which is the right answer."""
+        try:
+            r = _docker("image", "rm", self._dockerfile_tag(context_dir, dockerfile), timeout=120)
+        except subprocess.TimeoutExpired:
+            return False
+        return r.returncode == 0
 
     def close(self) -> None:
         if not self._is_open:

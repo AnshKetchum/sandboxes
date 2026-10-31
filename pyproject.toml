@@ -24,7 +24,13 @@ daytona = [
 ]
 e2b = ["e2b>=2.0"]
 blaxel = ["blaxel>=0.4"]
+modal = ["modal>=1.5.5,<2"]
+fly = ["httpx"]
+gke = ["kubernetes>=29"]
 test = ["pytest"]
+
+[project.scripts]
+sandboxes = "sandboxes.cli:main"
 
 [tool.hatch.build.targets.wheel]
 packages = ["sandboxes"]

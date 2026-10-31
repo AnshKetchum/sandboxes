@@ -15,18 +15,21 @@ from sandboxes.cost import summary
 from sandboxes.models import SandboxProviderConfig
 
 IMAGE = os.environ.get("SANDBOX_TEST_IMAGE", "registry-b.deepgrove.ai/openenv/swe-env-builder-dind:latest")
+from sandboxes.janitor import _load_keys
+_load_keys()          # provider keys from the shared env file when the shell did not export them (handles values with spaces)
 CASES = {
-    "daytona": ["DAYTONA_API_KEY"], "e2b": ["E2B_API_KEY"], "blaxel": ["BL_API_KEY", "BL_WORKSPACE"],
+    "daytona": ["DAYTONA_API_KEY"], "e2b": ["E2B_API_KEY"], "blaxel": ["BL_API_KEY", "BL_WORKSPACE"], "modal": [], "fly": ["FLY_API_KEY"],   # modal: ~/.modal.toml profile
 }
 
 
 @pytest.mark.parametrize("name", list(CASES))
 def test_open_exec_files_cost(name, monkeypatch, tmp_path):
-    if not all(os.environ.get(k) for k in CASES[name]):
-        pytest.skip(f"{name}: {CASES[name]} not set")
+    from sandboxes.registry import usable
+    if not all(os.environ.get(k) for k in CASES[name]) or not usable(SandboxProviderConfig(name=name))[0]:
+        pytest.skip(f"{name}: credentials not set")
     ledger = tmp_path / "ledger.jsonl"
     monkeypatch.setenv("SANDBOX_COST_LEDGER", str(ledger))
-    extra = {"docker_loop_gb": 1} if name == "blaxel" else {}
+    extra = {"docker_loop_gb": 1} if name == "blaxel" else {"runtime": "vm"} if name == "modal" else {"docker_loop_gb": 4} if name == "fly" else {}
     router = SandboxRouter([SandboxProviderConfig(name=name, cpu=2, memory_mb=4096, disk_gb=10, extra=extra)])
 
     async def go():

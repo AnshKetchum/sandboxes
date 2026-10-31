@@ -7,7 +7,9 @@ import shlex
 from typing import Optional
 
 from ..errors import CapacityError
-from ..raw import ExecResult, RawSandbox
+import datetime as dt
+
+from ..raw import ExecResult, LiveSandbox, RawSandbox
 
 
 def _is_capacity(msg: str) -> bool:
@@ -15,8 +17,52 @@ def _is_capacity(msg: str) -> bool:
     return any(k in m for k in ("quota", "limit exceeded", "maximum", "too many", "429", "insufficient"))
 
 
+from ..labels import is_ours                    # standard or legacy markers; never harbor.* (other projects in the org use those)
+
+
+def _epoch(ts):
+    try:
+        t = dt.datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+        return (t if t.tzinfo else t.replace(tzinfo=dt.timezone.utc)).timestamp()
+    except (TypeError, ValueError):
+        return None
+
+
 class DaytonaRaw(RawSandbox):
     provider = "daytona"
+    hard_lifetime = False          # auto-stop is inactivity based: only the janitor is a hard cap
+
+    @classmethod
+    async def list_live(cls):
+        from daytona import AsyncDaytona
+        c, out = AsyncDaytona(), []
+        try:
+            res = c.list()
+            items = []
+            if hasattr(res, "__aiter__"):                      # the harbor-pinned sdk yields sandboxes
+                async for sb in res:
+                    items.append(sb)
+            else:
+                items = list((await res).items)
+            for sb in items:
+                labels = dict(getattr(sb, "labels", None) or {})
+                if is_ours(labels):
+                    out.append(LiveSandbox("daytona", sb.id, _epoch(getattr(sb, "created_at", None)), str(getattr(sb, "state", "")), labels))
+        finally:
+            await c.close()
+        return out
+
+    @classmethod
+    async def kill(cls, sandbox_id):
+        from daytona import AsyncDaytona
+        c = AsyncDaytona()
+        try:
+            await c.delete(await c.get(sandbox_id))
+        except Exception as e:  # noqa: BLE001
+            if "not found" not in str(e).lower():
+                raise
+        finally:
+            await c.close()
 
     def __init__(self, spec, model=None):
         super().__init__(spec, model)
@@ -32,7 +78,7 @@ class DaytonaRaw(RawSandbox):
             image=Image.base(s.image),
             resources=Resources(cpu=int(s.cpu), memory=int(s.mem_gb), disk=int(s.disk_gb)),
             env_vars={k: str(v) for k, v in (s.env or {}).items()},
-            labels={"agentdist": "1", "sandboxes.managed": "true", **{k: str(v) for k, v in (s.labels or {}).items()}},
+            labels={k: str(v) for k, v in (s.labels or {}).items()},          # standard labels from RawSandbox.start
             auto_stop_interval=int(s.lifetime_s // 60),
             auto_delete_interval=int(s.lifetime_s // 60) + 60,
             network_block_all=False,

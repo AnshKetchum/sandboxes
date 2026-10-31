@@ -1,0 +1,11 @@
+# Fly.io Machines (Firecracker microVMs, real disk, own kernel). Needs FLY_API_KEY (value may start with "FlyV1 "). Machines
+# live in one app (FLY_APP, default sandboxes-lib) in the token's org. cpu_kind: performance (dedicated, default) or shared.
+# Machine limits per org are not published; the benchmark script finds the real ceiling.
+sandbox_providers:
+  - name: fly
+    cpu: 2
+    memory_mb: 4096
+    peak_concurrent_sandboxes: 250      # measured: "organization has reached its machine limit" at ~190-260 (exact limit unpublished: contact billing)
+    spend_cap_usd: 2500
+    auto_delete_minutes: 240
+    extra: {cpu_kind: performance, region: iad, docker_loop_gb: 5}   # overlay2 cannot sit on the overlay root: docker gets a 5 GB ext4 loop file on the machine's real 8 GB disk

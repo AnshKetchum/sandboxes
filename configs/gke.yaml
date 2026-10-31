@@ -1,0 +1,147 @@
+# GKE sandboxes (docs/gke.md): one pod per sandbox, on the node pool that runs its size most cheaply (gke_place). A harbor
+# task's Dockerfile is built once per context by Cloud Build into Artifact Registry (gke_build) and deleted when unused; nodes are
+# billed through the node meter (gke_meter). Credentials: a kubeconfig from `gcloud container clusters get-credentials`.
+# Watchdog: `python -m sandboxes.gke_ops watch` (or the janitor). `gke_ops down` leaves nothing that bills; `gke_ops residue` checks.
+sandbox_providers:
+  - name: gke
+    cpu: 1
+    memory_mb: 4096
+    disk_gb: 10                           # requested in full (guaranteed); extra.ephemeral_request_gb < disk_gb over-commits
+    peak_concurrent_sandboxes: 1000       # the namespace ResourceQuota (scripts/gke/setup.sh) is the hard ceiling
+    spend_cap_usd: 50                     # raise deliberately after the first live verification
+    auto_delete_minutes: 240              # activeDeadlineSeconds: the kubelet kills the pod here even if every process of ours died
+    extra:
+      cpu_request: 1.0                    # whole CPUs, request == limit: pinned to its own core (static CPU manager), nproc = 1
+      spot: prefer                        # prefer | only | never; on-demand pools are the fallback when no spot pool can grow
+      ready_timeout_s: 1200
+
+gke:
+  project: agentic-rollouts               # env GKE_PROJECT / GKE_LOCATION / GKE_CLUSTER override these three
+  location: us-central1-a                 # zonal control plane: GKE's free tier credits one zonal cluster's fee
+  cluster: sandboxes
+  zones: [us-central1-a, us-central1-b, us-central1-c, us-central1-f]   # where sandbox nodes may run (spot capacity varies)
+  system_pool: default-pool               # kube-system: 1 node while up, 0 after `down`
+  node_service_account: gke-sandbox-nodes@agentic-rollouts.iam.gserviceaccount.com
+  max_pods_per_node: 256
+  kubelet_config: {cpuManagerPolicy: static}   # sandbox pools: Guaranteed pods get exclusive cores (nproc = their vCPUs)
+  idle_scale_down_min: 15                 # a sandbox pool with no pod of ours this long: resized to 0
+  auto_down_min: 60                       # no pod of ours this long: `down` (system pool, images, uploads). 0: never
+  auto_up: true                           # a sandbox start on a cluster that is down brings it up (about 2 min)
+  orphan_pending_min: 30
+  node_overhead: {cpu: 1.7, mem_gib: 1.6, pods: 12, image_cache_gib: 200}   # DaemonSets (live: 1.25 vCPU, 1.07 GiB) + kubelet
+                                                                             # slack, and task images, per node
+  # The pool catalog. Placement picks, per sandbox size, the pool cheapest per sandbox that can still grow (room on a running
+  # node first; a family's pools share its vCPU quota, `quotas:`); pools sit at 0 nodes, free, until a sandbox needs one.
+  # `gke_ops pools plan|apply [--only NAME...]` makes the cluster match. max_nodes is over all zones.
+  # Pods' storage: on local NVMe (`local_ssd`: count of 375 GiB disks) wherever the family has it. On the network boot disk,
+  # 26 sandboxes of a node writing at once ran 3.6x slower (256 MB + fsync 29 s vs 8 s) and small files 3.9x slower
+  # (scripts/gke/bench.py, 2026-10-30). N4/N4D boot only from Hyperdisk Balanced: provisioned IOPS/MB/s instead (`boot_iops`,
+  # `boot_mbps`; 3,000 / 140 are included, which ~90 pods would share).
+  # 1 vCPU / 4 GiB / 10 GB sandboxes per node: c3d-90-lssd 86, c3d-60-lssd 56, c2d-56 53, c2d-32 29, n2-96 / n2d-96 / n4d-96 91-92,
+  # n4-64 60, e2-32 29: with every pool full, ~1,010 sandboxes in ~1,060 vCPUs of quota (N2D's 2 nodes included).
+  # us-central1, 2026-10-30. ALL: CPUS_ALL_REGIONS (1,300) less the system node and headroom for other projects' VMs
+  quotas: {C3D: 150, N2D: 200, C2D: 100, N2: 200, N4D: 200, N4: 200, E2: 72, C4N: 384, ALL: 1290}
+  pools:
+    # cheapest per sandbox first (spot, 2026-10-30 catalog): C3D $0.011/vCPU-h, half of N2D/C2D/E2 ($0.020-0.021), N4D/N4 $0.025-0.027
+    - {name: c3d-90-lssd-spot, machine: c3d-standard-90-lssd, spot: true, disk_gb: 100, local_ssd: 8, max_nodes: 1}
+    - {name: c3d-60-lssd-spot, machine: c3d-standard-60-lssd, spot: true, disk_gb: 100, local_ssd: 4, max_nodes: 1}
+    # 6 nodes = 1,044 sandboxes at ~$14/h: enable (and drop the two above) once the C3D quota is ~1,100 (requested 2026-10-27,
+    # granted 150)
+    - {name: c3d-180-lssd-spot, machine: c3d-standard-180-lssd, spot: true, disk_gb: 100, local_ssd: 16, max_nodes: 6, enabled: false}
+    - {name: n2d-96-spot, machine: n2d-standard-96, spot: true, disk_gb: 1250, max_nodes: 2}     # pods on pd-balanced: replace
+    # with n2d-96-lssd-spot once empty (the two share N2D's quota: placement fills the local-SSD one when this one is full)
+    - {name: n2d-96-lssd-spot, machine: n2d-standard-96, spot: true, disk_gb: 100, local_ssd: 16, max_nodes: 2}
+    - {name: c2d-56-lssd-spot, machine: c2d-standard-56, spot: true, disk_gb: 100, local_ssd: 4, max_nodes: 1}
+    - {name: c2d-32-lssd-spot, machine: c2d-standard-32, spot: true, disk_gb: 100, local_ssd: 2, max_nodes: 1}
+    - {name: e2-32-spot, machine: e2-standard-32, spot: true, disk_gb: 600, max_nodes: 2}        # E2 has no local SSD
+    - {name: n4d-96-spot, machine: n4d-standard-96, spot: true, disk_gb: 1250, boot_iops: 30000, boot_mbps: 1000, max_nodes: 2}
+    - {name: n4-64-spot, machine: n4-standard-64, spot: true, disk_gb: 1000, boot_iops: 25000, boot_mbps: 800, max_nodes: 3}
+    - {name: n2-96-lssd-spot, machine: n2-standard-96, spot: true, disk_gb: 100, local_ssd: 16, max_nodes: 2}
+    # C4N: offered in us-central1-a/b/c only; boots from Hyperdisk only
+    - {name: c4n-96-spot, machine: c4n-standard-96, spot: true, disk_gb: 1250, boot_iops: 25000, boot_mbps: 800, max_nodes: 4,
+       zones: [us-central1-a, us-central1-b, us-central1-c]}
+    # on-demand fallbacks: placement takes them only when no spot pool can grow (or every one is cooling down after a spot
+    # stockout: n2-standard-96 spot was out in all four zones on 2026-10-30). Each shares its family's quota with the spot pool
+    - {name: n2d-96-od, machine: n2d-standard-96, spot: false, disk_gb: 1250, max_nodes: 2}
+    - {name: n2-96-lssd-od, machine: n2-standard-96, spot: false, disk_gb: 100, local_ssd: 16, max_nodes: 2}
+    - {name: c4n-96-od, machine: c4n-standard-96, spot: false, disk_gb: 1250, boot_iops: 25000, boot_mbps: 800, max_nodes: 4,
+       zones: [us-central1-a, us-central1-b, us-central1-c]}
+  registry: us-central1-docker.pkg.dev/agentic-rollouts/envs    # built task images (ctx:<context digest>)
+  build:
+    bucket: agentic-rollouts-sandbox-builds   # Cloud Build source uploads; lifecycle rule deletes anything older than a day
+    machine_type: E2_HIGHCPU_8
+    usd_per_minute: 0.0156                # catalog: E2 $0.0016/vCPU-min + $0.00035/GiB-min (the 2,500 free minutes not counted)
+    storage_gib_month: 0.10               # Artifact Registry (first 0.5 GiB free, not counted)
+    timeout_s: 1800
+    max_concurrent: 20                    # Cloud Build allows 30 concurrent builds per region by default
+    image_ttl_h: 6                        # an image no pod runs, unused this long: deleted by the watchdog
+    cleanup_days: 2                       # the repository's own cleanup policy: deletes any image older than this, regardless
+    service_account: sandbox-builder@agentic-rollouts.iam.gserviceaccount.com
+
+# Machine shapes and prices (node meter, pool placement): `python scripts/gke/prices.py --project agentic-rollouts --region
+# us-central1 --pools --write` refills them from Compute Engine and the Cloud Billing Catalog (spot prices move up to daily).
+# Last refreshed 2026-10-27.
+gke_meter:
+  machine_shapes:
+    c4n-standard-96: {vcpus: 96, mem_gib: 360}
+    t2d-standard-60: {vcpus: 60, mem_gib: 240}
+    n4d-standard-96: {vcpus: 96, mem_gib: 384}
+    n4-standard-80: {vcpus: 80, mem_gib: 320}
+    n4-standard-64: {vcpus: 64, mem_gib: 256}
+    n2-standard-96: {vcpus: 96, mem_gib: 384}
+    c3d-standard-90-lssd: {vcpus: 90, mem_gib: 360}
+    c3d-standard-60-lssd: {vcpus: 60, mem_gib: 240}
+    c3d-standard-180-lssd: {vcpus: 180, mem_gib: 720}
+    c2d-standard-56: {vcpus: 56, mem_gib: 224}
+    c2d-standard-32: {vcpus: 32, mem_gib: 128}
+    e2-standard-2: {vcpus: 2, mem_gib: 8}
+    n2d-standard-96: {vcpus: 96, mem_gib: 384}
+    n2d-standard-32: {vcpus: 32, mem_gib: 128}
+    n2d-highmem-96: {vcpus: 96, mem_gib: 768}
+    e2-standard-32: {vcpus: 32, mem_gib: 128}
+    e2-highmem-16: {vcpus: 16, mem_gib: 128}
+    c4d-standard-96: {vcpus: 96, mem_gib: 372}
+    c4d-standard-192: {vcpus: 192, mem_gib: 744}
+    c4d-highmem-96: {vcpus: 96, mem_gib: 756}
+    c3d-standard-90: {vcpus: 90, mem_gib: 360}
+    c3d-standard-30: {vcpus: 30, mem_gib: 120}
+    c3d-standard-30-lssd: {vcpus: 30, mem_gib: 120}
+    c3d-standard-180: {vcpus: 180, mem_gib: 720}
+    c3d-highmem-180: {vcpus: 180, mem_gib: 1440}
+    c3d-highcpu-180: {vcpus: 180, mem_gib: 354}
+  machine_prices:
+    c4n-standard-96: {spot: 2.8846, ondemand: 7.5906}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    t2d-standard-60: {spot: 1.5209, ondemand: 2.5348}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    n4d-standard-96: {spot: 2.4378, ondemand: 4.0656}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    n4-standard-80: {spot: 2.1461, ondemand: 3.628}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    n4-standard-64: {spot: 1.7169, ondemand: 2.9024}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    n2-standard-96: {spot: 2.7963, ondemand: 4.6617}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c3d-standard-90-lssd: {spot: 0.9866, ondemand: 4.0859}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c3d-standard-60-lssd: {spot: 0.6577, ondemand: 2.7239}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c3d-standard-180-lssd: {spot: 1.9732, ondemand: 8.1718}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c2d-standard-56: {spot: 1.1674, ondemand: 2.5423}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c2d-standard-32: {spot: 0.6671, ondemand: 1.4528}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    e2-standard-2: {spot: 0.0402, ondemand: 0.067}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    n2d-standard-96: {spot: 1.9567, ondemand: 4.0556}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    n2d-standard-32: {spot: 0.6522, ondemand: 1.3519}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    n2d-highmem-96: {spot: 2.6394, ondemand: 5.471}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    e2-standard-32: {spot: 0.6434, ondemand: 1.0722}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    e2-highmem-16: {spot: 0.434, ondemand: 0.7232}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c4d-standard-96: {spot: 2.0146, ondemand: 4.5358}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c4d-highmem-96: {spot: 2.6554, ondemand: 5.9771}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c3d-standard-90: {spot: 0.9866, ondemand: 4.0859}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c3d-standard-30: {spot: 0.3289, ondemand: 1.362}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c3d-standard-30-lssd: {spot: 0.3289, ondemand: 1.362}   # machine only: its 2 local SSDs are the pool's local_ssd
+    c3d-standard-180: {spot: 1.9732, ondemand: 8.1718}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c3d-highmem-180: {spot: 2.6629, ondemand: 11.0223}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c3d-highcpu-180: {spot: 1.6225, ondemand: 6.7228}   # Cloud Billing Catalog (scripts/gke/prices.py)
+    c4d-standard-192: {spot: 4.0293, ondemand: 9.0716}   # Cloud Billing Catalog (scripts/gke/prices.py)
+  fallback_vcpu_hour: {spot: 0.02, ondemand: 0.05}   # an unknown machine type: a deliberately high per-vCPU price
+  disk_gb_month: 0.10                     # Hyperdisk Balanced capacity (C4D boots only from Hyperdisk); verify in billing
+  pool_disk_gb: {default-pool: 50}       # sandbox pools: their catalog disk_gb
+  local_ssd_gib_month: {spot: 0.0478, ondemand: 0.08}   # "SSD backed Local Storage [attached to Spot Preemptible VMs]", us-central1
+  default_disk_gb: 100
+  cluster_fee_hour: 0.0                   # GKE's $0.10/h management fee is covered by the free tier ($74.40/month per billing account,
+                                          # zonal and Autopilot clusters): `sandboxes` is the only cluster on billing account
+                                          # 012312-A42283-3BD145 (checked 2026-10-27). Set 0.10 again if another zonal/Autopilot
+                                          # cluster joins that account, or for a regional cluster (not covered)
