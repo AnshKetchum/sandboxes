@@ -7,7 +7,7 @@ the active LLM session (session.py).
                     tags={"stage": "evolve", "task_id": "t-0034"}, trajectory={"id": "u1x3-review2", "kind": "fidelity"})
     r.message, r.usage, r.usd, r.record
 
-The provider is the config's first one whose `models` globs match the model. Per provider type:
+The provider is the one whose `models` glob matching the model is the most specific (`local/*` over `*`). Per type:
 
     openrouter         `provider` routing and `reasoning: {effort}` are sent; the upstream provider, the billed cost
                        (usage.cost) and reasoning (`reasoning`, `reasoning_details`) are read from the answer; prices come

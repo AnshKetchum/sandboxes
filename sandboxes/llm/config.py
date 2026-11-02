@@ -6,7 +6,7 @@
         base_url: https://openrouter.ai/api/v1
         api_key_env: [OPENROUTER_API_KEYS, OPENROUTER_API_KEY]   # a pool (comma or space separated), used round-robin
         keys_file: /ansh/data_env/openrouter_keys.txt              # one key per line, when no env var is set
-        models: ["*"]                    # model ids it serves (globs); the first matching provider serves a call
+        models: ["*"]                    # model ids it serves (globs); the most specific matching glob wins
         routing: {order: [OpenAI], allow_fallbacks: false}         # openrouter only: sent as `provider`
         pricing: {source: openrouter, refresh_s: 60}
       - name: local-sglang
@@ -122,12 +122,20 @@ class LLMConfig(BaseModel):
     recording: RecordingConfig = Field(default_factory=RecordingConfig)
 
     def get_provider(self, model: str) -> LLMProviderConfig:
-        """The first enabled provider whose `models` globs match `model`."""
+        """The enabled provider whose matching `models` glob is the most specific (the most characters that are not
+        wildcards), the earliest listed on a tie: `local/*` wins over a catch-all `*` wherever the two are listed."""
+        best, best_score = None, -1
         for p in self.llm_providers:
-            if p.enabled and p.serves(model):
-                return p
-        raise ConfigError(f"no enabled llm provider serves model {model!r}: "
-                          + ", ".join(f"{p.name} {p.models}" for p in self.llm_providers))
+            if not p.enabled:
+                continue
+            score = max((len(pattern.replace("*", "").replace("?", "")) for pattern in p.models
+                         if fnmatch.fnmatchcase(model, pattern)), default=-1)
+            if score > best_score:
+                best, best_score = p, score
+        if best is None:
+            raise ConfigError(f"no enabled llm provider serves model {model!r}: "
+                              + ", ".join(f"{p.name} {p.models}" for p in self.llm_providers))
+        return best
 
 
 def _deep_merge(base: dict, over: dict) -> dict:

@@ -87,6 +87,9 @@ def test_a_config_resolves_bases_overrides_and_the_provider_of_a_model(tmp_path)
     assert cfg.recording.content is False
     with pytest.raises(Exception, match="no enabled llm provider serves model 'anthropic/x'"):
         cfg.get_provider("anthropic/x")
+    catch_all = load_llm_config(CONFIG, overrides={"openrouter": {"models": ["*"]}})     # listed first, but less specific
+    assert catch_all.get_provider("local/qwen").name == "local"
+    assert catch_all.get_provider("anthropic/x").name == "openrouter"
     assert "api_key_env" not in cfg.llm_providers[0].to_public()           # a session never records where keys come from
 
 
