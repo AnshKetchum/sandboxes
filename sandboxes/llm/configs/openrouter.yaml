@@ -1,5 +1,6 @@
-# The shared OpenRouter config for sandboxes.llm (docs/llm.md). A project's own config takes it as a base:
-#   {base: /ansh/sandboxes/configs/llm/openrouter.yaml, overrides: {openrouter: {routing: {order: [OpenAI]}}}}
+# The shared OpenRouter config for sandboxes.llm (docs/llm.md), shipped in the package. A project's own config takes it
+# as a base by name, wherever sandboxes is installed:
+#   {base: "sandboxes:openrouter", overrides: {openrouter: {routing: {order: [OpenAI]}}}}
 llm_providers:
   - name: openrouter
     provider_type: openrouter

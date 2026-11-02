@@ -2,7 +2,7 @@
 
     from sandboxes.llm import LLMClient, load_llm_config, open_llm_session
 
-    cfg = load_llm_config("configs/llm/openrouter.yaml")
+    cfg = load_llm_config("sandboxes:openrouter")
     with open_llm_session("greenhouse", name="r-20261102-NA1"):
         r = LLMClient(cfg).chat(messages, model="openai/gpt-6-luna", tags={"stage": "evolve"},
                                 trajectory={"id": "unit-1.3-review-2", "kind": "fidelity"})

@@ -1,7 +1,7 @@
 """One client for every LLM call, over OpenRouter or any OpenAI-compatible server (vLLM, SGLang), that records each call in
 the active LLM session (session.py).
 
-    cfg = load_llm_config("configs/llm/openrouter.yaml")
+    cfg = load_llm_config("sandboxes:openrouter")
     client = LLMClient(cfg)                                  # records into current_llm_session(), or pass session=
     r = client.chat(messages, model="openai/gpt-6-luna", tools=tools, reasoning_effort="medium",
                     tags={"stage": "evolve", "task_id": "t-0034"}, trajectory={"id": "u1x3-review2", "kind": "fidelity"})

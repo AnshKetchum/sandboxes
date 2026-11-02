@@ -38,6 +38,8 @@ from pydantic import BaseModel, Field, field_validator
 from ..errors import ConfigError
 
 LLM_CONFIG_PATH_ENV = "SANDBOX_LLM_CONFIG_PATH"
+BUILTIN_PREFIX = "sandboxes:"                    # `base: sandboxes:openrouter` names a config shipped in the package
+BUILTIN_DIR = Path(__file__).parent / "configs"
 PROVIDER_TYPES = ("openrouter", "openai_compatible")
 PRICING_SOURCES = ("openrouter", "static", "none")
 DEFAULT_CAPABILITIES = {
@@ -163,14 +165,20 @@ def _apply_overrides(raw: dict, overrides: dict) -> dict:
     return merged
 
 
+def get_base_path(base: str, base_dir: Optional[Path] = None) -> Path:
+    """Where a `base:` points: `sandboxes:<name>` is a config shipped in this package (sandboxes/llm/configs/<name>.yaml),
+    a relative path is read from the directory of the file naming it."""
+    if base.startswith(BUILTIN_PREFIX):
+        return BUILTIN_DIR / f"{base[len(BUILTIN_PREFIX):]}.yaml"
+    path = Path(base)
+    return base_dir / path if not path.is_absolute() and base_dir is not None else path
+
+
 def _resolve(raw: dict, base_dir: Optional[Path] = None) -> dict:
-    """A `{base, overrides}` mapping into the plain config it stands for (bases may nest; a relative base is read from
-    the directory of the file naming it)."""
+    """A `{base, overrides}` mapping into the plain config it stands for (bases may nest)."""
     if "base" not in raw:
         return raw
-    base_path = Path(raw["base"])
-    if not base_path.is_absolute() and base_dir is not None:
-        base_path = base_dir / base_path
+    base_path = get_base_path(str(raw["base"]), base_dir)
     return _apply_overrides(_resolve(_read(base_path), base_path.parent), raw.get("overrides") or {})
 
 
@@ -182,6 +190,8 @@ def load_llm_config(source: Union[str, Path, dict, None] = None, overrides: Opti
         source = os.environ.get(LLM_CONFIG_PATH_ENV)
         if not source:
             raise ConfigError(f"no llm config: pass a path or set {LLM_CONFIG_PATH_ENV}")
+    if isinstance(source, str) and source.startswith(BUILTIN_PREFIX):
+        source = get_base_path(source)
     if isinstance(source, (str, Path)):
         base_dir = Path(source).parent
         raw = _read(source)

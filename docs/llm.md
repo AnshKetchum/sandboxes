@@ -8,7 +8,7 @@ so that any call can be rebuilt as a trajectory (and exported as ATIF-v1.7 for t
 ```python
 from sandboxes.llm import LLMClient, load_llm_config, open_llm_session
 
-cfg = load_llm_config("configs/llm/openrouter.yaml")
+cfg = load_llm_config("sandboxes:openrouter")
 with open_llm_session("greenhouse", name="r-20261102-NA1", root=cfg.recording.sessions_dir):
     client = LLMClient(cfg)
     r = client.chat(messages, model="openai/gpt-6-luna", tools=tools, reasoning_effort="medium",
@@ -21,7 +21,7 @@ with open_llm_session("greenhouse", name="r-20261102-NA1", root=cfg.recording.se
 ## Config: `llm_providers`
 
 Shaped like `sandbox_providers`: a path, a dict, or `{base: path, overrides: {...}}` (a key naming a provider overrides that
-provider). `configs/llm/openrouter.yaml` is the shared base.
+provider). `sandboxes:openrouter` (sandboxes/llm/configs/openrouter.yaml) is the shared base, and a base can name it.
 
 ```yaml
 llm_providers:
