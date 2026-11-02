@@ -1,0 +1,21 @@
+# The shared OpenRouter config for sandboxes.llm (docs/llm.md), shipped in the package. A project's own config takes it
+# as a base by name, wherever sandboxes is installed:
+#   {base: "sandboxes:openrouter", overrides: {openrouter: {routing: {order: [OpenAI]}}}}
+llm_providers:
+  - name: openrouter
+    provider_type: openrouter
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: [OPENROUTER_API_KEYS, OPENROUTER_API_KEY]   # a pool, used round-robin (rate limits are per key)
+    keys_file: null                # a file of keys (one per line) when neither variable is set: a project config sets it
+    models: ["*"]
+    routing: {order: [], allow_fallbacks: true}
+    pricing:
+      source: openrouter           # live per-provider prices, refreshed in the background
+      refresh_s: 60
+      max_age_s: 3600              # a call priced with older prices is marked stale
+      verify_generations: 0.05     # share of calls whose OpenRouter generation record is fetched afterwards
+    timeout_s: 300
+    retries: 8
+recording:
+  content: true                    # messages, answers, reasoning and tool calls (false: counts only)
+  sessions_dir: null               # default ~/.cache/sandboxes/llm_sessions

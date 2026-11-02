@@ -30,6 +30,14 @@ supported providers:
 3. e2b
 4. blaxel
 
+## LLM calls, recorded (`sandboxes.llm`)
+
+The same idea for LLM calls: one client over OpenRouter and OpenAI-compatible servers (vLLM, SGLang), chosen per model in
+an `llm_providers:` config, that records every call in a session: tokens, characters, cost and the exact price charged
+(OpenRouter's live per-provider prices), who served it, and its content (messages once, by hash; reasoning when the model
+gives it), linked into trajectories that export as ATIF-v1.7. `sandboxes llm sessions|cost|calls|trajectories|trajectory|
+growth|pricing` reads them. See [docs/llm.md](docs/llm.md).
+
 ## several providers at once
 
 List as many providers as you like; a provider is used only if its API key is in the environment and it is

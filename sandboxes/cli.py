@@ -12,6 +12,7 @@
     sandboxes reap  [--owner X] [--run R] [--creating-older-than MIN] [--dry-run] delete broken sandboxes (error state, stuck creating)
     sandboxes providers                                                          what is usable and what a 2 vCPU/4 GiB node costs
     sandboxes audit PATH...                                                      find provider-specific code in a project
+    sandboxes llm sessions|cost|calls|trajectories|trajectory|growth|pricing ...  recorded LLM calls (sandboxes/llm/cli.py)
 
 A project's own stop/clean command is a thin wrapper over `sandboxes stop --owner <project>` (see sandboxes.cli.stop_for).
 """
@@ -159,9 +160,12 @@ def main(argv=None) -> int:
             h.add_argument("--reason", default="")
     r.add_argument("--providers", default=""); r.add_argument("--dry-run", action="store_true")
     sub.add_parser("providers")
-    for name in ("cost", "guard", "janitor", "audit", "sessions"):
+    for name in ("cost", "guard", "janitor", "audit", "sessions", "llm"):
         sub.add_parser(name, add_help=False)
     a, rest = ap.parse_known_args(argv)
+    if a.cmd == "llm":                              # reads recorded calls only: no provider keys needed
+        from .llm.cli import main as m
+        return m(rest)
     from .janitor import _load_keys
     _load_keys()                                    # keys from the shared env file when the shell did not export them
     if a.cmd == "ls":
