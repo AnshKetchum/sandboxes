@@ -68,8 +68,23 @@ def get_prompt_view(message: dict) -> dict:
     return view
 
 
+def get_canonical_arguments(arguments):
+    """Tool call arguments as compact, key-sorted JSON when they are JSON (loops often re-serialize them), else as given."""
+    try:
+        return json.dumps(json.loads(arguments), sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    except (TypeError, ValueError):
+        return arguments
+
+
 def get_message_hash(message: dict) -> str:
-    body = json.dumps(get_prompt_view(message), sort_keys=True, ensure_ascii=False, separators=(",", ":"))
+    """The hash of a message's prompt view, canonicalized the way loops change a message they resend: null content as
+    "", tool call arguments re-serialized. The stored row keeps the message as first seen."""
+    view = get_prompt_view(message)
+    if view["content"] is None:
+        view["content"] = ""
+    for call in view.get("tool_calls") or []:
+        call["arguments"] = get_canonical_arguments(call["arguments"])
+    body = json.dumps(view, sort_keys=True, ensure_ascii=False, separators=(",", ":"))
     return hashlib.sha256(body.encode()).hexdigest()[:HASH_CHARS]
 
 

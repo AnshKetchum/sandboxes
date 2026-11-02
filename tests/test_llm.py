@@ -174,6 +174,22 @@ def test_trajectory_steps_link_by_path_retries_branch_and_rewrites_show(env):
     assert s.get_growth()["tool:read_file"] == 1000
 
 
+def test_a_resent_answer_still_links_when_the_loop_normalizes_it(env):
+    call = {"id": "c1", "type": "function", "function": {"name": "add", "arguments": '{"b": 2, "a": 1}'}}
+    server = Server([(200, answer(None, tool_calls=[call])), (200, answer("3"))])
+    s = open_llm_session("greenhouse", "r-1")
+    client = get_client(server, session=s)
+    m = [{"role": "user", "content": "add"}]
+    client.chat(m, model="openai/gpt-6-luna", trajectory={"id": "T"})
+    resent = {"role": "assistant", "content": "", "tool_calls": [            # how agent loops put the answer back
+        {"type": "function", "index": 0, "id": "c1", "function": {"name": "add", "arguments": '{"a":1,"b":2}'}}]}
+    client.chat(m + [resent, {"role": "tool", "tool_call_id": "c1", "content": "3"}], model="openai/gpt-6-luna",
+                trajectory={"id": "T"})
+    first, second = s.get_calls()
+    assert second["path"]["parent_call"] == first["call_id"] and "rewritten_at" not in second["path"]
+    assert s.get_messages()[first["path"]["response"]]["content"] is None          # stored as first seen
+
+
 def test_a_process_that_inherits_a_session_links_to_the_calls_already_recorded(env):
     server = Server([(200, answer("one")), (200, answer("two"))])
     s = open_llm_session("greenhouse", "r-1")
