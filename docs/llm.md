@@ -29,7 +29,7 @@ llm_providers:
     provider_type: openrouter        # openrouter | openai_compatible
     base_url: https://openrouter.ai/api/v1
     api_key_env: [OPENROUTER_API_KEYS, OPENROUTER_API_KEY]   # a pool, round-robin
-    keys_file: /ansh/data_env/openrouter_keys.txt
+    keys_file: /path/to/openrouter_keys.txt   # one key per line, when no key variable is set (shipped base: none)
     models: ["*"]                    # model ids it serves (globs); the most specific matching glob wins (ties: list order)
     routing: {order: [OpenAI], allow_fallbacks: false}
     pricing: {source: openrouter, refresh_s: 60, max_age_s: 3600, verify_generations: 0.05}

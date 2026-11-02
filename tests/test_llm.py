@@ -1,6 +1,8 @@
 """sandboxes.llm: configs, prices, the recorded client over OpenRouter and OpenAI-compatible servers, trajectories and the
 CLI. Offline: an httpx.MockTransport answers every request, and prices come from a canned endpoints listing."""
 import json
+import threading
+import time
 
 import httpx
 import pytest
@@ -8,6 +10,7 @@ import pytest
 from sandboxes.llm import LLMClient, LLMRequestError, OpenRouterPrices, load_llm_config, open_llm_session
 from sandboxes.llm import cli as llm_cli
 from sandboxes.llm import pricing, session as llm_session
+from sandboxes.llm.atif import to_atif
 from sandboxes.llm.pricing import parse_endpoints
 
 BASE = "https://openrouter.ai/api/v1"
@@ -190,6 +193,73 @@ def test_a_resent_answer_still_links_when_the_loop_normalizes_it(env):
     assert s.get_messages()[first["path"]["response"]]["content"] is None          # stored as first seen
 
 
+def test_recording_that_fails_never_fails_or_repeats_a_call(env, monkeypatch):
+    s = open_llm_session("greenhouse", "r-1")
+    monkeypatch.setattr(s, "_append", lambda name, row: (_ for _ in ()).throw(OSError(24, "Too many open files")))
+    server = Server([(200, answer(cost=0.00002))])
+    client = get_client(server, session=s)
+    r = client.chat([{"role": "user", "content": "q"}], model="openai/gpt-6-luna", trajectory={"id": "T"})
+    assert r.usage["prompt_tokens"] == 1000 and r.usd == 0.00002 and len(server.requests) == 1
+    assert client.recording_errors["messages"] == 1 and client.recording_errors["call"] == 1
+    failing = Server([(500, {"error": "boom"})] * 3)
+    with pytest.raises(LLMRequestError):                      # the provider's error, not the recording's
+        get_client(failing, session=s).chat([{"role": "user", "content": "q"}], model="openai/gpt-6-luna")
+
+
+def test_session_metadata_survives_concurrent_writers(env):
+    s = open_llm_session("greenhouse", "r-1")
+    errors = []
+
+    def write():
+        for _ in range(200):
+            try:
+                s.write_meta({"llm_providers": []})
+            except OSError as e:
+                errors.append(e)
+
+    threads = [threading.Thread(target=write) for _ in range(4)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert errors == [] and json.loads(s.meta_path.read_text())["config"] == {"llm_providers": []}
+
+
+def test_a_models_first_price_fetch_runs_once_for_concurrent_callers():
+    fetches = []
+
+    def slow_fetch(model):
+        fetches.append(model)
+        time.sleep(0.2)
+        return ENDPOINTS
+
+    prices = OpenRouterPrices(BASE, refresh_s=0, fetch=slow_fetch)
+    results = []
+    threads = [threading.Thread(target=lambda: results.append(len(prices.get("openai/gpt-6-luna")))) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert fetches == ["openai/gpt-6-luna"] and results == [3] * 8
+
+
+def test_an_answer_the_loop_edited_keeps_its_call_in_the_atif_export(env):
+    call = {"id": "c1", "type": "function", "function": {"name": "read", "arguments": '{"p": 1}'}}
+    server = Server([(200, answer(None, tool_calls=[call, dict(call, id="c2")], reasoning_text="read it twice")),
+                     (200, answer("done", reasoning_text=None))])
+    s = open_llm_session("greenhouse", "r-1")
+    client = get_client(server, session=s)
+    m = [{"role": "user", "content": "go"}]
+    client.chat(m, model="openai/gpt-6-luna", trajectory={"id": "T"})
+    deduped = {"role": "assistant", "content": "", "tool_calls": [call]}                 # the loop dropped the repeat
+    client.chat(m + [deduped, {"role": "tool", "tool_call_id": "c1", "content": "x"}], model="openai/gpt-6-luna",
+                trajectory={"id": "T"})
+    agent = [st for st in to_atif(s, "T")["steps"] if st["source"] == "agent"][0]
+    assert agent.get("is_copied_context") is None and agent["llm_call_count"] == 1
+    assert agent["extra"] == {"edited_by_loop": True} and agent["reasoning_content"] == "read it twice"
+    assert agent["metrics"]["prompt_tokens"] == 1000
+
+
 def test_a_process_that_inherits_a_session_links_to_the_calls_already_recorded(env):
     server = Server([(200, answer("one")), (200, answer("two"))])
     s = open_llm_session("greenhouse", "r-1")
@@ -268,7 +338,6 @@ def test_a_trajectory_exports_as_atif_with_reasoning_only_where_the_model_gave_i
     first = client.chat(m, model="openai/gpt-6-luna", reasoning_effort="medium", trajectory={"id": "T", "kind": "implement"})
     client.chat(m + [first.message, {"role": "tool", "tool_call_id": "c1", "content": "print(1)"}], model="openai/gpt-6-luna",
                 trajectory={"id": "T", "kind": "implement"})
-    from sandboxes.llm.atif import to_atif
     doc = to_atif(s, "T")
     assert doc["schema_version"] == "ATIF-v1.7" and doc["agent"]["version"] == "abc123"
     assert [st["source"] for st in doc["steps"]] == ["system", "user", "agent", "user", "agent", "agent"]

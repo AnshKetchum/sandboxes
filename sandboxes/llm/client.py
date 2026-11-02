@@ -154,6 +154,23 @@ def get_billed_usd(usage: dict) -> Optional[float]:
     return float(cost) if isinstance(cost, (int, float)) else None
 
 
+def get_result_usage(tokens: dict) -> dict:
+    """A ChatResult's usage: every count an int (0 where the provider did not report it)."""
+    return {"prompt_tokens": tokens.get("prompt") or 0, "completion_tokens": tokens.get("completion") or 0,
+            "cached_tokens": tokens.get("cached") or 0, "cache_write_tokens": tokens.get("cache_write") or 0,
+            "reasoning_tokens": tokens.get("reasoning") or 0}
+
+
+def get_plain_result(raw: dict, message: dict) -> ChatResult:
+    """A call's result without its record (what a call returns when recording it failed): its usage and billed cost."""
+    usage = raw.get("usage") if isinstance(raw.get("usage"), dict) else {}
+    try:
+        tokens, _ = get_tokens(usage)
+    except (TypeError, ValueError):
+        tokens = {}
+    return ChatResult(message=message, usage=get_result_usage(tokens), usd=get_billed_usd(usage) or 0.0, raw=raw)
+
+
 def get_backoff_s(attempt: int) -> float:
     return min(BACKOFF_INITIAL_S * 2 ** (attempt - 1) + random.uniform(0, 1), BACKOFF_MAX_S)
 
@@ -179,14 +196,35 @@ class LLMClient:
         self.keys_lock = threading.Lock()
         self.warned: set[tuple[str, str]] = set()
         self.recorded_config = False
+        self.recording_errors: dict[str, int] = {}      # what failed to record -> how often (never a call's failure)
+        self.recording_lock = threading.Lock()
 
     # -- plumbing ---------------------------------------------------------------------------------------------------------
+    def record_safely(self, what: str, fn: Callable, *args, default=None, **kwargs):
+        """fn(*args, **kwargs) for the session's records. Recording never fails a call: an error (a full disk, no file
+        descriptors left, an answer of an unexpected shape) is counted in `recording_errors`, printed once per `what`,
+        and `default` returned, so a call is never lost, raised over or sent again because of its record."""
+        try:
+            return fn(*args, **kwargs)
+        except Exception as e:  # noqa: BLE001 — see the docstring
+            with self.recording_lock:
+                self.recording_errors[what] = self.recording_errors.get(what, 0) + 1
+                first = self.recording_errors[what] == 1
+            if first:
+                print(f"[sandboxes.llm] recording {what} failed (the call itself is unaffected): {type(e).__name__}: "
+                      f"{str(e)[:200]}", file=sys.stderr, flush=True)
+            return default
+
     def get_session(self) -> Optional[LLMSession]:
         s = self.session or current_llm_session()
-        if s is not None and not self.recorded_config:
-            self.recorded_config = True
-            s.write_meta({"llm_providers": [p.to_public() for p in self.config.llm_providers],
-                          "recording": self.config.recording.model_dump()})
+        if s is None:
+            return None
+        with self.recording_lock:
+            first, self.recorded_config = not self.recorded_config, True
+        if first:
+            self.record_safely("session config", s.write_meta,
+                               {"llm_providers": [p.to_public() for p in self.config.llm_providers],
+                                "recording": self.config.recording.model_dump()})
         return s
 
     def get_keys(self, provider: LLMProviderConfig) -> KeyPool:
@@ -331,18 +369,21 @@ class LLMClient:
         trajectory = dict(trajectory or {})
         hashes, links, tools_hash = [], {}, None
         if session is not None:
-            hashes = session.add_messages(messages, call_id=call_id, t=t_start, content=content)
-            links = session.get_links(hashes, trajectory.get("id"))
-            tools_hash = session.add_tools(payload.get("tools"), content=content)
+            hashes = self.record_safely("messages", session.add_messages, messages, call_id=call_id, t=t_start,
+                                        content=content, default=[])
+            links = self.record_safely("links", session.get_links, hashes, trajectory.get("id"), default={})
+            tools_hash = self.record_safely("tools", session.add_tools, payload.get("tools"), content=content)
         if trajectory:
             trajectory["step"] = links.get("step", 0)
+        new_from = links.get("new_from", 0)
         record = {"v": 1, "call_id": call_id, "kind": "chat", "pid": os.getpid(), "t_start": round(t_start, 3),
                   "tags": dict(tags or {}), "trajectory": trajectory or None,
                   "provider": {"name": provider.name, "type": provider.provider_type,
                                "host": self.httpx.URL(provider.base_url).host},
                   "model_requested": model, "model_sent": payload["model"], "params": params, "tools": tools_hash,
-                  "n_tools": len(payload.get("tools") or []), "chars": self.get_prompt_chars(messages, links.get("new_from", 0)),
-                  "n_messages": len(messages), "n_new_messages": len(messages) - links.get("new_from", 0)}
+                  "n_tools": len(payload.get("tools") or []),
+                  "chars": self.record_safely("characters", self.get_prompt_chars, messages, new_from, default={}),
+                  "n_messages": len(messages), "n_new_messages": len(messages) - new_from}
         try:
             raw, sent = self.send(provider, provider.base_url.rstrip("/") + "/chat/completions", payload,
                                   timeout_s or provider.timeout_s)
@@ -352,9 +393,12 @@ class LLMClient:
                 raise LLMRequestError(f"malformed chat completion from {provider.name}: {raw!r:.500}", status=200,
                                       body=json.dumps(raw)[:2000], attempts=sent["attempts"]) from e
         except LLMRequestError as e:
-            self.record_failure(session, record, links, hashes, e)
+            if session is not None:
+                self.record_safely("failed call", self.record_failure, session, record, links, hashes, e)
             raise
-        return self.record_chat(session, provider, record, links, hashes, raw, message, sent, content)
+        result = self.record_safely("call", self.record_chat, session, provider, record, links, hashes, raw, message,
+                                    sent, content)
+        return result if result is not None else get_plain_result(raw, message)
 
     @staticmethod
     def get_prompt_chars(messages: list[dict], new_from: int) -> dict:
@@ -371,8 +415,6 @@ class LLMClient:
                 "new_by_source": new_by_source}
 
     def record_failure(self, session, record: dict, links: dict, hashes: list, e: LLMRequestError) -> None:
-        if session is None:
-            return
         record.update({"t_end": round(time.time(), 3), "status": "error", "attempts": e.attempts,
                        "retry_reasons": getattr(e, "retry_reasons", []),
                        "error": {"kind": "http" if e.status else "transport", "http_status": e.status,
@@ -423,20 +465,22 @@ class LLMClient:
         if cost_details.get("upstream_inference_cost") is not None:
             record["upstream_usd"] = cost_details["upstream_inference_cost"]
         if session is not None:
-            response = session.add_response(message, call_id=record["call_id"], t=t_end, content=content)
-            record["path"] = {**links, "prompt": hashes, "response": response,
-                              "chain": get_chain(links.get("prefix", ""), response)}
-            if price is not None:
-                session.add_price(price.to_history())
-            session.add_call(record)
-            if provider.provider_type == "openrouter" and record.get("generation_id") \
-                    and random.random() < provider.pricing.verify_generations:
-                threading.Thread(target=self.verify_generation, args=(session, provider, record["call_id"],
-                                                                      record["generation_id"]), daemon=True).start()
-        result_usage = {"prompt_tokens": tokens["prompt"] or 0, "completion_tokens": tokens["completion"] or 0,
-                        "cached_tokens": tokens["cached"] or 0, "cache_write_tokens": tokens["cache_write"] or 0,
-                        "reasoning_tokens": tokens["reasoning"] or 0}
-        return ChatResult(message=message, usage=result_usage, usd=usd, raw=raw, record=record)
+            self.record_safely("call", self.write_chat_record, session, provider, record, links, hashes, message, price,
+                               content)
+        return ChatResult(message=message, usage=get_result_usage(tokens), usd=usd, raw=raw, record=record)
+
+    def write_chat_record(self, session: LLMSession, provider: LLMProviderConfig, record: dict, links: dict,
+                          hashes: list, message: dict, price: Optional[Price], content: bool) -> None:
+        response = session.add_response(message, call_id=record["call_id"], t=record["t_end"], content=content)
+        record["path"] = {**links, "prompt": hashes, "response": response,
+                          "chain": get_chain(links.get("prefix", ""), response)}
+        if price is not None:
+            session.add_price(price.to_history())
+        session.add_call(record)
+        if provider.provider_type == "openrouter" and record.get("generation_id") \
+                and random.random() < provider.pricing.verify_generations:
+            threading.Thread(target=self.verify_generation, args=(session, provider, record["call_id"],
+                                                                  record["generation_id"]), daemon=True).start()
 
     def verify_generation(self, session: LLMSession, provider: LLMProviderConfig, call_id: str, generation_id: str) -> None:
         """OpenRouter's own record of a generation (exact provider, native token counts, total cost), into
@@ -471,23 +515,29 @@ class LLMClient:
         try:
             raw, sent = self.send(provider, url, payload, timeout_s or provider.timeout_s)
         except LLMRequestError as e:
-            self.record_failure(session, record, {}, [], e)
+            if session is not None:
+                self.record_safely("failed call", self.record_failure, session, record, {}, [], e)
             raise
         if session is not None:
-            usage = raw.get("usage") if isinstance(raw, dict) else None
-            tokens, reported = get_tokens(usage or {})
-            billed = get_billed_usd(usage or {})
-            t_end = time.time()
-            record.update({"t_end": round(t_end, 3), "latency_s": round(t_end - record["t_start"], 3), "status": "ok",
-                           **sent, "model_served": raw.get("model") if isinstance(raw, dict) else None,
-                           "tokens": tokens, "tokens_reported": reported, "usd": billed or 0.0,
-                           "usd_source": "api" if billed is not None else "none", "list_usd": None, "price": None})
-            session.add_call(record)
+            self.record_safely("call", self.write_request_record, session, record, raw, sent)
         return raw
 
-    def embed(self, texts: list[str], *, model: str, tags: Optional[dict] = None) -> list[list[float]]:
+    @staticmethod
+    def write_request_record(session: LLMSession, record: dict, raw, sent: dict) -> None:
+        usage = raw.get("usage") if isinstance(raw, dict) else None
+        tokens, reported = get_tokens(usage if isinstance(usage, dict) else {})
+        billed = get_billed_usd(usage if isinstance(usage, dict) else {})
+        t_end = time.time()
+        record.update({"t_end": round(t_end, 3), "latency_s": round(t_end - record["t_start"], 3), "status": "ok",
+                       **sent, "model_served": raw.get("model") if isinstance(raw, dict) else None,
+                       "tokens": tokens, "tokens_reported": reported, "usd": billed or 0.0,
+                       "usd_source": "api" if billed is not None else "none", "list_usd": None, "price": None})
+        session.add_call(record)
+
+    def embed(self, texts: list[str], *, model: str, tags: Optional[dict] = None,
+              timeout_s: Optional[float] = None) -> list[list[float]]:
         """Embeddings of `texts`, in order (recorded like any request)."""
-        raw = self.request("/embeddings", {"input": texts}, model=model, kind="embedding", tags=tags,
+        raw = self.request("/embeddings", {"input": texts}, model=model, kind="embedding", tags=tags, timeout_s=timeout_s,
                            input_chars=sum(len(t) for t in texts))
         try:
             return [row["embedding"] for row in sorted(raw["data"], key=lambda d: d.get("index", 0))]

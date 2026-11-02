@@ -149,6 +149,7 @@ class OpenRouterPrices:
         self.fetch = fetch or self._fetch
         self.endpoints: dict[str, list[Price]] = {}
         self.lock = threading.Lock()
+        self.first_fetches: dict[str, threading.Lock] = {}     # a model's first fetch, so it runs once
         self.thread: Optional[threading.Thread] = None
         self.errors = 0
 
@@ -174,13 +175,18 @@ class OpenRouterPrices:
         return bool(prices)
 
     def get(self, model: str) -> list[Price]:
-        """`model`'s endpoint prices: fetched now the first time, from the background refresh afterwards."""
+        """`model`'s endpoint prices: fetched now the first time (once: callers arriving meanwhile wait for that fetch
+        instead of starting their own), from the background refresh afterwards."""
         with self.lock:
             known = model in self.endpoints
+            first_fetch = self.first_fetches.setdefault(model, threading.Lock())
         if not known:
-            if not self.refresh(model):
+            with first_fetch:
                 with self.lock:
-                    self.endpoints.setdefault(model, [])
+                    known = model in self.endpoints
+                if not known and not self.refresh(model):
+                    with self.lock:
+                        self.endpoints.setdefault(model, [])
         self._start()
         with self.lock:
             return list(self.endpoints.get(model, []))

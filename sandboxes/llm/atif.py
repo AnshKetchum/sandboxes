@@ -54,10 +54,14 @@ def get_metrics(call: dict) -> dict:
 
 def to_atif(session: LLMSession, trajectory_id: str, *, agent_name: str = "", agent_version: str = "") -> dict:
     """The trajectory as an ATIF-v1.7 dict (raises KeyError when it has no successful call)."""
-    data = session.get_trajectory_messages(trajectory_id)
-    trajectory = session.get_trajectories()[trajectory_id]
+    trajectories = session.get_trajectories()
+    data = session.get_trajectory_messages(trajectory_id, trajectories)
+    trajectory = trajectories[trajectory_id]
     calls = [c for c in trajectory["calls"] if c.get("status") == "ok"]
     producer = {(c.get("path") or {}).get("response"): c for c in calls}
+    # A loop may edit an answer before resending it (dropping repeated tool calls, replacing unparsable arguments): such
+    # a message is still the answer of the call whose prompt ended just before it.
+    by_position = {len((c.get("path") or {}).get("prompt") or []): c for c in calls}
     steps: list[dict] = []
     messages = data["messages"]
     i = 0
@@ -68,6 +72,8 @@ def to_atif(session: LLMSession, trajectory_id: str, *, agent_name: str = "", ag
             steps.append({"step_id": len(steps) + 1, "source": role, "message": get_message_value(m.get("content"))})
         elif role == "assistant":
             call = producer.get(get_message_hash(m))
+            edited = call is None and by_position.get(i) is not None
+            call = call or by_position.get(i)
             step = {"step_id": len(steps) + 1, "source": "agent", "message": get_message_value(m.get("content"))}
             if m.get("reasoning"):
                 step["reasoning_content"] = m["reasoning"] if isinstance(m["reasoning"], str) else get_text(m["reasoning"])
@@ -88,6 +94,12 @@ def to_atif(session: LLMSession, trajectory_id: str, *, agent_name: str = "", ag
             if call is not None:
                 step.update({"timestamp": get_iso(call.get("t_end")), "model_name": call.get("model_served"),
                              "metrics": get_metrics(call), "llm_call_count": 1})
+                if edited:      # the conversation holds the loop's edit; the answer as given keeps its reasoning
+                    original = session.get_messages({(call.get("path") or {}).get("response")})
+                    reasoning = next(iter(original.values()), {}).get("reasoning")
+                    if reasoning and "reasoning_content" not in step:
+                        step["reasoning_content"] = reasoning if isinstance(reasoning, str) else get_text(reasoning)
+                    step["extra"] = {"edited_by_loop": True}
                 if (call.get("params") or {}).get("reasoning_effort"):
                     step["reasoning_effort"] = call["params"]["reasoning_effort"]
             else:

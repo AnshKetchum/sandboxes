@@ -146,6 +146,7 @@ class LLMSession:
 
     def __post_init__(self):
         self.lock = threading.Lock()
+        self.meta_lock = threading.Lock()
         self.loaded = False
         self.seen_messages: set[str] = set()
         self.seen_tools: set[str] = set()
@@ -195,13 +196,11 @@ class LLMSession:
                 t["last_hashes"] = list(path.get("prompt") or []) + ([path["response"]] if path.get("response") else [])
 
     def add_messages(self, messages: list[dict], *, call_id: str, t: float, content: bool) -> list[str]:
-        """Each message's hash, recording the ones this session has not seen."""
-        hashes = []
+        """Each message's hash, recording the ones this session has not seen (hashed outside the lock)."""
+        hashes = [get_message_hash(m) for m in messages]
         with self.lock:
             self._load_state()
-            for m in messages:
-                h = get_message_hash(m)
-                hashes.append(h)
+            for h, m in zip(hashes, messages):
                 if h not in self.seen_messages:
                     self.seen_messages.add(h)
                     self._append("messages", self._get_message_row(h, m, call_id, t, content))
@@ -305,8 +304,9 @@ class LLMSession:
     def get_calls(self) -> list[dict]:
         return list(self._read("calls"))
 
-    def get_messages(self) -> dict[str, dict]:
-        return {row["hash"]: row for row in self._read("messages")}
+    def get_messages(self, hashes: Optional[set] = None) -> dict[str, dict]:
+        """Message rows by hash: all of them, or only `hashes` (a run's messages.jsonl can be large)."""
+        return {row["hash"]: row for row in self._read("messages") if hashes is None or row.get("hash") in hashes}
 
     def get_tools(self) -> dict[str, dict]:
         return {row["hash"]: row for row in self._read("tools")}
@@ -360,16 +360,17 @@ class LLMSession:
             t["start"], t["end"] = cs[0].get("t_start"), cs[-1].get("t_end")
         return out
 
-    def get_trajectory_messages(self, trajectory_id: str) -> dict:
+    def get_trajectory_messages(self, trajectory_id: str, trajectories: Optional[dict] = None) -> dict:
         """One trajectory rebuilt: the messages of its last successful call's prompt and answer, with reasoning on the
-        answers that had it, its tools, and its calls' ids. Raises KeyError when it has no successful call."""
-        t = self.get_trajectories()[trajectory_id]
+        answers that had it, its tools, and its calls' ids (`trajectories`: get_trajectories(), when the caller has it).
+        Raises KeyError when it has no successful call."""
+        t = (trajectories if trajectories is not None else self.get_trajectories())[trajectory_id]
         ok = [c for c in t["calls"] if c.get("status") == "ok"]
         if not ok:
             raise KeyError(f"trajectory {trajectory_id} has no successful call")
         last = ok[-1]
-        rows = self.get_messages()
         path = last.get("path") or {}
+        rows = self.get_messages(set(path.get("prompt") or []) | {path.get("response")})
         messages = [_get_message(rows.get(h), h) for h in path.get("prompt") or []]
         if path.get("response"):
             messages.append(_get_message(rows.get(path["response"]), path["response"]))
@@ -388,8 +389,12 @@ class LLMSession:
 
     # -- lifecycle --------------------------------------------------------------------------------------------------------
     def close(self) -> None:
+        """Mark the session ended (never raises: it runs at process exit)."""
         self.ended = time.time()
-        self.write_meta()
+        try:
+            self.write_meta()
+        except OSError:
+            pass
 
     def __enter__(self) -> "LLMSession":
         return self
@@ -402,16 +407,19 @@ class LLMSession:
     def write_meta(self, config: Optional[dict] = None) -> None:
         meta = {"client": self.client, "id": self.id, "name": self.name, "started": self.started, "ended": self.ended,
                 "pid": os.getpid(), "host": socket.gethostname(), "tags": self.tags}
-        if config is not None:
-            meta["config"] = config
-        elif self.meta_path.is_file():
-            try:
-                meta["config"] = json.loads(self.meta_path.read_text()).get("config")
-            except ValueError:
-                pass
-        tmp = self.meta_path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(meta, indent=1))
-        os.replace(tmp, self.meta_path)
+        # One writer at a time in this process (the config read and the write together), and a temp file of its own,
+        # since another process may write the same session.
+        with self.meta_lock:
+            if config is not None:
+                meta["config"] = config
+            elif self.meta_path.is_file():
+                try:
+                    meta["config"] = json.loads(self.meta_path.read_text()).get("config")
+                except (OSError, ValueError):
+                    pass
+            tmp = self.meta_path.with_name(f"session.json.{os.getpid()}.{threading.get_ident()}.tmp")
+            tmp.write_text(json.dumps(meta, indent=1))
+            os.replace(tmp, self.meta_path)
 
     def to_dict(self) -> dict:
         return {"client": self.client, "id": self.id, "name": self.name, "dir": str(self.dir), "started": self.started,

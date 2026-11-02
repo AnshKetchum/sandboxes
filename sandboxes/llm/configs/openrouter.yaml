@@ -6,7 +6,7 @@ llm_providers:
     provider_type: openrouter
     base_url: https://openrouter.ai/api/v1
     api_key_env: [OPENROUTER_API_KEYS, OPENROUTER_API_KEY]   # a pool, used round-robin (rate limits are per key)
-    keys_file: /ansh/data_env/openrouter_keys.txt              # when neither variable is set
+    keys_file: null                # a file of keys (one per line) when neither variable is set: a project config sets it
     models: ["*"]
     routing: {order: [], allow_fallbacks: true}
     pricing:
