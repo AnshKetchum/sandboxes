@@ -29,6 +29,10 @@ supported providers:
 2. daytona
 3. e2b
 4. blaxel
+5. modal
+6. fly
+7. gke (our own cluster)
+8. prime (Prime Intellect)
 
 ## LLM calls, recorded (`sandboxes.llm`)
 
@@ -48,6 +52,7 @@ not `enabled: false`:
 | daytona | `DAYTONA_API_KEY` | $0.0504/vCPU-h + $0.0162/GiB-h + $0.000108/GiB-h disk (5 GiB free) | RAM quota (500 GiB: ~125 sandboxes at 4 GiB), creation hangs under load |
 | e2b | `E2B_API_KEY` | $0.000014/vCPU-s + $0.0000045/GiB-s, storage free, Pro $150/mo | 100 concurrent (600/1100 add-ons: $650/$1150 per month) |
 | blaxel | `BL_API_KEY`, `BL_WORKSPACE` | $0.0000115/GB-s (CPU included); snapshots $0.20, images $0.045, volumes $0.12 per GB-month | 200 concurrent (tier 2), 60 s per command call, RAM-backed root fs |
+| prime | `PRIME_API_KEY` (+ `PRIME_TEAM_ID` to bill a team) | $0.02/vCPU-h + $0.0125/GiB-h + $0.0002/GiB-h disk; images $0.10/GiB-month | 1,024 active sandboxes, 192 creations per 10 s (account defaults); a create needs 1 h of runtime in the wallet |
 
 ```yaml
 # configs/multi.yaml — sandbox_providers: [daytona.yaml, e2b.yaml, blaxel.yaml]
@@ -106,6 +111,12 @@ python -m sandboxes.cost --run scale-200 --watch 30 --cap 120       # live table
 | blaxel | 0.166 | ~252 (HTTP 429 beyond; 200 earlier the same day) | 4 s / 7 s / 9 s (250) | falls 66% by N=250 | only with 16 GiB+ (RAM-backed disk) |
 | daytona | 0.166 | RAM quota ~120 at 4 GiB (tested to 5 here) | 1 s / - | flat | yes, 10 GB disk |
 | modal | 0.380 | 2000 of 2000 started (Team plan: 5,000) | 0.8 s / 1.1 s / 11 s (2000) | flat | yes with `runtime: vm` |
+| prime (2026-11-04) | 0.092 | 100 of 100 (tested to 100; account limit 1,024) | 2.6 s / 9.1 s (100) | halves from N=50 (998M -> 447M) | untested |
+
+Prime (`name: prime`, 2026-11-04): microVM sandboxes from Docker Hub or Prime images; a task's Dockerfile is built by Prime's
+cloud builder once per context digest (a real task image: 92 s to build and start, 2-3 s after). Same day, Modal `runtime: vm`
+gave 0.5 s / 0.9 s / 5.7 s first command at N=1 / 10 / 50 and kept ~730M burn at 50, so Prime is 2.5-5x cheaper per unit of
+CPU work at list prices. Setup, caveats and the measurements: [docs/prime.md](docs/prime.md).
 
 GKE (`name: gke`): one pod per sandbox on our own cluster's spot node pools (pods' storage on local NVMe where the family has
 it); Google bills nodes, so a node meter puts the node bill in the ledger and a watchdog deletes what dead processes leave and

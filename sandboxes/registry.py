@@ -41,6 +41,7 @@ class ProviderInfo:
 #   fly    1/s, 3    create-machine: 1 req/s per action, short bursts to 3     fly.io/docs/machines/api/working-with-machines-api
 #   daytona 5/s      tier 1: 300 sandbox creations/min (tiers 2-4: 400/500/600) www.daytona.io/docs/en/limits
 #   blaxel -         no per-second creation limit published (concurrency tiers only)
+#   prime  19/s, 50  account default: 192 creations per 10 s burst, 102,400 per hour  docs.primeintellect.ai/sandboxes/overview
 DEFAULT_CAPABILITIES = {
     "daytona": {"create_rate_per_s": 5, "create_burst": 5, "dind": True, "image_ref": True, "requires_prebuilt_image": False, "persistent_disk_gb": 10},
     "e2b": {"create_rate_per_s": 5, "create_burst": 5, "max_concurrent_builds": 15, "build_timeout_s": 900, "dind": True, "image_ref": True, "requires_prebuilt_image": False, "persistent_disk_gb": 20},
@@ -49,6 +50,10 @@ DEFAULT_CAPABILITIES = {
     "docker": {"dind": False, "image_ref": True, "requires_prebuilt_image": False, "persistent_disk_gb": 0, "local": True},
     "fly": {"create_rate_per_s": 1, "create_burst": 3, "dind": True, "image_ref": True, "requires_prebuilt_image": False, "builds_dockerfile": True, "persistent_disk_gb": 8, "note": "Firecracker microVM, real disk (8 GB rootfs by default)"},
     "modal": {"create_rate_per_s": 5, "create_burst": 5, "dind": True, "image_ref": True, "requires_prebuilt_image": False, "builds_dockerfile": True, "persistent_disk_gb": 500, "note": "runtime=vm (real VM, large root disk); gvisor cannot run a daemon"},
+    "prime": {"create_rate_per_s": 19, "create_burst": 50, "dind": False, "image_ref": True, "requires_prebuilt_image": False,
+              "builds_dockerfile": True, "build_timeout_s": 1800, "persistent_disk_gb": 128,
+              "note": "microVM per sandbox; images from Docker Hub or Prime's registry only (others: `prime images push --source-image`); "
+                      "Dockerfiles built by Prime's cloud builder; disk up to 128 GiB per sandbox; dind untested"},
     #   gke    20/s, 40  our own cluster: bounded by the API server, not a vendor quota (tune per cluster size)
     "gke": {"create_rate_per_s": 20, "create_burst": 40, "dind": False, "image_ref": True, "requires_prebuilt_image": False,
             "builds_dockerfile": True, "persistent_disk_gb": 10,
@@ -77,6 +82,8 @@ PROVIDERS: dict[str, ProviderInfo] = {
     "fly": ProviderInfo("fly", ("FLY_API_KEY",), "sandboxes.backends.fly_raw:FlyRaw", "sandboxes.generic_provider:FlyProvider", DEFAULT_CAPABILITIES["fly"]),
     "modal": ProviderInfo("modal", (), "sandboxes.backends.modal_raw:ModalRaw", "sandboxes.generic_provider:ModalProvider",
                           DEFAULT_CAPABILITIES["modal"], available=_modal_credentials),
+    "prime": ProviderInfo("prime", ("PRIME_API_KEY",), "sandboxes.backends.prime_raw:PrimeRaw", "sandboxes.generic_provider:PrimeProvider",
+                          DEFAULT_CAPABILITIES["prime"], extra_env=("PRIME_TEAM_ID",)),
     "gke": ProviderInfo("gke", (), "sandboxes.backends.gke_raw:GKERaw", "sandboxes.generic_provider:GKEProvider",
                         DEFAULT_CAPABILITIES["gke"], extra_env=("GKE_NAMESPACE", "GKE_KUBE_CONTEXT", "SANDBOX_GKE_VCPU_HOUR"),
                         available=_gke_credentials),

@@ -176,5 +176,9 @@ class FlyProvider(RawBackedProvider):
     name: ClassVar[str] = "fly"
 
 
+class PrimeProvider(RawBackedProvider):
+    name: ClassVar[str] = "prime"
+
+
 class GKEProvider(RawBackedProvider):
     name: ClassVar[str] = "gke"
