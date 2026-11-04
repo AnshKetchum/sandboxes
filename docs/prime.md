@@ -44,6 +44,7 @@ python scripts/prime/task_image_check.py TASK/environment --team T --cmd "cd /ap
 python scripts/benchmark_concurrency.py --provider prime --concurrencies 1 10 50 100 --hold 30 --budget-usd 1.5
 python scripts/benchmark_concurrency.py --provider modal --extra runtime=vm --concurrencies 1 10 50 --hold 30
 python scripts/compare_rates.py scripts/benchmark_results/bench-*.json     # $/hour per provider, and $/hour per unit of CPU work
+python scripts/benchmark_io.py --provider prime modal --trials 2 --extra modal:runtime=vm [--quick]   # disk, network, CPU per sandbox
 python scripts/prime/cleanup.py --team T [--delete-images] [--kill-run RUN] # what we hold on Prime; delete built images
 ```
 
@@ -67,6 +68,47 @@ Other timings from the same day:
 - a real greenhouse task image (ubuntu, apt, BuildKit heredocs): 92 s to build and start.
 
 The full write-up, scripts and raw results are in `/ansh/prime-tests/` (RESULTS.md).
+
+## Disk, network and per-call overhead (2026-11-04)
+
+Settings: `scripts/benchmark_io.py`, one sandbox per trial, 2 vCPU / 4 GiB / 10 GB, `python:3.12-slim`; ranges cover 2 full
+and 2 quick trials.
+
+**Disk.** Prime's disk is a virtio ext4 volume (`/dev/vda`, the whole root filesystem; `/sandbox-workspace` is not a
+separate mount).
+
+| | Prime | Modal `runtime: vm` |
+|---|---|---|
+| sequential write, O_DIRECT | 0.9-1.3 GB/s | 3.2-5.8 GB/s |
+| fsyncs per second | 1,900-7,400 (noisy) | 7,200-9,900 |
+| 20,000 small files: create + sync / cold read / delete | 0.26-0.34 / 0.35-0.51 / 0.08-0.10 s | 1.17-1.36 / 0.76-1.45 / 0.36-0.41 s |
+| 4 KiB random read / write IOPS (one at a time) | 56-94k / 11-69k | 40-58k / 38-50k |
+
+- Small-file work, the kind that made GKE's network-disk pods slow (`docs/gke.md`), is 2.5-4x faster on Prime than on
+  Modal, and far ahead of GKE's pd-balanced numbers.
+- No local-NVMe work is needed. Prime does not offer a disk choice anyway.
+
+**Network and per-call overhead, the real gap.**
+
+| | Prime | Modal `runtime: vm` |
+|---|---|---|
+| download from PyPI's CDN | 14.6-95.7 MB/s (varies by sandbox) | 140-142 MB/s |
+| `pip install numpy pandas` | 4.4-9.6 s | 5.5-5.7 s |
+| exec round trip | 0.24 s | 0.06 s |
+| DNS lookup / HTTPS request (incl. exec) | 0.25-0.46 s | 0.06-0.12 s |
+| upload a task's `solution/` + `tests/` (two `put_file` calls) | 3.0 s | 0.2 s |
+| open from an already-built image | 7.8 s | 1.1 s |
+
+A greenhouse oracle (t-0019) splits the same way:
+- the task's own `solve.sh` took 6.9 s on Prime and 7.2 s on Modal;
+- `test.sh` took 35.6 s and 32.8 s; it downloads its test tools.
+
+Prime's extra time sits in opening, uploads, and command and network latency.
+
+**Where to optimize if it matters:**
+- fewer exec calls per step, batching small commands;
+- one tarball upload per step instead of several `put_file` calls;
+- test tooling preinstalled in task images rather than downloaded by every `test.sh`.
 
 ## Pricing and limits (launch prices valid through 2026-12-22)
 
