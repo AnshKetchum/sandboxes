@@ -1,0 +1,12 @@
+# Prime Intellect: microVM sandboxes. $0.02/vCPU-h + $0.0125/GiB-RAM-h + $0.0002/GiB-disk-h (launch pricing through
+# 2026-12-22). Needs PRIME_API_KEY; PRIME_TEAM_ID bills a team's wallet (a create needs one hour of runtime in it).
+# Account defaults: 1,024 active sandboxes, 4,096 vCPUs, 192 creations per 10 s. Sized like e2b.yaml / daytona.yaml.
+sandbox_providers:
+  - name: prime
+    cpu: 2
+    memory_mb: 4096
+    disk_gb: 10
+    peak_concurrent_sandboxes: 1000
+    spend_cap_usd: 50
+    auto_stop_minutes: 120
+    auto_delete_minutes: 180            # sandbox lifetime if never closed

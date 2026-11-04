@@ -11,7 +11,7 @@ from sandboxes.raw import ExecResult, LiveSandbox, RawSandbox, StoredArtifact
 from sandboxes.registry import PROVIDERS, ProviderInfo, load_class, register_provider
 
 
-@pytest.mark.parametrize("name", ["daytona", "e2b", "blaxel", "modal", "fly", "gke"])
+@pytest.mark.parametrize("name", ["daytona", "e2b", "blaxel", "modal", "fly", "gke", "prime"])
 def test_every_real_provider_satisfies_the_contract(name):
     cls = load_class(PROVIDERS[name].raw)
     assert issubclass(cls, RawSandbox) and cls.provider == name

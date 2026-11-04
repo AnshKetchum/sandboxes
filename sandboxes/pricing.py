@@ -9,6 +9,7 @@ Every provider charges differently, and not only for running time:
               ($150/mo Pro) and concurrency add-ons (600 -> $650/mo, 1100 -> $1150/mo) are fixed
     blaxel    GB-RAM-second only (CPU scales with RAM and is not billed separately), plus storage:
               snapshots $0.20/GB-month, images $0.045/GB-month, volumes $0.12/GB-month
+    prime     vCPU-hour + GiB-RAM-hour + GiB-disk-hour; images and checkpoints $0.10/GiB-month (fetched 2026-11-04)
     docker    local, free
 
 The numbers are list prices fetched 2026-10-06 (daytona.io/pricing, e2b.dev/pricing,
@@ -86,6 +87,11 @@ DEFAULT_MODELS: dict[str, CostModel] = {
         "fly", vcpu_hour=0.000012732 * 3600, ram_gib_hour=0.000002316 * 3600, included_ram_gib_per_vcpu=2.0,
         notes="performance CPU, Ashburn list price: $0.000012732 per vCPU-second, 2 GB RAM per vCPU included, extra RAM $0.000002316 per GB-second; "
               "shared CPU is ~15x cheaper per vCPU (override: vcpu_hour 0.003047, included_ram_gib_per_vcpu 0.25); volumes $0.15/GB-month"),
+    "prime": CostModel(
+        "prime", vcpu_hour=0.02, ram_gib_hour=0.0125, disk_gib_hour=0.0002, image_gib_month=0.10, snapshot_gib_month=0.10,
+        notes="docs.primeintellect.ai/sandboxes/overview, launch pricing valid through 2026-12-22: $0.02 per vCPU-hour, $0.0125 per "
+              "GiB-RAM-hour, $0.0002 per GiB-disk-hour (all disk billed); images and checkpoints $0.10 per GiB-month plus one day of "
+              "storage at upload; a paused sandbox bills its disk only; a create needs one hour of runtime in the wallet"),
     "docker": CostModel("docker", notes="local daemon, free"),
     # A pod's share of its node: the node's price per vCPU-hour, per requested vCPU. Google bills nodes, not pods; gke_meter
     # charges whatever the pods' shares do not cover, so this rate only splits a node's cost between runs. Set it with
