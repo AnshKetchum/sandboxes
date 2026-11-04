@@ -33,6 +33,22 @@ docs.primeintellect.ai/sandboxes/overview.
   `sandboxes-ctx` images ($0.10/GiB-month).
 - **Not tested:** docker-in-docker (`dind: False`).
 
+## Scripts
+
+Each script takes `--env-file` (a file with `PRIME_API_KEY` or `PRIME_INTELLECT_API_KEY`, used when the shell has none),
+`--team` (the team to bill) and `--ledger` (where costs go). The key is never printed.
+
+```bash
+python scripts/prime/live_check.py --team T --env-file .env [--long]       # every primitive, plus a Dockerfile build and its reuse (~$0.01)
+python scripts/prime/task_image_check.py TASK/environment --team T --cmd "cd /app && ls"   # build and boot a real task image
+python scripts/benchmark_concurrency.py --provider prime --concurrencies 1 10 50 100 --hold 30 --budget-usd 1.5
+python scripts/benchmark_concurrency.py --provider modal --extra runtime=vm --concurrencies 1 10 50 --hold 30
+python scripts/compare_rates.py scripts/benchmark_results/bench-*.json     # $/hour per provider, and $/hour per unit of CPU work
+python scripts/prime/cleanup.py --team T [--delete-images] [--kill-run RUN] # what we hold on Prime; delete built images
+```
+
+`benchmark_concurrency.py` reads `PRIME_API_KEY` and `PRIME_TEAM_ID` from the environment.
+
 ## Measured (2026-11-04)
 
 Settings: `scripts/benchmark_concurrency.py`, 2 vCPU / 4 GiB / 10 GB, `python:3.12-slim`, 30 s CPU burn.
