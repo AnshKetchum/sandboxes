@@ -1,0 +1,6 @@
+# Euphoria pool for the paper-replication rollouts (2026-10-18): Daytona first (cheaper; user preference), Modal only as overflow.
+# 2 vCPU / 4 GiB: tasks install CPU torch and run small experiments.
+total_spend_cap_usd: 4000
+sandbox_providers:
+  - {base: /ansh/sandboxes/configs/daytona.yaml, overrides: {cpu: 2, memory_mb: 4096, disk_gb: 10, peak_concurrent_sandboxes: 90, auto_delete_minutes: 180}}
+  - {name: modal, cpu: 2, memory_mb: 4096, disk_gb: 20, peak_concurrent_sandboxes: 100, spend_cap_usd: 4000, auto_delete_minutes: 180, extra: {runtime: vm}}

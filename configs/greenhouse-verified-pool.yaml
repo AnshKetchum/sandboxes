@@ -1,0 +1,7 @@
+# Euphoria pool for the 1,048-task greenhouse-verified rollout (2026-10-10): Daytona first (cheapest, 1 vCPU / 2 GiB = $0.08/h,
+# 200 fits the shared org's 250-CPU quota), then Modal (2 cpu / 4 GiB vm, ~$0.38/h; 2,000 concurrent verified on 2026-10-06).
+# Both build each task's Dockerfile themselves; base images are read from the ECR Public mirror (Docker Hub throttled on 10-09).
+total_spend_cap_usd: 1250
+sandbox_providers:
+  - {base: /ansh/sandboxes/configs/daytona.yaml, overrides: {cpu: 1, memory_mb: 2048, disk_gb: 8, peak_concurrent_sandboxes: 200, auto_delete_minutes: 150}}
+  - {name: modal, cpu: 2, memory_mb: 4096, disk_gb: 20, peak_concurrent_sandboxes: 50, spend_cap_usd: 1250, auto_delete_minutes: 150, extra: {runtime: vm}}

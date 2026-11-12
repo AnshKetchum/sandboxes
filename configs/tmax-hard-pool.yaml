@@ -1,0 +1,4 @@
+# Euphoria pool for the tmax hard-security rollouts (2026-10-13): Modal only, 2 vCPU / 4 GiB vm, 500 concurrent. Each task's Dockerfile is built by Modal.
+total_spend_cap_usd: 5600
+sandbox_providers:
+  - {name: modal, cpu: 2, memory_mb: 4096, disk_gb: 20, peak_concurrent_sandboxes: 500, spend_cap_usd: 5600, auto_delete_minutes: 150, extra: {runtime: vm}}

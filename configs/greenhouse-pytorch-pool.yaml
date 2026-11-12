@@ -1,0 +1,7 @@
+# Euphoria pool for the greenhouse PyTorch-systems rollout (2026-10-09): Modal only, concurrency = tasks x trials so every
+# attempt runs in one round (user request). 2 cpu / 4 GiB, runtime vm, ~$0.38/h. The v3 batches launched 1000+ Modal sandboxes
+# at once; a 100-sandbox workspace limit was seen on 2026-10-07 -- beyond the real limit sandboxes just queue in scheduling.
+# total_spend_cap_usd is this experiment's env budget (user-approved $1250); the machine-wide cap in ~/.cache/sandboxes/caps.json is 4000.
+total_spend_cap_usd: 1250
+sandbox_providers:
+  - {name: modal, cpu: 2, memory_mb: 4096, disk_gb: 20, peak_concurrent_sandboxes: 200, spend_cap_usd: 1250, auto_delete_minutes: 150, extra: {runtime: vm}}
