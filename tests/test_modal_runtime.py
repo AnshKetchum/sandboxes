@@ -32,6 +32,26 @@ def test_create_sets_the_runtime_and_passes_no_runtime_argument(monkeypatch):
     assert os.environ["MODAL_FUNCTION_RUNTIME"] == "vm"
 
 
+@pytest.mark.parametrize("extra, blocked", [({"runtime": "vm"}, False), ({"runtime": "vm", "block_network": True}, True)])
+def test_a_no_network_spec_creates_the_sandbox_without_network(monkeypatch, extra, blocked):
+    seen = {}
+
+    class FakeSandbox:
+        object_id = "sb-1"
+
+    async def fake_create(**kw):
+        seen.update(kw)
+        return FakeSandbox()
+
+    async def fake_app():
+        return object()
+
+    monkeypatch.setattr(modal_raw, "_get_app", fake_app)
+    monkeypatch.setattr(modal.Sandbox, "create", type("C", (), {"aio": staticmethod(fake_create)})())
+    asyncio.run(modal_raw.ModalRaw(SandboxSpec(image="python:3.12-slim", extra=extra))._create())
+    assert seen["block_network"] is blocked
+
+
 def test_a_dockerfile_is_built_once_for_concurrent_sandboxes_and_a_failed_build_is_not_retried(monkeypatch, tmp_path):
     from sandboxes.errors import ImageBuildError
     (tmp_path / "Dockerfile").write_text("FROM debian:12\n")

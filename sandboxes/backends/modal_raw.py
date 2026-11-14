@@ -136,7 +136,8 @@ class ModalRaw(RawSandbox):
             self._sb = await modal.Sandbox.create.aio(
                 app=app, image=img, cpu=(float(s.cpu), float(s.cpu)), memory=int(s.mem_gb) * 1024, timeout=int(s.lifetime_s),
                 tags={"sandboxes": "1", **{k: str(v) for k, v in (s.labels or {}).items()}},
-                env={k: str(v) for k, v in (s.env or {}).items()} or None, region=s.extra.get("region"))
+                env={k: str(v) for k, v in (s.env or {}).items()} or None, region=s.extra.get("region"),
+                block_network=bool(s.extra.get("block_network")))
         except Exception as e:  # noqa: BLE001
             if _is_capacity(e):
                 raise CapacityError("modal", str(e)[:200]) from e

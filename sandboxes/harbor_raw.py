@@ -62,7 +62,8 @@ class RawSandboxEnvironment(BaseEnvironment):
 
     @property
     def capabilities(self) -> EnvironmentCapabilities:
-        return EnvironmentCapabilities()
+        # a provider whose sandboxes can be created without network can enforce no-network
+        return EnvironmentCapabilities(disable_internet=bool((PROVIDERS[self.PROVIDER].capabilities or {}).get("blocks_network")))
 
     def _validate_definition(self):
         if not self.task_env_config.docker_image and (PROVIDERS[self.PROVIDER].capabilities or {}).get("builds_dockerfile"):
@@ -83,6 +84,7 @@ class RawSandboxEnvironment(BaseEnvironment):
             env=dict(self._startup_env()),
             labels=dict(self._labels),
             extra={**{k: v for k, v in self._sandbox_extra.items() if k != "docker_loop_gb"},   # no docker daemon in a harbor task's sandbox
+                   **({"block_network": True} if self._network_disabled else {}),
                    **({} if cfg.docker_image else {"dockerfile": str(self.environment_dir / "Dockerfile"), "context_dir": str(self.environment_dir)})},
             **({"lifetime_s": int(self._lifetime_s)} if self._lifetime_s else {}),
         )
