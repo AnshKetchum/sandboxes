@@ -49,7 +49,7 @@ DEFAULT_CAPABILITIES = {
                "note": "root fs is RAM-backed (50% of memory); docker only fits in a small loop file"},
     "docker": {"dind": False, "image_ref": True, "requires_prebuilt_image": False, "persistent_disk_gb": 0, "local": True},
     "fly": {"create_rate_per_s": 1, "create_burst": 3, "dind": True, "image_ref": True, "requires_prebuilt_image": False, "builds_dockerfile": True, "persistent_disk_gb": 8, "note": "Firecracker microVM, real disk (8 GB rootfs by default)"},
-    "modal": {"create_rate_per_s": 5, "create_burst": 5, "dind": True, "image_ref": True, "requires_prebuilt_image": False, "builds_dockerfile": True, "persistent_disk_gb": 500, "note": "runtime=vm (real VM, large root disk); gvisor cannot run a daemon"},
+    "modal": {"create_rate_per_s": 5, "create_burst": 5, "blocks_network": True, "dind": True, "image_ref": True, "requires_prebuilt_image": False, "builds_dockerfile": True, "persistent_disk_gb": 500, "note": "runtime=vm (real VM, large root disk); gvisor cannot run a daemon"},
     "prime": {"create_rate_per_s": 19, "create_burst": 50, "dind": False, "image_ref": True, "requires_prebuilt_image": False,
               "builds_dockerfile": True, "build_timeout_s": 1800, "persistent_disk_gb": 128,
               "note": "microVM per sandbox; images from Docker Hub or Prime's registry only (others: `prime images push --source-image`); "

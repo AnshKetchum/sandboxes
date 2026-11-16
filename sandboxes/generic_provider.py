@@ -71,10 +71,18 @@ class RawBackedProvider(SandboxProvider):
             raise SandboxOpenError("already open — call close() first")
         if volumes:
             raise SandboxOpenError(f"{self.name} does not support host bind mounts (volumes=); use put_file/get_file")
-        self._start(self._spec(image, name_prefix), workdir)
+        spec = self._spec(image, name_prefix)
+        self._seal(spec, network)
+        self._start(spec, workdir)
 
     def can_open_from_dockerfile(self) -> bool:
         return bool(capabilities(self.config).get("builds_dockerfile"))
+
+    def _seal(self, spec: SandboxSpec, network: str) -> None:
+        """network="none" seals the sandbox on a backend that can block its network (`blocks_network`: modal);
+        elsewhere the request is ignored, as before."""
+        if network == "none" and capabilities(self.config).get("blocks_network"):
+            spec.extra["block_network"] = True
 
     def open_from_dockerfile(self, context_dir, *, dockerfile: Optional[str] = None, workdir: str = "/",
                              network: str = "bridge", name_prefix: Optional[str] = None,
@@ -89,6 +97,7 @@ class RawBackedProvider(SandboxProvider):
         spec.image = ""
         spec.labels.update(labels or {})
         spec.extra.update(dockerfile=str(resolve_dockerfile(context_dir, dockerfile)), context_dir=str(context_dir))
+        self._seal(spec, network)
         self._start(spec, workdir)
 
     def _start(self, spec: SandboxSpec, workdir: str) -> None:
