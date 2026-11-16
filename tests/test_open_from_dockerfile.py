@@ -86,6 +86,18 @@ def test_raw_backed_provider_hands_the_context_to_the_backend(monkeypatch, tmp_p
     p.close()
 
 
+@pytest.mark.parametrize("capability, network, blocked", [({}, "none", True), ({}, "bridge", False),
+                                                          ({"blocks_network": False}, "none", False)])
+def test_network_none_seals_a_backend_that_can_block_it(monkeypatch, tmp_path, capability, network, blocked):
+    monkeypatch.setattr(generic_provider, "load_class", lambda _p: _FakeRaw)
+    _FakeRaw.specs.clear()
+    _FakeRaw.fail_build = False
+    cfg = SandboxProviderConfig(name="modal", capabilities=capability)
+    ModalProvider(cfg).open_from_dockerfile(_ctx(tmp_path), network=network)
+    ModalProvider(cfg).open("python:3.12-slim", network=network)
+    assert [spec.extra.get("block_network", False) for spec in _FakeRaw.specs] == [blocked, blocked]
+
+
 def test_a_backend_build_failure_stays_an_image_build_error(monkeypatch, tmp_path):
     monkeypatch.setattr(generic_provider, "load_class", lambda _p: _FakeRaw)
     _FakeRaw.fail_build = True
