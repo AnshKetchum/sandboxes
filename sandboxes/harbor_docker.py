@@ -105,16 +105,24 @@ class DockerHarborEnvironment(BaseEnvironment):
         provider = self.require()
         solver_main = provider.raw_env
         provider.renew_main()
-        self._renewed = True    # once a session: a later upload into /tests must not drop the tests already there
+        # once a grading: a later upload into /tests before any command runs must not drop the tests already there;
+        # exec() clears it, so a grade after more work (a precheck's oracle run) gets a fresh main again
+        self._renewed = True
         self._record_grading_main(solver_main, provider.raw_env)
 
     def _record_grading_main(self, solver_main: str, grading_main: str) -> None:
-        """Evidence in the trial folder that the grade comes from a fresh `main`, not the one the solver worked in."""
+        """Evidence in the trial folder that each grade comes from a fresh `main`, not the one the work ran in: one
+        entry per renewal. A record that cannot be written never fails the grade."""
         trial_dir = getattr(getattr(self, "trial_paths", None), "trial_dir", None)
         if trial_dir is None or not Path(trial_dir).is_dir():
             return
-        (Path(trial_dir) / GRADING_RECORD).write_text(json.dumps(
-            {"solver_main": solver_main, "grading_main": grading_main, "renewed_at": time.time()}, indent=1))
+        record = Path(trial_dir) / GRADING_RECORD
+        try:
+            entries = json.loads(record.read_text()) if record.is_file() else []
+            entries.append({"solver_main": solver_main, "grading_main": grading_main, "renewed_at": time.time()})
+            record.write_text(json.dumps(entries, indent=1))
+        except (OSError, ValueError) as e:
+            print(f"[sandboxes] harbor_docker: could not record the grading main: {e!r}", flush=True)
 
     async def upload_file(self, source_path, target_path: str):
         await asyncio.to_thread(self.renew_for_grading, target_path)
@@ -142,6 +150,7 @@ class DockerHarborEnvironment(BaseEnvironment):
 
     async def exec(self, command: str, cwd: Optional[str] = None, env: Optional[dict[str, str]] = None,
                    timeout_sec: Optional[int] = None, user=None) -> ExecResult:
+        self._renewed = False       # work after the tests went in: the next grade needs a fresh main again
         full = self.get_command(command, env, user)
         workdir = effective_exec_cwd(cwd, self.task_env_config.workdir, self.get_workdir())
         result = await asyncio.to_thread(self.require().run_command, full, timeout=timeout_sec or EXEC_TIMEOUT_S, cwd=workdir)

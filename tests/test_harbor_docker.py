@@ -99,18 +99,24 @@ def test_a_command_runs_as_the_given_user_with_its_variables(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize("compose", [True, False])
-def test_a_compose_task_is_graded_in_a_fresh_main_once_and_other_uploads_are_not(tmp_path, monkeypatch, compose):
+def test_a_compose_task_is_graded_in_a_fresh_main_each_time_and_other_uploads_are_not(tmp_path, monkeypatch, compose):
+    """A precheck's shape: grade the untouched stack, run the oracle, grade again; each grade gets a fresh main, and
+    uploads into /tests with no command between them renew it once."""
     env = make_env(tmp_path, monkeypatch, compose)
     asyncio.run(env.start(force_build=False))
-    asyncio.run(env.upload_dir(tmp_path, "/solution"))
     asyncio.run(env.upload_dir(tmp_path, "/tests"))
     asyncio.run(env.upload_file(tmp_path / "x", "/tests/test_state.py"))
+    asyncio.run(env.exec("bash /tests/test.sh"))
+    asyncio.run(env.upload_dir(tmp_path, "/solution"))
+    asyncio.run(env.exec("bash /solution/solve.sh"))
+    asyncio.run(env.upload_dir(tmp_path, "/tests"))
     kinds = [call[0] for call in env.provider.calls[1:]]
-    assert kinds == (["put", "renew", "put", "put"] if compose else ["put", "put", "put"])
+    assert kinds == (["renew", "put", "put", "run", "put", "run", "renew", "put"] if compose
+                     else ["put", "put", "run", "put", "run", "put"])
     record = tmp_path / "trial" / harbor_docker.GRADING_RECORD
     assert record.is_file() == compose
     if compose:
-        assert json.loads(record.read_text())["solver_main"] == "t__1-main"
+        assert [entry["solver_main"] for entry in json.loads(record.read_text())] == ["t__1-main", "t__1-main"]
 
 
 def test_removing_a_stack_container_takes_its_project_down(monkeypatch):
