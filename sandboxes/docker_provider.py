@@ -283,7 +283,27 @@ class DockerProvider(SandboxProvider):
         self._opened_at = time.monotonic()
         self._closed_at = None
 
+    def renew_main(self) -> None:
+        """A compose stack's `main` replaced by a fresh container of its image, on the stack's network with its volumes and
+        the services as they are: what was changed inside `main` (its files, /etc/hosts, processes) is gone, what was
+        changed in the services stays. The old `main` is stopped. For grading a task whose state is in its services
+        where the solver could not have touched the grader's own tools."""
+        if not self._compose:
+            raise SandboxOpenError("renew_main: not a compose stack (open_from_compose)")
+        old = self._require_open()
+        run = _docker(*self._compose, "run", "-d", "--no-deps", "main", timeout=180)
+        fresh = run.stdout.strip().splitlines()[-1] if run.returncode == 0 and run.stdout.strip() else ""
+        if not fresh:
+            raise SandboxOpenError(f"docker compose run main failed: {_tail(run.stderr, 3000)}")
+        _docker("stop", "-t", "5", old, timeout=60)
+        self._container_name = fresh
+
     def _close_compose(self) -> None:
+        # a renewed main is a one-off container of the project: remove it with the project
+        oneoff = _docker("ps", "-aq", "--filter", f"label=com.docker.compose.project={self._compose[2]}",
+                         "--filter", "label=com.docker.compose.oneoff=True", timeout=60).stdout.split()
+        if oneoff:
+            _docker("rm", "-f", *oneoff, timeout=120)
         # --rmi local: the images compose built for this project (its services' own builds, named after the project).
         _docker(*self._compose, "down", "-v", "--rmi", "local", "--remove-orphans", "--timeout", "10", timeout=300)
         shutil.rmtree(self._compose_dir, ignore_errors=True)

@@ -44,6 +44,12 @@ class FakeProvider:
         self.calls.append(("close",))
         self._is_open = False
 
+    def renew_main(self):
+        self.calls.append(("renew",))
+
+    def put_file(self, source, target, mode="file"):
+        self.calls.append(("put", str(target), mode))
+
 
 def make_env(tmp_path, monkeypatch, compose: bool):
     monkeypatch.setattr(harbor_docker, "DockerProvider", FakeProvider)
@@ -89,6 +95,17 @@ def test_a_command_runs_as_the_given_user_with_its_variables(tmp_path, monkeypat
     assert cwd == "/workspace" and result.return_code == 0 and result.stdout == "ok\n"
     asyncio.run(env.exec("id"))
     assert env.provider.calls[-1][1] == "id"
+
+
+@pytest.mark.parametrize("compose", [True, False])
+def test_a_compose_task_is_graded_in_a_fresh_main_and_other_uploads_are_not(tmp_path, monkeypatch, compose):
+    env = make_env(tmp_path, monkeypatch, compose)
+    asyncio.run(env.start(force_build=False))
+    asyncio.run(env.upload_dir(tmp_path, "/solution"))
+    asyncio.run(env.upload_dir(tmp_path, "/tests"))
+    asyncio.run(env.upload_file(tmp_path / "x", "/tests/test_state.py"))
+    kinds = [call[0] for call in env.provider.calls[1:]]
+    assert kinds == (["put", "renew", "put", "renew", "put"] if compose else ["put", "put", "put"])
 
 
 def test_removing_a_stack_container_takes_its_project_down(monkeypatch):

@@ -3,6 +3,9 @@ whole stack (open_from_compose: `main` is the sandbox the agent and the verifier
 task as its Dockerfile's container (open_from_dockerfile). Harbor's own docker environment cannot run a sealed compose task:
 its no-network sidecar takes over the network of every service, so a seeder cannot reach the services it seeds.
 
+A compose task is graded in a fresh `main` of the same stack (DockerProvider.renew_main, when the verifier uploads the tests):
+the services keep the state the solver left, and nothing it changed inside its workstation reaches the grade.
+
 The provider is synchronous, so each call runs in a thread: one process's sessions on this environment do not block each other.
 Docker has no provider-side lifetime; a stack ends at stop(), or by its labels (`sandboxes stop --run ...`, fleet.stop)."""
 
@@ -22,6 +25,7 @@ from .harbor_raw import dockerfile_workdir
 from .models import SandboxProviderConfig
 
 COMPOSE_FILE = "docker-compose.yaml"
+TESTS_DIR = "/tests"            # where harbor's and euphoria's verifiers upload the tests, right before grading
 EXEC_TIMEOUT_S = 86400          # harbor passes none for an agent's long commands; the agent's own limits end those
 
 
@@ -87,10 +91,20 @@ class DockerHarborEnvironment(BaseEnvironment):
             raise RuntimeError("Sandbox not found. Please start the environment first.")
         return self.provider
 
+    def renew_for_grading(self, target: str) -> None:
+        """Grading starts when the verifier uploads the tests to /tests (harbor's and euphoria's verifiers both do, right
+        before test.sh): a compose task is then graded in a fresh `main` on the same stack, so nothing the solver did
+        inside its workstation (/etc/hosts, a fake service on localhost, the tools the grader runs) reaches the grade,
+        while the services keep the state it left."""
+        if self.uses_compose and str(target).rstrip("/").startswith(TESTS_DIR):
+            self.require().renew_main()
+
     async def upload_file(self, source_path, target_path: str):
+        await asyncio.to_thread(self.renew_for_grading, target_path)
         await asyncio.to_thread(self.require().put_file, source_path, target_path)
 
     async def upload_dir(self, source_dir, target_dir: str):
+        await asyncio.to_thread(self.renew_for_grading, target_dir)
         await asyncio.to_thread(self.require().put_file, source_dir, target_dir, mode="dir")
 
     async def download_file(self, source_path: str, target_path):
