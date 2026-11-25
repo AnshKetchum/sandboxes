@@ -265,8 +265,12 @@ class DockerProvider(SandboxProvider):
         self._compose = ["compose", "-p", project, "--project-directory", str(context_dir), "-f", str(base_path),
                          "-f", str(task_compose), "-f", str(infra_path)]
         self._compose_dir = files_dir
-        up = _docker(*self._compose, "up", "-d", "--wait", "--wait-timeout", str(_COMPOSE_WAIT_S),
-                     timeout=_COMPOSE_WAIT_S + 120)
+        try:
+            up = _docker(*self._compose, "up", "-d", "--wait", "--wait-timeout", str(_COMPOSE_WAIT_S),
+                         timeout=_COMPOSE_WAIT_S + 120)
+        except subprocess.TimeoutExpired as error:
+            self._close_compose()
+            raise SandboxOpenError(f"docker compose up did not return within {_COMPOSE_WAIT_S + 120}s") from error
         main = _docker(*self._compose, "ps", "-q", "main", timeout=60).stdout.strip() if up.returncode == 0 else ""
         if not main:
             logs = _docker(*self._compose, "logs", "--no-color", "--tail", "40", timeout=120)
@@ -280,7 +284,8 @@ class DockerProvider(SandboxProvider):
         self._closed_at = None
 
     def _close_compose(self) -> None:
-        _docker(*self._compose, "down", "-v", "--remove-orphans", "--timeout", "10", timeout=300)
+        # --rmi local: the images compose built for this project (its services' own builds, named after the project).
+        _docker(*self._compose, "down", "-v", "--rmi", "local", "--remove-orphans", "--timeout", "10", timeout=300)
         shutil.rmtree(self._compose_dir, ignore_errors=True)
         self._compose = None
 

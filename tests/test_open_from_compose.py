@@ -3,6 +3,7 @@ its content tag and sleeping, layered first; the task's docker-compose.yaml next
 every service, main's limits, an internal network when sealed). A failed `up` takes the project down and says why;
 close() removes the project and its volumes; providers that cannot run one refuse."""
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -24,18 +25,21 @@ COMPOSE = """services:
 
 class _FakeDocker:
     """Plays the docker CLI: records each call (with the generated compose files' contents), succeeds unless told
-    `up` fails."""
+    `up` fails or hangs."""
 
-    def __init__(self, up_fails: bool = False):
+    def __init__(self, up_fails: bool = False, up_hangs: bool = False):
         self.calls: list[list[str]] = []
         self.files: dict[str, dict] = {}
         self.up_fails = up_fails
+        self.up_hangs = up_hangs
 
     def __call__(self, *args, timeout):
         self.calls.append(list(args))
         for index, arg in enumerate(args):
             if arg == "-f" and args[index + 1].endswith(".json"):
                 self.files[Path(args[index + 1]).name] = json.loads(Path(args[index + 1]).read_text())
+        if "up" in args and self.up_hangs:
+            raise subprocess.TimeoutExpired(["docker", *args], timeout)
         stdout, code = "", 0
         if "up" in args and self.up_fails:
             code = 1
@@ -78,7 +82,8 @@ def test_main_is_the_built_context_under_the_task_compose_with_infra_last(fake, 
     assert infra["networks"] == {"default": {"internal": True}}
     assert provider._require_open() == "main-container-id"
     provider.close()
-    assert any("down" in call and "-v" in call for call in fake.calls)
+    down = next(call for call in fake.calls if "down" in call)
+    assert "-v" in down and down[down.index("--rmi") + 1] == "local"
     assert provider._compose is None
 
 
@@ -97,6 +102,16 @@ def test_a_failed_up_takes_the_project_down_and_says_why(monkeypatch, tmp_path):
     with pytest.raises(SandboxOpenError, match="dependency failed(.|\n)*notes  \\| listening"):
         provider.open_from_compose(_ctx(tmp_path))
     assert any("down" in call for call in docker.calls) and not provider._is_open
+
+
+def test_an_up_that_never_returns_takes_the_project_down(monkeypatch, tmp_path):
+    docker = _FakeDocker(up_hangs=True)
+    monkeypatch.setattr(docker_provider, "_docker", docker)
+    monkeypatch.setattr(DockerProvider, "_build_context", lambda self, ctx, dockerfile, timeout: "sandboxes-ctx:abc")
+    provider = DockerProvider()
+    with pytest.raises(SandboxOpenError, match="did not return"):
+        provider.open_from_compose(_ctx(tmp_path))
+    assert any("down" in call for call in docker.calls) and not provider._is_open and provider._compose is None
 
 
 def test_no_compose_file_or_no_compose_provider_refuses(fake, tmp_path):
