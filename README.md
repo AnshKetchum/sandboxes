@@ -132,7 +132,9 @@ its own billing (see below).
 
 Projects that consume sandboxes (euphoria, petunia, greenhouse, pr_task_synthesis, anything new) hold NO provider logic: they
 set their identity once (`sandboxes.set_context(owner="euphoria")`, optionally `run=`), open sandboxes through the library
-(`SandboxRouter`, `harbor_adapter.make_env` for harbor tasks), and use the same commands as everyone else:
+(`SandboxRouter`, `harbor_adapter.make_env` for harbor tasks; on local docker a task with
+`environment/docker-compose.yaml` comes up as its whole stack, `harbor_docker.py`, the only provider that runs those), and use the
+same commands as everyone else (`stop` takes a docker stack down whole, networks and volumes too):
 
 ```
 sandboxes ls    [--owner X] [--run R] [--label k=v ...] [--older-than H]   what is alive, on every provider and local docker

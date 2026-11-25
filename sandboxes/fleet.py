@@ -287,7 +287,7 @@ async def stop(owner=None, run=None, older_than_hours=None, providers=None, all_
         err = None
         try:
             if sb.provider == "docker":
-                _subprocess.run(["docker", "rm", "-f", sb.id], capture_output=True, timeout=60)
+                _remove_docker(sb.id)
             else:
                 await raw_class(sb.provider).kill(sb.id)
         except Exception as e:  # noqa: BLE001 — "state change in progress": the next stop gets it
@@ -298,6 +298,19 @@ async def stop(owner=None, run=None, older_than_hours=None, providers=None, all_
             on_result(sb, err)
     await areconcile(gone={sb.id for sb in deleted})
     return deleted
+
+
+def _remove_docker(container: str) -> None:
+    """Remove a docker sandbox: a container of a compose stack (open_from_compose) takes its whole project down, networks and
+    volumes with it, so a stopped stack leaves nothing behind; any other container is removed alone."""
+    r = _subprocess.run(["docker", "inspect", "-f", '{{index .Config.Labels "com.docker.compose.project"}}', container],
+                        capture_output=True, text=True, timeout=60)
+    project = r.stdout.strip() if r.returncode == 0 else ""
+    if project and project != "<no value>":
+        _subprocess.run(["docker", "compose", "-p", project, "down", "-v", "--remove-orphans", "--timeout", "10"],
+                        capture_output=True, timeout=300)
+    else:
+        _subprocess.run(["docker", "rm", "-f", container], capture_output=True, timeout=60)
 
 
 def classify_state(state: str) -> str:
@@ -327,7 +340,7 @@ async def reap(owner=None, run=None, creating_older_than_min: float = 8.0, provi
         for sb, _ in out:
             try:
                 if sb.provider == "docker":
-                    _subprocess.run(["docker", "rm", "-f", sb.id], capture_output=True, timeout=60)
+                    _remove_docker(sb.id)
                 else:
                     await raw_class(sb.provider).kill(sb.id)
             except Exception:  # noqa: BLE001
