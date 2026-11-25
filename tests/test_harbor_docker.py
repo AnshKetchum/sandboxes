@@ -2,6 +2,7 @@
 run as the task's user with its variables, and a stopped stack is taken down whole (fleet's docker removal)."""
 
 import asyncio
+import json
 import shlex
 import subprocess
 
@@ -98,14 +99,18 @@ def test_a_command_runs_as_the_given_user_with_its_variables(tmp_path, monkeypat
 
 
 @pytest.mark.parametrize("compose", [True, False])
-def test_a_compose_task_is_graded_in_a_fresh_main_and_other_uploads_are_not(tmp_path, monkeypatch, compose):
+def test_a_compose_task_is_graded_in_a_fresh_main_once_and_other_uploads_are_not(tmp_path, monkeypatch, compose):
     env = make_env(tmp_path, monkeypatch, compose)
     asyncio.run(env.start(force_build=False))
     asyncio.run(env.upload_dir(tmp_path, "/solution"))
     asyncio.run(env.upload_dir(tmp_path, "/tests"))
     asyncio.run(env.upload_file(tmp_path / "x", "/tests/test_state.py"))
     kinds = [call[0] for call in env.provider.calls[1:]]
-    assert kinds == (["put", "renew", "put", "renew", "put"] if compose else ["put", "put", "put"])
+    assert kinds == (["put", "renew", "put", "put"] if compose else ["put", "put", "put"])
+    record = tmp_path / "trial" / harbor_docker.GRADING_RECORD
+    assert record.is_file() == compose
+    if compose:
+        assert json.loads(record.read_text())["solver_main"] == "t__1-main"
 
 
 def test_removing_a_stack_container_takes_its_project_down(monkeypatch):

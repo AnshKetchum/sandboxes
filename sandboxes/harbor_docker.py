@@ -12,7 +12,9 @@ Docker has no provider-side lifetime; a stack ends at stop(), or by its labels (
 from __future__ import annotations
 
 import asyncio
+import json
 import shlex
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -27,6 +29,7 @@ from .models import SandboxProviderConfig
 COMPOSE_FILE = "docker-compose.yaml"
 TESTS_DIR = "/tests"            # where harbor's and euphoria's verifiers upload the tests, right before grading
 EXEC_TIMEOUT_S = 86400          # harbor passes none for an agent's long commands; the agent's own limits end those
+GRADING_RECORD = "grading_main.json"    # in the trial folder: which `main` the solver worked in and which one graded
 
 
 class DockerHarborEnvironment(BaseEnvironment):
@@ -37,6 +40,7 @@ class DockerHarborEnvironment(BaseEnvironment):
         self._lifetime_s = lifetime_s
         self.labels = {**dict(labels or {}), **({"sandboxes.lifetime_s": str(lifetime_s)} if lifetime_s else {})}
         self.provider: Optional[DockerProvider] = None
+        self._renewed = False
         super().__init__(*args, **kwargs)
 
     @staticmethod
@@ -96,8 +100,21 @@ class DockerHarborEnvironment(BaseEnvironment):
         before test.sh): a compose task is then graded in a fresh `main` on the same stack, so nothing the solver did
         inside its workstation (/etc/hosts, a fake service on localhost, the tools the grader runs) reaches the grade,
         while the services keep the state it left."""
-        if self.uses_compose and str(target).rstrip("/").startswith(TESTS_DIR):
-            self.require().renew_main()
+        if self._renewed or not self.uses_compose or not str(target).rstrip("/").startswith(TESTS_DIR):
+            return
+        provider = self.require()
+        solver_main = provider.raw_env
+        provider.renew_main()
+        self._renewed = True    # once a session: a later upload into /tests must not drop the tests already there
+        self._record_grading_main(solver_main, provider.raw_env)
+
+    def _record_grading_main(self, solver_main: str, grading_main: str) -> None:
+        """Evidence in the trial folder that the grade comes from a fresh `main`, not the one the solver worked in."""
+        trial_dir = getattr(getattr(self, "trial_paths", None), "trial_dir", None)
+        if trial_dir is None or not Path(trial_dir).is_dir():
+            return
+        (Path(trial_dir) / GRADING_RECORD).write_text(json.dumps(
+            {"solver_main": solver_main, "grading_main": grading_main, "renewed_at": time.time()}, indent=1))
 
     async def upload_file(self, source_path, target_path: str):
         await asyncio.to_thread(self.renew_for_grading, target_path)
