@@ -11,8 +11,10 @@ for docker cp always writing root:root, same tail-truncated exec output cap.
 
 from __future__ import annotations
 
+import json
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
@@ -20,6 +22,8 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import ClassVar, Optional, Union
+
+import yaml
 
 from .base import SandboxProvider
 from .buildctx import context_digest, resolve_dockerfile
@@ -39,6 +43,8 @@ _IMAGE_GONE_RE = re.compile(
 )
 
 _OUTPUT_TAIL = 12000
+_COMPOSE_FILE = "docker-compose.yaml"      # Harbor's multi-container environment file, beside the Dockerfile
+_COMPOSE_WAIT_S = 600                       # healthchecks and one-shot (seed) services, at `up --wait`
 
 
 def _tail(text: str, n: int = _OUTPUT_TAIL) -> str:
@@ -100,6 +106,8 @@ class DockerProvider(SandboxProvider):
         super().__init__(config)
         self._container_name: Optional[str] = None
         self._workdir: str = "/"
+        self._compose: Optional[list[str]] = None      # the compose CLI prefix of a multi-container environment
+        self._compose_dir: Optional[str] = None        # its generated main/infra compose files
 
     # -- lifecycle ------------------------------------------------------
 
@@ -191,6 +199,11 @@ class DockerProvider(SandboxProvider):
         already exists locally (an unchanged context reopens instantly),
         then `open()` it. Not built through `open()`'s retry: an image-gone
         race after the existence check is `open()`'s own retry case."""
+        tag = self._build_context(context_dir, dockerfile, build_timeout)
+        self.open(tag, workdir=workdir, network=network, name_prefix=name_prefix, labels=labels)
+
+    def _build_context(self, context_dir, dockerfile: Optional[str], build_timeout: float) -> str:
+        """The context's content tag, built unless it already exists locally."""
         tag = self._dockerfile_tag(context_dir, dockerfile)
         try:
             exists = _docker("image", "inspect", tag, timeout=20).returncode == 0
@@ -203,7 +216,71 @@ class DockerProvider(SandboxProvider):
                 dockerfile=str(resolve_dockerfile(context_dir, dockerfile)) if dockerfile else None)
             if not r.ok:
                 raise ImageBuildError(f"docker: image build failed for {context_dir}: {r.detail}")
-        self.open(tag, workdir=workdir, network=network, name_prefix=name_prefix, labels=labels)
+        return tag
+
+    def can_open_from_compose(self) -> bool:
+        return True
+
+    def open_from_compose(
+        self,
+        context_dir: Union[str, Path],
+        *,
+        workdir: str = "/",
+        network: str = "bridge",
+        name_prefix: Optional[str] = None,
+        labels: Optional[dict[str, str]] = None,
+        build_timeout: float = 1800.0,
+    ) -> None:
+        """A Harbor multi-container environment, layered as harbor's own docker environment layers it: the
+        context's Dockerfile built (content-tagged, as open_from_dockerfile) as `main`, sleeping; then the task's
+        docker-compose.yaml; then infra last (the standard labels on every service, main's cpu/memory/pids limits,
+        and for network "none" an internal default network: no egress, the services still reach one another).
+        `up --wait` returns once every healthcheck passes and every one-shot service has exited 0; a failure takes
+        the project down and raises SandboxOpenError with the services' log tails. `main` becomes the sandbox, so
+        run_command, put_file, get_file and stats work as for a single container; close() removes the project and
+        its volumes."""
+        if self._is_open:
+            raise SandboxOpenError("already open — call close() first")
+        context_dir = Path(context_dir)
+        task_compose = context_dir / _COMPOSE_FILE
+        if not task_compose.is_file():
+            raise SandboxOpenError(f"docker: {task_compose} does not exist; open_from_dockerfile opens a single container")
+        tag = self._build_context(context_dir, None, build_timeout)
+        prefix = _sanitize_name_prefix(name_prefix) if name_prefix else "sbx"
+        project = re.sub(r"[^a-z0-9_-]", "-", f"{prefix}-{uuid.uuid4().hex[:12]}".lower())
+        from .labels import standard_labels
+        std = standard_labels(run=name_prefix if name_prefix and not os.environ.get("SANDBOX_RUN_ID") else None, extra=labels)
+        services = (yaml.safe_load(task_compose.read_text()) or {}).get("services") or {}
+        infra: dict = {"services": {name: {"labels": dict(std)} for name in {"main", *services}}}
+        cfg = self.config
+        limits = {"cpus": cfg.cpu, "mem_limit": f"{cfg.memory_mb}m" if cfg.memory_mb else None, "pids_limit": cfg.pids_limit}
+        infra["services"]["main"].update({key: value for key, value in limits.items() if value})
+        if network == "none":
+            infra["networks"] = {"default": {"internal": True}}
+        files_dir = tempfile.mkdtemp(prefix=f"{project}-compose-")
+        base_path, infra_path = Path(files_dir) / "main.json", Path(files_dir) / "infra.json"
+        base_path.write_text(json.dumps({"services": {"main": {"image": tag, "command": ["sh", "-c", "sleep infinity"]}}}))
+        infra_path.write_text(json.dumps(infra))
+        self._compose = ["compose", "-p", project, "-f", str(base_path), "-f", str(task_compose), "-f", str(infra_path)]
+        self._compose_dir = files_dir
+        up = _docker(*self._compose, "up", "-d", "--wait", "--wait-timeout", str(_COMPOSE_WAIT_S),
+                     timeout=_COMPOSE_WAIT_S + 120)
+        main = _docker(*self._compose, "ps", "-q", "main", timeout=60).stdout.strip() if up.returncode == 0 else ""
+        if not main:
+            logs = _docker(*self._compose, "logs", "--no-color", "--tail", "40", timeout=120)
+            self._close_compose()
+            raise SandboxOpenError(f"docker compose up failed: {_tail(up.stderr, 3000)}\n"
+                                   f"services' logs:\n{_tail(logs.stdout, 6000)}")
+        self._container_name = main
+        self._workdir = workdir
+        self._is_open = True
+        self._opened_at = time.monotonic()
+        self._closed_at = None
+
+    def _close_compose(self) -> None:
+        _docker(*self._compose, "down", "-v", "--remove-orphans", "--timeout", "10", timeout=300)
+        shutil.rmtree(self._compose_dir, ignore_errors=True)
+        self._compose = None
 
     def release_dockerfile_image(
         self, context_dir: Union[str, Path], *, dockerfile: Optional[str] = None
@@ -219,7 +296,10 @@ class DockerProvider(SandboxProvider):
     def close(self) -> None:
         if not self._is_open:
             return
-        _docker("rm", "-f", self._container_name, timeout=60)
+        if self._compose:
+            self._close_compose()
+        else:
+            _docker("rm", "-f", self._container_name, timeout=60)
         self._closed_at = time.monotonic()
         self._is_open = False
 
