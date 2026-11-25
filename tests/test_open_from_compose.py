@@ -68,7 +68,7 @@ def test_main_is_the_built_context_under_the_task_compose_with_infra_last(fake, 
     up = next(call for call in fake.calls if "up" in call)
     files = [up[index + 1] for index, arg in enumerate(up) if arg == "-f"]
     assert files[0].endswith("main.json") and files[1].endswith("docker-compose.yaml") and files[2].endswith("infra.json")
-    assert "--wait" in up and up[2].startswith("run-7-")
+    assert "--wait" in up and up[2].startswith("run-7-") and up[up.index("--project-directory") + 1].endswith("environment")
     assert fake.files["main.json"]["services"]["main"] == {"image": "sandboxes-ctx:abc",
                                                             "command": ["sh", "-c", "sleep infinity"]}
     infra = fake.files["infra.json"]

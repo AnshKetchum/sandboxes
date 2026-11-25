@@ -261,7 +261,9 @@ class DockerProvider(SandboxProvider):
         base_path, infra_path = Path(files_dir) / "main.json", Path(files_dir) / "infra.json"
         base_path.write_text(json.dumps({"services": {"main": {"image": tag, "command": ["sh", "-c", "sleep infinity"]}}}))
         infra_path.write_text(json.dumps(infra))
-        self._compose = ["compose", "-p", project, "-f", str(base_path), "-f", str(task_compose), "-f", str(infra_path)]
+        # The task's relative paths (a service's build context, mounted files) resolve from environment/, as in Harbor.
+        self._compose = ["compose", "-p", project, "--project-directory", str(context_dir), "-f", str(base_path),
+                         "-f", str(task_compose), "-f", str(infra_path)]
         self._compose_dir = files_dir
         up = _docker(*self._compose, "up", "-d", "--wait", "--wait-timeout", str(_COMPOSE_WAIT_S),
                      timeout=_COMPOSE_WAIT_S + 120)
