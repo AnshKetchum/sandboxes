@@ -11,6 +11,7 @@ for docker cp always writing root:root, same tail-truncated exec output cap.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import re
@@ -53,6 +54,13 @@ def _tail(text: str, n: int = _OUTPUT_TAIL) -> str:
 
 def _docker(*args: str, timeout: float) -> subprocess.CompletedProcess:
     return subprocess.run(["docker", *args], capture_output=True, text=True, timeout=timeout)
+
+
+def _image_exists(tag: str) -> bool:
+    try:
+        return _docker("image", "inspect", tag, timeout=20).returncode == 0
+    except subprocess.TimeoutExpired:
+        return False
 
 
 def _sanitize_name_prefix(prefix: str, max_len: int = 100) -> str:
@@ -203,19 +211,21 @@ class DockerProvider(SandboxProvider):
         self.open(tag, workdir=workdir, network=network, name_prefix=name_prefix, labels=labels)
 
     def _build_context(self, context_dir, dockerfile: Optional[str], build_timeout: float) -> str:
-        """The context's content tag, built unless it already exists locally."""
+        """The context's content tag, built unless it already exists locally. Builders of one tag on this host take turns
+        (a file lock): parallel sessions of one task build it once instead of racing to export the same name."""
         tag = self._dockerfile_tag(context_dir, dockerfile)
-        try:
-            exists = _docker("image", "inspect", tag, timeout=20).returncode == 0
-        except subprocess.TimeoutExpired:
-            exists = False
-        if not exists:
-            r = self.build_sandbox_image(
-                context_dir, tag=tag, timeout=build_timeout,
-                network=(self.config.extra or {}).get("build_network"),
-                dockerfile=str(resolve_dockerfile(context_dir, dockerfile)) if dockerfile else None)
-            if not r.ok:
-                raise ImageBuildError(f"docker: image build failed for {context_dir}: {r.detail}")
+        if _image_exists(tag):
+            return tag
+        lock_path = Path(tempfile.gettempdir()) / f"sandboxes-build-{re.sub(r'[^A-Za-z0-9_.-]', '-', tag)}.lock"
+        with open(lock_path, "w") as lock:
+            fcntl.flock(lock, fcntl.LOCK_EX)
+            if not _image_exists(tag):
+                r = self.build_sandbox_image(
+                    context_dir, tag=tag, timeout=build_timeout,
+                    network=(self.config.extra or {}).get("build_network"),
+                    dockerfile=str(resolve_dockerfile(context_dir, dockerfile)) if dockerfile else None)
+                if not r.ok and not _image_exists(tag):     # another host process's build of the same tag won
+                    raise ImageBuildError(f"docker: image build failed for {context_dir}: {r.detail}")
         return tag
 
     def can_open_from_compose(self) -> bool:
