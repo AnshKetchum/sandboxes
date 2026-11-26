@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
 import time
 from pathlib import Path
@@ -23,6 +24,7 @@ from harbor.environments.capabilities import EnvironmentCapabilities, Environmen
 from harbor.environments.definition import effective_exec_cwd
 
 from .docker_provider import DockerProvider
+from .remote_docker_provider import RemoteDockerProvider
 from .harbor_raw import dockerfile_workdir
 from .models import SandboxProviderConfig
 
@@ -71,9 +73,12 @@ class DockerHarborEnvironment(BaseEnvironment):
     def get_workdir(self) -> str:
         return self.task_env_config.workdir or dockerfile_workdir(self.environment_dir) or "/"
 
+    def make_provider(self) -> DockerProvider:
+        return DockerProvider(SandboxProviderConfig(name="docker", cpu=self._effective_cpus or None,
+                                                    memory_mb=self._effective_memory_mb or None))
+
     def open_provider(self) -> None:
-        config = SandboxProviderConfig(name="docker", cpu=self._effective_cpus or None, memory_mb=self._effective_memory_mb or None)
-        provider = DockerProvider(config)
+        provider = self.make_provider()
         options = dict(workdir=self.get_workdir(), network="none" if self._network_disabled else "bridge",
                        name_prefix=self.session_id, labels=self.labels)
         if self.uses_compose:
@@ -155,3 +160,26 @@ class DockerHarborEnvironment(BaseEnvironment):
         workdir = effective_exec_cwd(cwd, self.task_env_config.workdir, self.get_workdir())
         result = await asyncio.to_thread(self.require().run_command, full, timeout=timeout_sec or EXEC_TIMEOUT_S, cwd=workdir)
         return ExecResult(stdout=result.output, stderr="", return_code=124 if result.timed_out else result.exit_code)
+
+
+class RemoteDockerHarborEnvironment(DockerHarborEnvironment):
+    """The same environment with its docker host in a cloud VM (RemoteDockerProvider): one VM per session, the task's whole
+    stack inside it, `main` the sandbox the agent and the verifier use. The VM's provider and size come from
+    SANDBOX_REMOTE_DOCKER_HOST (default modal), SANDBOX_REMOTE_DOCKER_CPU (4) and SANDBOX_REMOTE_DOCKER_MEMORY_MB (8192);
+    the VM provider writes its own cost-ledger entries."""
+
+    LEDGER_NATIVE = True
+
+    @staticmethod
+    def type() -> str:
+        return "sandboxes-docker-remote"
+
+    def make_provider(self) -> DockerProvider:
+        extra = {"host": os.environ.get("SANDBOX_REMOTE_DOCKER_HOST", "modal"),
+                 "host_cpu": float(os.environ.get("SANDBOX_REMOTE_DOCKER_CPU", "4")),
+                 "host_memory_mb": int(os.environ.get("SANDBOX_REMOTE_DOCKER_MEMORY_MB", "8192"))}
+        lifetime_min = max(1, int(self._lifetime_s) // 60) if self._lifetime_s else None
+        return RemoteDockerProvider(SandboxProviderConfig(name="docker-remote", cpu=self._effective_cpus or None,
+                                                          memory_mb=self._effective_memory_mb or None, extra=extra,
+                                                          **({"auto_delete_minutes": lifetime_min} if lifetime_min else {})))
+

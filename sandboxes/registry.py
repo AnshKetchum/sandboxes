@@ -48,6 +48,8 @@ DEFAULT_CAPABILITIES = {
     "blaxel": {"dind": False, "image_ref": True, "requires_prebuilt_image": False, "persistent_disk_gb": 0,
                "note": "root fs is RAM-backed (50% of memory); docker only fits in a small loop file"},
     "docker": {"dind": False, "image_ref": True, "requires_prebuilt_image": False, "persistent_disk_gb": 0, "local": True},
+    "docker-remote": {"dind": False, "image_ref": True, "requires_prebuilt_image": False, "persistent_disk_gb": 0,
+                      "note": "DockerProvider with its docker host in one VM per sandbox (Modal runtime=vm by default): compose stacks on a cloud provider"},
     "fly": {"create_rate_per_s": 1, "create_burst": 3, "dind": True, "image_ref": True, "requires_prebuilt_image": False, "builds_dockerfile": True, "persistent_disk_gb": 8, "note": "Firecracker microVM, real disk (8 GB rootfs by default)"},
     "modal": {"create_rate_per_s": 5, "create_burst": 5, "blocks_network": True, "dind": True, "image_ref": True, "requires_prebuilt_image": False, "builds_dockerfile": True, "persistent_disk_gb": 500, "note": "runtime=vm (real VM, large root disk); gvisor cannot run a daemon"},
     "prime": {"create_rate_per_s": 19, "create_burst": 50, "dind": False, "image_ref": True, "requires_prebuilt_image": False,
@@ -73,6 +75,8 @@ def _gke_credentials() -> bool:
 
 PROVIDERS: dict[str, ProviderInfo] = {
     "docker": ProviderInfo("docker", (), None, "sandboxes.docker_provider:DockerProvider", DEFAULT_CAPABILITIES["docker"]),
+    "docker-remote": ProviderInfo("docker-remote", (), None, "sandboxes.remote_docker_provider:RemoteDockerProvider",
+                                  DEFAULT_CAPABILITIES["docker-remote"], available=_modal_credentials),
     "daytona": ProviderInfo("daytona", ("DAYTONA_API_KEY",), "sandboxes.backends.daytona_raw:DaytonaRaw",
                             "sandboxes.daytona_provider:DaytonaProvider", DEFAULT_CAPABILITIES["daytona"]),
     "e2b": ProviderInfo("e2b", ("E2B_API_KEY",), "sandboxes.backends.e2b_raw:E2BRaw",

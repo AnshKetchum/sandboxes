@@ -117,6 +117,22 @@ class DockerProvider(SandboxProvider):
         self._compose: Optional[list[str]] = None      # the compose CLI prefix of a multi-container environment
         self._compose_dir: Optional[str] = None        # its generated main/infra compose files
 
+    # -- the docker host: this machine here; RemoteDockerProvider runs these inside a VM --------------
+
+    def _docker(self, *args: str, timeout: float) -> subprocess.CompletedProcess:
+        return _docker(*args, timeout=timeout)
+
+    def _image_exists(self, tag: str) -> bool:
+        return _image_exists(tag)
+
+    def _host_path(self, path: Union[str, Path]) -> str:
+        """`path` on this machine as the docker host sees it: the same path here."""
+        return str(path)
+
+    def _fetch(self, source: str, local_path: Union[str, Path]) -> None:
+        """`docker cp` a container's path (`name:path`) to `local_path` on this machine."""
+        self._docker("cp", source, str(local_path), timeout=60)
+
     # -- lifecycle ------------------------------------------------------
 
     def open(
@@ -170,7 +186,7 @@ class DockerProvider(SandboxProvider):
 
         last_stderr = ""
         for attempt in range(3):
-            r = _docker(*args, timeout=90)
+            r = self._docker(*args, timeout=90)
             if r.returncode == 0:
                 break
             last_stderr = _tail(r.stderr, 4000)
@@ -214,17 +230,17 @@ class DockerProvider(SandboxProvider):
         """The context's content tag, built unless it already exists locally. Builders of one tag on this host take turns
         (a file lock): parallel sessions of one task build it once instead of racing to export the same name."""
         tag = self._dockerfile_tag(context_dir, dockerfile)
-        if _image_exists(tag):
+        if self._image_exists(tag):
             return tag
         lock_path = Path(tempfile.gettempdir()) / f"sandboxes-build-{re.sub(r'[^A-Za-z0-9_.-]', '-', tag)}.lock"
         with open(lock_path, "w") as lock:
             fcntl.flock(lock, fcntl.LOCK_EX)
-            if not _image_exists(tag):
+            if not self._image_exists(tag):
                 r = self.build_sandbox_image(
                     context_dir, tag=tag, timeout=build_timeout,
                     network=(self.config.extra or {}).get("build_network"),
                     dockerfile=str(resolve_dockerfile(context_dir, dockerfile)) if dockerfile else None)
-                if not r.ok and not _image_exists(tag):     # another host process's build of the same tag won
+                if not r.ok and not self._image_exists(tag):     # another host process's build of the same tag won
                     raise ImageBuildError(f"docker: image build failed for {context_dir}: {r.detail}")
         return tag
 
@@ -272,18 +288,19 @@ class DockerProvider(SandboxProvider):
         base_path.write_text(json.dumps({"services": {"main": {"image": tag, "command": ["sh", "-c", "sleep infinity"]}}}))
         infra_path.write_text(json.dumps(infra))
         # The task's relative paths (a service's build context, mounted files) resolve from environment/, as in Harbor.
-        self._compose = ["compose", "-p", project, "--project-directory", str(context_dir), "-f", str(base_path),
-                         "-f", str(task_compose), "-f", str(infra_path)]
+        host_context = self._host_path(context_dir)
+        self._compose = ["compose", "-p", project, "--project-directory", host_context, "-f", self._host_path(base_path),
+                         "-f", f"{host_context}/{_COMPOSE_FILE}", "-f", self._host_path(infra_path)]
         self._compose_dir = files_dir
         try:
-            up = _docker(*self._compose, "up", "-d", "--wait", "--wait-timeout", str(_COMPOSE_WAIT_S),
+            up = self._docker(*self._compose, "up", "-d", "--wait", "--wait-timeout", str(_COMPOSE_WAIT_S),
                          timeout=_COMPOSE_WAIT_S + 120)
         except subprocess.TimeoutExpired as error:
             self._close_compose()
             raise SandboxOpenError(f"docker compose up did not return within {_COMPOSE_WAIT_S + 120}s") from error
-        main = _docker(*self._compose, "ps", "-q", "main", timeout=60).stdout.strip() if up.returncode == 0 else ""
+        main = self._docker(*self._compose, "ps", "-q", "main", timeout=60).stdout.strip() if up.returncode == 0 else ""
         if not main:
-            logs = _docker(*self._compose, "logs", "--no-color", "--tail", "40", timeout=120)
+            logs = self._docker(*self._compose, "logs", "--no-color", "--tail", "40", timeout=120)
             self._close_compose()
             raise SandboxOpenError(f"docker compose up failed: {_tail(up.stderr, 3000)}\n"
                                    f"services' logs:\n{_tail(logs.stdout, 6000)}")
@@ -301,21 +318,21 @@ class DockerProvider(SandboxProvider):
         if not self._compose:
             raise SandboxOpenError("renew_main: not a compose stack (open_from_compose)")
         old = self._require_open()
-        run = _docker(*self._compose, "run", "-d", "--no-deps", "main", timeout=180)
+        run = self._docker(*self._compose, "run", "-d", "--no-deps", "main", timeout=180)
         fresh = run.stdout.strip().splitlines()[-1] if run.returncode == 0 and run.stdout.strip() else ""
         if not fresh:
             raise SandboxOpenError(f"docker compose run main failed: {_tail(run.stderr, 3000)}")
-        _docker("stop", "-t", "5", old, timeout=60)
+        self._docker("stop", "-t", "5", old, timeout=60)
         self._container_name = fresh
 
     def _close_compose(self) -> None:
         # a renewed main is a one-off container of the project: remove it with the project
-        oneoff = _docker("ps", "-aq", "--filter", f"label=com.docker.compose.project={self._compose[2]}",
+        oneoff = self._docker("ps", "-aq", "--filter", f"label=com.docker.compose.project={self._compose[2]}",
                          "--filter", "label=com.docker.compose.oneoff=True", timeout=60).stdout.split()
         if oneoff:
-            _docker("rm", "-f", *oneoff, timeout=120)
+            self._docker("rm", "-f", *oneoff, timeout=120)
         # --rmi local: the images compose built for this project (its services' own builds, named after the project).
-        _docker(*self._compose, "down", "-v", "--rmi", "local", "--remove-orphans", "--timeout", "10", timeout=300)
+        self._docker(*self._compose, "down", "-v", "--rmi", "local", "--remove-orphans", "--timeout", "10", timeout=300)
         shutil.rmtree(self._compose_dir, ignore_errors=True)
         self._compose = None
 
@@ -325,7 +342,7 @@ class DockerProvider(SandboxProvider):
         """`docker image rm` the context's tag; docker refuses while a
         container still uses it, which is the right answer."""
         try:
-            r = _docker("image", "rm", self._dockerfile_tag(context_dir, dockerfile), timeout=120)
+            r = self._docker("image", "rm", self._dockerfile_tag(context_dir, dockerfile), timeout=120)
         except subprocess.TimeoutExpired:
             return False
         return r.returncode == 0
@@ -336,7 +353,7 @@ class DockerProvider(SandboxProvider):
         if self._compose:
             self._close_compose()
         else:
-            _docker("rm", "-f", self._container_name, timeout=60)
+            self._docker("rm", "-f", self._container_name, timeout=60)
         self._closed_at = time.monotonic()
         self._is_open = False
 
@@ -374,17 +391,17 @@ class DockerProvider(SandboxProvider):
         default_perm = "755" if mode == "file" else "a+rwX"
         perm = permissions or default_perm
         if mode == "dir":
-            _docker("exec", "--user", "root", name, "mkdir", "-p", remote_path, timeout=30)
-            _docker("cp", str(Path(local_path)) + "/.", f"{name}:{remote_path}/", timeout=120)
-            _docker("exec", "--user", "root", name, "chmod", "-R", perm, remote_path, timeout=30)
+            self._docker("exec", "--user", "root", name, "mkdir", "-p", remote_path, timeout=30)
+            self._docker("cp", self._host_path(Path(local_path)) + "/.", f"{name}:{remote_path}/", timeout=120)
+            self._docker("exec", "--user", "root", name, "chmod", "-R", perm, remote_path, timeout=30)
         else:
-            _docker("cp", str(local_path), f"{name}:{remote_path}", timeout=60)
-            _docker("exec", "--user", "root", name, "chmod", perm, remote_path, timeout=20)
+            self._docker("cp", self._host_path(local_path), f"{name}:{remote_path}", timeout=60)
+            self._docker("exec", "--user", "root", name, "chmod", perm, remote_path, timeout=20)
 
     def get_file(self, remote_path: str, local_path: Union[str, Path]) -> None:
         name = self._require_open()
         Path(local_path).parent.mkdir(parents=True, exist_ok=True)
-        _docker("cp", f"{name}:{remote_path}", str(local_path), timeout=60)
+        self._fetch(f"{name}:{remote_path}", local_path)
 
     # -- exec ---------------------------------------------------------------
 
@@ -398,7 +415,7 @@ class DockerProvider(SandboxProvider):
         name = self._require_open()
         workdir = cwd or self._workdir
         try:
-            r = _docker("exec", "-w", workdir, name, "bash", "-lc", command, timeout=timeout)
+            r = self._docker("exec", "-w", workdir, name, "bash", "-lc", command, timeout=timeout)
         except subprocess.TimeoutExpired:
             return CommandResult(exit_code=None, output="", timed_out=True)
         return CommandResult(exit_code=r.returncode, output=_tail(r.stdout + r.stderr))
@@ -432,10 +449,10 @@ class DockerProvider(SandboxProvider):
             # bridge that fails apt/pip with no route — `host` sidesteps it.
             args += ["--network", network]
         if dockerfile:
-            args += ["-f", dockerfile]
-        args.append(str(context_dir))
+            args += ["-f", self._host_path(dockerfile)]
+        args.append(self._host_path(context_dir))
         try:
-            r = _docker(*args, timeout=timeout)
+            r = self._docker(*args, timeout=timeout)
         except subprocess.TimeoutExpired:
             return BuildResult(ok=False, image=tag,
                                detail=f"build timed out after {timeout}s",
@@ -456,12 +473,12 @@ class DockerProvider(SandboxProvider):
         reg = registry or self.config.registry
         ref = f"{reg}/{tag}" if reg and not tag.startswith(reg) else tag
         if ref != tag:
-            r = _docker("tag", tag, ref, timeout=30)
+            r = self._docker("tag", tag, ref, timeout=30)
             if r.returncode != 0:
                 return PushResult(ok=False, image=ref, detail=_tail(r.stderr, 2000),
                                   seconds=time.monotonic() - t0)
         try:
-            r = _docker("push", ref, timeout=timeout)
+            r = self._docker("push", ref, timeout=timeout)
         except subprocess.TimeoutExpired:
             return PushResult(ok=False, image=ref, detail=f"push timed out after {timeout}s",
                               seconds=time.monotonic() - t0)
