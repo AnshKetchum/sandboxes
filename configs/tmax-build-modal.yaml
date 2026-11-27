@@ -1,0 +1,4 @@
+# tmax stage-4 build+initial-test sandboxes on Modal (2 vCPU / 4 GiB), up to 400 at once
+total_spend_cap_usd: 5600
+sandbox_providers:
+  - {name: modal, cpu: 2, memory_mb: 4096, disk_gb: 10, peak_concurrent_sandboxes: 400, spend_cap_usd: 5600, auto_delete_minutes: 25, extra: {runtime: vm}}

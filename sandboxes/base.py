@@ -157,6 +157,27 @@ class SandboxProvider(ABC):
             f"{self.name} cannot build a Dockerfile (no builds_dockerfile capability); "
             "open() a prebuilt registry image instead, or use docker, daytona, modal or fly")
 
+    def can_open_from_compose(self) -> bool:
+        """Whether `open_from_compose` works on this provider: a task environment of several containers. False
+        by default; docker can."""
+        return False
+
+    def open_from_compose(
+        self,
+        context_dir: Union[str, Path],
+        *,
+        workdir: str = "/",
+        network: str = "bridge",
+        name_prefix: Optional[str] = None,
+        labels: Optional[dict[str, str]] = None,
+        build_timeout: float = 1800.0,
+    ) -> None:
+        """Start a Harbor multi-container environment: `context_dir`'s Dockerfile built as the service `main` (the
+        sandbox every command, file and stats call goes to) beside the services of its `docker-compose.yaml`, which
+        reach one another by service name. Arguments as `open_from_dockerfile`; network "none" seals the
+        environment (no egress) while its services still reach one another."""
+        raise SandboxOpenError(f"{self.name} cannot start a multi-container (compose) environment; use docker")
+
     def release_dockerfile_image(
         self, context_dir: Union[str, Path], *, dockerfile: Optional[str] = None
     ) -> bool:

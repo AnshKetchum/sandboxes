@@ -25,6 +25,8 @@ HARBOR_ENVS = {
     "daytona": ("harbor.environments.daytona.environment", "DaytonaEnvironment"),
     "e2b": ("sandboxes.harbor_e2b", "LifetimeE2BEnvironment"),   # harbor's E2BEnvironment with a real lifetime + our labels
     "blaxel": ("sandboxes.harbor_blaxel", "LabelledBlaxelEnvironment"),   # harbor's BlaxelEnvironment + our labels
+    "docker": ("sandboxes.harbor_docker", "DockerHarborEnvironment"),     # local docker; a compose task as its whole stack
+    "docker-remote": ("sandboxes.harbor_docker", "RemoteDockerHarborEnvironment"),   # the same, its docker host in a cloud VM
 }
 _live: dict = {}
 

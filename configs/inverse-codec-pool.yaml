@@ -1,0 +1,4 @@
+# Euphoria pool for the inverse-codec rollouts (2026-10-12): Modal only, 1 vCPU / 2 GiB vm, 500 concurrent. Each task's Dockerfile is built by Modal.
+total_spend_cap_usd: 4000
+sandbox_providers:
+  - {name: modal, cpu: 1, memory_mb: 2048, disk_gb: 20, peak_concurrent_sandboxes: 500, spend_cap_usd: 4000, auto_delete_minutes: 120, extra: {runtime: vm}}
